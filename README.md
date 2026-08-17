@@ -97,4 +97,5 @@ src/
   什么，没法提前写死，**这时循环才真正必要**。
 - **第三步**：跨视频提问。先用 SQLite FTS5 关键词检索跑通，再考虑向量检索。
 
-完整设计和取舍理由见 [docs/superpowers/specs/2026-08-17-clipknow-design.md](docs/superpowers/specs/2026-08-17-clipknow-design.md)。
+每一步为什么这么切，代码注释里都写了理由——尤其 `ingest/scrapecreators.rs`
+和 `agent/llm.rs` 的文件头注释，记录了实测踩到的坑和当时的取舍。

@@ -13,8 +13,7 @@
 use serde_json::Value;
 
 use crate::content::model::{
-    new_id, now_ts, parse_iso8601, Artifact, ArtifactKind, Comment, FetchedVideo, Transcript,
-    Video,
+    Artifact, ArtifactKind, Comment, FetchedVideo, Transcript, Video, new_id, now_ts, parse_iso8601,
 };
 use crate::error::{ClipKnowError, Result};
 use crate::ingest::url::{ParsedUrl, Platform};
@@ -68,7 +67,12 @@ impl ScrapeCreators {
         let (comments, cm_artifact) = self.fetch_comments(parsed.platform, raw_url, &video.id);
         artifacts.push(cm_artifact);
 
-        Ok(FetchedVideo { video, transcript, comments, artifacts })
+        Ok(FetchedVideo {
+            video,
+            transcript,
+            comments,
+            artifacts,
+        })
     }
 
     fn fetch_comments(
@@ -91,7 +95,10 @@ impl ScrapeCreators {
             Err(e) => {
                 // 调用失败——我们不知道有没有评论，绝不能拿空数组去覆盖旧数据
                 eprintln!("  ! 评论抓取失败（保留上次的结果）: {e}");
-                (Vec::new(), Artifact::failed(ArtifactKind::Comments, e.to_string()))
+                (
+                    Vec::new(),
+                    Artifact::failed(ArtifactKind::Comments, e.to_string()),
+                )
             }
         }
     }
@@ -116,7 +123,10 @@ impl ScrapeCreators {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("  ! 文字稿抓取失败（保留上次的结果）: {e}");
-                    return (None, Artifact::failed(ArtifactKind::Transcript, e.to_string()));
+                    return (
+                        None,
+                        Artifact::failed(ArtifactKind::Transcript, e.to_string()),
+                    );
                 }
             };
 
@@ -139,7 +149,10 @@ impl ScrapeCreators {
             return if is_ai_failure {
                 // 重试完还是失败——是 SC 那边的问题，不是视频没人声
                 eprintln!("  ! AI 转录重试后仍失败（保留上次的结果）");
-                (None, Artifact::failed(ArtifactKind::Transcript, "AI 转录重试后仍失败".into()))
+                (
+                    None,
+                    Artifact::failed(ArtifactKind::Transcript, "AI 转录重试后仍失败".into()),
+                )
             } else {
                 // 确实没有语音内容，这是确定信息
                 (None, Artifact::unavailable(ArtifactKind::Transcript, raw))
@@ -269,7 +282,14 @@ fn normalize_instagram(v: &Value, parsed: &ParsedUrl, raw_url: &str) -> Video {
         platform: parsed.platform,
         native_id: parsed.native_id.clone(),
         url: raw_url.to_string(),
-        title: pick_str(n, &["caption.text", "caption", "edge_media_to_caption.edges.0.node.text"]),
+        title: pick_str(
+            n,
+            &[
+                "caption.text",
+                "caption",
+                "edge_media_to_caption.edges.0.node.text",
+            ],
+        ),
         author_handle: pick_str(n, &["owner.username", "user.username"]),
         author_name: pick_str(n, &["owner.full_name", "user.full_name"]),
         duration_sec: pick_f64(n, &["video_duration"]).map(|d| d as i64),
@@ -299,7 +319,11 @@ fn extract_transcript(v: &Value, video_id: &str) -> Option<Transcript> {
     let raw = raw_transcript_text(v)?;
 
     // WEBVTT 要把时间戳行剥掉，只留台词
-    let text = if is_webvtt(&raw) { strip_webvtt(&raw) } else { raw };
+    let text = if is_webvtt(&raw) {
+        strip_webvtt(&raw)
+    } else {
+        raw
+    };
     let text = text.trim().to_string();
 
     if text.is_empty() || looks_like_transcription_failure(&text) {
@@ -377,7 +401,11 @@ fn join_segments(v: &Value) -> Option<String> {
         .filter_map(|seg| seg.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join(" ");
-    if joined.trim().is_empty() { None } else { Some(joined) }
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 fn extract_comments(v: &Value, video_id: &str, platform: Platform) -> Vec<Comment> {
@@ -401,7 +429,15 @@ fn extract_comments(v: &Value, video_id: &str, platform: Platform) -> Vec<Commen
             Some(Comment {
                 id: pick_str(c, &["id", "cid"]).unwrap_or_else(new_id),
                 video_id: video_id.to_string(),
-                author: pick_str(c, &["author.name", "user.nickname", "user.username", "owner.username"]),
+                author: pick_str(
+                    c,
+                    &[
+                        "author.name",
+                        "user.nickname",
+                        "user.username",
+                        "owner.username",
+                    ],
+                ),
                 text,
                 like_count: pick_i64(c, &["engagement.likes", "digg_count", "like_count"]),
                 published_at: pick_i64(c, &["create_time"])
@@ -423,8 +459,8 @@ fn dig<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
         cur = match part.parse::<usize>() {
-            Ok(idx) => cur.get(idx)?,   // 纯数字当数组下标
-            Err(_) => cur.get(part)?,   // 否则当对象的 key
+            Ok(idx) => cur.get(idx)?, // 纯数字当数组下标
+            Err(_) => cur.get(part)?, // 否则当对象的 key
         };
     }
     Some(cur)
@@ -432,7 +468,9 @@ fn dig<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// 依次尝试多个路径，返回第一个存在且非 null 的节点。
 fn first_present<'a>(v: &'a Value, paths: &[&str]) -> Option<&'a Value> {
-    paths.iter().find_map(|p| dig(v, p).filter(|x| !x.is_null()))
+    paths
+        .iter()
+        .find_map(|p| dig(v, p).filter(|x| !x.is_null()))
 }
 
 fn pick_str(v: &Value, paths: &[&str]) -> Option<String> {
@@ -478,7 +516,10 @@ mod tests {
     use serde_json::json;
 
     fn parsed(platform: Platform, id: &str) -> ParsedUrl {
-        ParsedUrl { platform, native_id: id.to_string() }
+        ParsedUrl {
+            platform,
+            native_id: id.to_string(),
+        }
     }
 
     #[test]
@@ -525,8 +566,14 @@ mod tests {
         });
         let got = normalize_youtube(&v, &parsed(Platform::YouTube, "UZvJzKNJ3dY"), "https://x");
 
-        assert_eq!(got.title.as_deref(), Some("Braun Whole Range 2026 – National Product Review"));
-        assert_eq!(got.author_handle.as_deref(), Some("nationalproductreview2267"));
+        assert_eq!(
+            got.title.as_deref(),
+            Some("Braun Whole Range 2026 – National Product Review")
+        );
+        assert_eq!(
+            got.author_handle.as_deref(),
+            Some("nationalproductreview2267")
+        );
         assert_eq!(got.author_name.as_deref(), Some("National Product Review"));
         assert_eq!(got.duration_sec, Some(57), "毫秒要换算成秒");
         assert_eq!(got.view_count, Some(231));
@@ -550,13 +597,21 @@ mod tests {
                 "video": { "duration": 25067 }
             }
         });
-        let got = normalize_tiktok(&v, &parsed(Platform::TikTok, "7660954507282533662"), "https://x");
+        let got = normalize_tiktok(
+            &v,
+            &parsed(Platform::TikTok, "7660954507282533662"),
+            "https://x",
+        );
 
         assert_eq!(got.title.as_deref(), Some("Mek me tell yuh dis"));
         assert_eq!(got.author_handle.as_deref(), Some("artistcraigkirkland"));
         assert_eq!(got.author_name.as_deref(), Some("Amaziyah The Great Music"));
         assert_eq!(got.duration_sec, Some(25), "25067ms → 25s");
-        assert_eq!(got.published_at, Some(1783704990), "create_time 本来就是秒，不该再解析");
+        assert_eq!(
+            got.published_at,
+            Some(1783704990),
+            "create_time 本来就是秒，不该再解析"
+        );
         assert_eq!(got.view_count, Some(77));
         assert_eq!(got.like_count, Some(9), "TikTok 的点赞是 digg_count");
     }
@@ -635,8 +690,8 @@ mod tests {
         // 防误杀：真实转录里可能碰巧提到「audio」之类的词
         let v = json!({
             "transcript_only_text": "今天教大家怎么给视频配音。首先打开软件，导入 audio 文件，\
-调整音量。然后我们来看第二步，这一步很关键，很多人都做错了。记得把降噪打开，\
-不然背景里的杂音会很明显。最后导出的时候选择高质量。"
+        调整音量。然后我们来看第二步，这一步很关键，很多人都做错了。记得把降噪打开，\
+        不然背景里的杂音会很明显。最后导出的时候选择高质量。"
         });
         assert!(
             extract_transcript(&v, "vid-1").is_some(),
@@ -673,7 +728,9 @@ mod tests {
 
     #[test]
     fn comments_are_capped_and_blanks_dropped() {
-        let mut list: Vec<Value> = (0..50).map(|i| json!({"content": format!("c{i}")})).collect();
+        let mut list: Vec<Value> = (0..50)
+            .map(|i| json!({"content": format!("c{i}")}))
+            .collect();
         list.push(json!({"content": "   "}));
         let v = json!({ "comments": list });
         let cs = extract_comments(&v, "vid-1", Platform::YouTube);

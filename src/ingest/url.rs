@@ -60,7 +60,9 @@ pub fn parse(raw: &str) -> Result<ParsedUrl> {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
-    let without_www = without_scheme.strip_prefix("www.").unwrap_or(without_scheme);
+    let without_www = without_scheme
+        .strip_prefix("www.")
+        .unwrap_or(without_scheme);
     let lower = without_www.to_ascii_lowercase();
 
     if lower.starts_with("youtube.com/") || lower.starts_with("m.youtube.com/") {
@@ -130,16 +132,21 @@ fn parse_instagram(s: &str, raw: &str) -> Result<ParsedUrl> {
 fn segment_after(s: &str, marker: &str) -> Option<String> {
     let idx = s.to_ascii_lowercase().find(&marker.to_ascii_lowercase())?;
     let rest = &s[idx + marker.len()..];
-    let end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let seg = &rest[..end];
-    if seg.is_empty() { None } else { Some(seg.to_string()) }
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_string())
+    }
 }
 
 /// 小工具：少写几遍 Ok(ParsedUrl { .. })
 fn ok(platform: Platform, native_id: String) -> Result<ParsedUrl> {
-    Ok(ParsedUrl { platform, native_id })
+    Ok(ParsedUrl {
+        platform,
+        native_id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +185,11 @@ mod tests {
 
     #[test]
     fn youtube_short_link() {
-        assert_parses("https://youtu.be/dQw4w9WgXcQ", Platform::YouTube, "dQw4w9WgXcQ");
+        assert_parses(
+            "https://youtu.be/dQw4w9WgXcQ",
+            Platform::YouTube,
+            "dQw4w9WgXcQ",
+        );
     }
 
     #[test]
@@ -201,12 +212,20 @@ mod tests {
 
     #[test]
     fn tiktok_short_link() {
-        assert_parses("https://vm.tiktok.com/ZMh1a2b3c/", Platform::TikTok, "ZMh1a2b3c");
+        assert_parses(
+            "https://vm.tiktok.com/ZMh1a2b3c/",
+            Platform::TikTok,
+            "ZMh1a2b3c",
+        );
     }
 
     #[test]
     fn instagram_post() {
-        assert_parses("https://www.instagram.com/p/C1a2B3c4D5e/", Platform::Instagram, "C1a2B3c4D5e");
+        assert_parses(
+            "https://www.instagram.com/p/C1a2B3c4D5e/",
+            Platform::Instagram,
+            "C1a2B3c4D5e",
+        );
     }
 
     #[test]

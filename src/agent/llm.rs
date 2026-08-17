@@ -13,7 +13,7 @@
 //! Rust 没有官方 Anthropic SDK，所以这里是手写 HTTP。好在有 reqwest + serde，
 //! 总共不到 100 行。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::{ClipKnowError, Result};
 
@@ -45,7 +45,10 @@ pub struct Msg {
 
 impl Msg {
     pub fn user(text: impl Into<String>) -> Self {
-        Msg { role: Role::User, text: text.into() }
+        Msg {
+            role: Role::User,
+            text: text.into(),
+        }
     }
 }
 
@@ -129,7 +132,11 @@ impl AnthropicClient {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("构造 HTTP 客户端失败");
-        Self { http, api_key, model }
+        Self {
+            http,
+            api_key,
+            model,
+        }
     }
 
     pub fn from_env() -> Result<Self> {
@@ -138,8 +145,7 @@ impl AnthropicClient {
         // 每家一个独立的变量。共用一个 CLIPKNOW_MODEL 会出事：
         // 设了 claude-opus-5 之后再 --provider deepseek，模型名会被发给
         // DeepSeek，直接 400。
-        let model =
-            std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         Ok(Self::new(key, model))
     }
 
@@ -170,7 +176,10 @@ impl AnthropicClient {
 impl LlmClient for AnthropicClient {
     fn pricing(&self) -> Pricing {
         // Claude Opus 5：$5 / $25 每百万 token
-        Pricing { input_per_mtok: 5.0, output_per_mtok: 25.0 }
+        Pricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+        }
     }
 
     fn model_name(&self) -> &str {
@@ -289,8 +298,8 @@ impl DeepSeekClient {
     pub fn from_env() -> Result<Self> {
         let key = std::env::var("DEEPSEEK_API_KEY")
             .map_err(|_| ClipKnowError::MissingEnv("DEEPSEEK_API_KEY"))?;
-        let model = std::env::var("DEEPSEEK_MODEL")
-            .unwrap_or_else(|_| DEEPSEEK_DEFAULT_MODEL.to_string());
+        let model =
+            std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_DEFAULT_MODEL.to_string());
         Ok(Self::new(key, model))
     }
 
@@ -321,7 +330,10 @@ impl LlmClient for DeepSeekClient {
     fn pricing(&self) -> Pricing {
         // ⚠️ DeepSeek 调过几次价，这里是数量级参考，以官网为准：
         // https://platform.deepseek.com/api-docs/pricing
-        Pricing { input_per_mtok: 0.27, output_per_mtok: 1.10 }
+        Pricing {
+            input_per_mtok: 0.27,
+            output_per_mtok: 1.10,
+        }
     }
 
     fn model_name(&self) -> &str {
@@ -436,7 +448,11 @@ pub fn build_client(explicit: Option<Provider>) -> Result<Box<dyn LlmClient>> {
         Some(p) => p,
         None if has_deepseek => Provider::DeepSeek,
         None if has_anthropic => Provider::Anthropic,
-        None => return Err(ClipKnowError::MissingEnv("DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY")),
+        None => {
+            return Err(ClipKnowError::MissingEnv(
+                "DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY",
+            ));
+        }
     };
 
     Ok(match chosen {
@@ -477,7 +493,10 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 2}
         });
         let r = parse_anthropic_response(&body).unwrap();
-        assert_eq!(r.text, "答案第一段。第二段。", "thinking 块要跳过，text 块要拼接");
+        assert_eq!(
+            r.text, "答案第一段。第二段。",
+            "thinking 块要跳过，text 块要拼接"
+        );
     }
 
     #[test]
@@ -549,7 +568,10 @@ mod tests {
             max_tokens: 8192,
         });
 
-        assert!(body.get("system").is_none(), "OpenAI 格式没有顶层 system 字段");
+        assert!(
+            body.get("system").is_none(),
+            "OpenAI 格式没有顶层 system 字段"
+        );
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "你是助手");
         assert_eq!(body["messages"][1]["role"], "user");
@@ -593,7 +615,10 @@ mod tests {
             "choices": [{"message": {"content": "半句"}, "finish_reason": "length"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 8192}
         });
-        assert_eq!(parse_openai_response(&body).unwrap().stop_reason, StopReason::MaxTokens);
+        assert_eq!(
+            parse_openai_response(&body).unwrap().stop_reason,
+            StopReason::MaxTokens
+        );
     }
 
     #[test]

@@ -20,9 +20,9 @@
 
 use clap::{Parser, Subcommand};
 
-use clipknow::agent::llm::{build_client, ModelRequest, Msg, Provider, StopReason};
+use clipknow::agent::llm::{ModelRequest, Msg, Provider, StopReason, build_client};
 use clipknow::content::evidence::{
-    build_evidence, format_date, format_duration, QUESTION_CLOSE, QUESTION_OPEN, SYSTEM_PROMPT,
+    QUESTION_CLOSE, QUESTION_OPEN, SYSTEM_PROMPT, build_evidence, format_date, format_duration,
 };
 use clipknow::error::{ClipKnowError, Result};
 use clipknow::ingest::scrapecreators::ScrapeCreators;
@@ -86,18 +86,21 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     // --provider 给了但拼错时，明确报错而不是悄悄用默认的那家
     let provider = match &cli.provider {
-        Some(s) => Some(
-            Provider::parse(s)
-                .ok_or_else(|| ClipKnowError::Llm(format!("不认识的 provider: {s}（可选 deepseek / anthropic）")))?,
-        ),
+        Some(s) => Some(Provider::parse(s).ok_or_else(|| {
+            ClipKnowError::Llm(format!(
+                "不认识的 provider: {s}（可选 deepseek / anthropic）"
+            ))
+        })?),
         None => None,
     };
 
     let mut store = SqliteStore::open(&cli.db)?;
     match cli.command {
-        Command::Ask { url, question, refresh } => {
-            cmd_ask(&mut store, &url, &question, refresh, provider)
-        }
+        Command::Ask {
+            url,
+            question,
+            refresh,
+        } => cmd_ask(&mut store, &url, &question, refresh, provider),
         Command::Show { url, raw } => cmd_show(&store, &url, raw),
         Command::List { limit } => cmd_list(&store, limit),
     }
@@ -107,9 +110,7 @@ fn run(cli: Cli) -> Result<()> {
 fn ensure_ingested(store: &mut SqliteStore, raw_url: &str, refresh: bool) -> Result<StoredVideo> {
     let parsed = url::parse(raw_url)?;
 
-    if !refresh
-        && let Some(sv) = store.find_by_native(parsed.platform, &parsed.native_id)?
-    {
+    if !refresh && let Some(sv) = store.find_by_native(parsed.platform, &parsed.native_id)? {
         println!("· 命中缓存（加 --refresh 可强制重抓）");
         return Ok(sv);
     }
@@ -169,7 +170,8 @@ fn cmd_ask(
         llm.model_name(),
         resp.input_tokens,
         resp.output_tokens,
-        llm.pricing().cost_usd(resp.input_tokens, resp.output_tokens)
+        llm.pricing()
+            .cost_usd(resp.input_tokens, resp.output_tokens)
     );
     Ok(())
 }
@@ -200,14 +202,12 @@ fn cmd_list(store: &SqliteStore, limit: usize) -> Result<()> {
         println!(
             "{:<10} {:<8} {}",
             v.platform.as_str(),
-            v.duration_sec.map(format_duration).unwrap_or_else(|| "-".into()),
+            v.duration_sec
+                .map(format_duration)
+                .unwrap_or_else(|| "-".into()),
             v.title.as_deref().unwrap_or("(无标题)")
         );
-        println!(
-            "           {}  抓取于 {}",
-            v.url,
-            format_date(v.fetched_at)
-        );
+        println!("           {}  抓取于 {}", v.url, format_date(v.fetched_at));
     }
     println!("\n共 {} 条", videos.len());
     Ok(())

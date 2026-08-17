@@ -4,7 +4,7 @@
 //! `bundled` feature 让它把 SQLite 源码一起编译进来，所以你的机器上
 //! 不需要另外装任何东西。
 
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::content::model::{ArtifactKind, Comment, FetchedVideo, Transcript, Video};
 use crate::error::Result;
@@ -86,7 +86,11 @@ impl Store for SqliteStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        Ok(Some(StoredVideo { video, transcript, comments }))
+        Ok(Some(StoredVideo {
+            video,
+            transcript,
+            comments,
+        }))
     }
 
     fn save(&mut self, fetched: &FetchedVideo) -> Result<String> {
@@ -118,10 +122,21 @@ impl Store for SqliteStore {
                 comment_count=excluded.comment_count, description=excluded.description,
                 raw_json=excluded.raw_json, fetched_at=excluded.fetched_at",
             params![
-                video_id, v.platform.as_str(), v.native_id, v.url, v.title,
-                v.author_handle, v.author_name, v.duration_sec, v.published_at,
-                v.view_count, v.like_count, v.comment_count, v.description,
-                v.raw_json, v.fetched_at
+                video_id,
+                v.platform.as_str(),
+                v.native_id,
+                v.url,
+                v.title,
+                v.author_handle,
+                v.author_name,
+                v.duration_sec,
+                v.published_at,
+                v.view_count,
+                v.like_count,
+                v.comment_count,
+                v.description,
+                v.raw_json,
+                v.fetched_at
             ],
         )?;
 
@@ -129,7 +144,10 @@ impl Store for SqliteStore {
         // 抓取失败（网络错误 / AI 转录挂了）时保持原样——否则 --refresh
         // 碰上一次抖动，就把上次抓好的内容弄丢了。
         if fetched.status_of(ArtifactKind::Transcript).is_conclusive() {
-            tx.execute("DELETE FROM transcripts WHERE video_id = ?1", params![video_id])?;
+            tx.execute(
+                "DELETE FROM transcripts WHERE video_id = ?1",
+                params![video_id],
+            )?;
             if let Some(t) = &fetched.transcript {
                 tx.execute(
                     "INSERT INTO transcripts (video_id, text, source, lang, fetched_at)
@@ -142,7 +160,10 @@ impl Store for SqliteStore {
         // ★ 评论：同样的规则。以前是无条件先删后插，评论请求一失败
         // 就把旧评论全清空了。
         if fetched.status_of(ArtifactKind::Comments).is_conclusive() {
-            tx.execute("DELETE FROM comments WHERE video_id = ?1", params![video_id])?;
+            tx.execute(
+                "DELETE FROM comments WHERE video_id = ?1",
+                params![video_id],
+            )?;
             for c in &fetched.comments {
                 tx.execute(
                     "INSERT OR REPLACE INTO comments (id, video_id, author, text, like_count, published_at)
@@ -168,9 +189,9 @@ impl Store for SqliteStore {
     }
 
     fn list_videos(&self, limit: usize) -> Result<Vec<Video>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {VIDEO_COLS} FROM videos ORDER BY fetched_at DESC LIMIT ?1"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {VIDEO_COLS} FROM videos ORDER BY fetched_at DESC LIMIT ?1"
+        ))?;
         let rows = stmt
             .query_map(params![limit as i64], row_to_video)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -209,7 +230,7 @@ fn row_to_video(r: &Row) -> rusqlite::Result<Video> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::model::{new_id, now_ts, Artifact};
+    use crate::content::model::{Artifact, new_id, now_ts};
 
     /// 三个端点都成功的 artifacts。
     fn all_ok() -> Vec<Artifact> {
@@ -249,12 +270,20 @@ mod tests {
             }),
             comments: vec![
                 Comment {
-                    id: "c1".into(), video_id: vid.clone(), author: Some("a".into()),
-                    text: "冷门评论".into(), like_count: Some(3), published_at: Some(1755412863),
+                    id: "c1".into(),
+                    video_id: vid.clone(),
+                    author: Some("a".into()),
+                    text: "冷门评论".into(),
+                    like_count: Some(3),
+                    published_at: Some(1755412863),
                 },
                 Comment {
-                    id: "c2".into(), video_id: vid.clone(), author: Some("b".into()),
-                    text: "热门评论".into(), like_count: Some(999), published_at: Some(1755412863),
+                    id: "c2".into(),
+                    video_id: vid.clone(),
+                    author: Some("b".into()),
+                    text: "热门评论".into(),
+                    like_count: Some(999),
+                    published_at: Some(1755412863),
                 },
             ],
             artifacts: all_ok(),
@@ -266,7 +295,10 @@ mod tests {
         let mut s = SqliteStore::in_memory().unwrap();
         s.save(&sample("abc", "标题")).unwrap();
 
-        let got = s.find_by_native(Platform::YouTube, "abc").unwrap().expect("应该查到");
+        let got = s
+            .find_by_native(Platform::YouTube, "abc")
+            .unwrap()
+            .expect("应该查到");
         assert_eq!(got.video.title.as_deref(), Some("标题"));
         assert_eq!(got.video.duration_sec, Some(57));
         assert_eq!(got.video.comment_count, None, "NULL 应该原样读回来");
@@ -285,7 +317,11 @@ mod tests {
     #[test]
     fn missing_video_returns_none_not_error() {
         let s = SqliteStore::in_memory().unwrap();
-        assert!(s.find_by_native(Platform::YouTube, "nope").unwrap().is_none());
+        assert!(
+            s.find_by_native(Platform::YouTube, "nope")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -309,7 +345,11 @@ mod tests {
         s.save(&second).unwrap();
 
         let got = s.find_by_native(Platform::YouTube, "abc").unwrap().unwrap();
-        assert_eq!(got.comments.len(), 1, "重抓后评论应以最新一批为准，不能累积");
+        assert_eq!(
+            got.comments.len(),
+            1,
+            "重抓后评论应以最新一批为准，不能累积"
+        );
     }
 
     #[test]
@@ -321,7 +361,10 @@ mod tests {
         f.comments.clear();
         s.save(&f).unwrap();
 
-        let got = s.find_by_native(Platform::YouTube, "silent").unwrap().unwrap();
+        let got = s
+            .find_by_native(Platform::YouTube, "silent")
+            .unwrap()
+            .unwrap();
         assert!(got.transcript.is_none());
         assert!(got.comments.is_empty());
     }
@@ -421,7 +464,9 @@ mod tests {
 
         let mut stmt = s
             .conn
-            .prepare("SELECT kind, status, raw_json FROM artifacts WHERE video_id = ?1 ORDER BY kind")
+            .prepare(
+                "SELECT kind, status, raw_json FROM artifacts WHERE video_id = ?1 ORDER BY kind",
+            )
             .unwrap();
         let rows: Vec<(String, String, Option<String>)> = stmt
             .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))

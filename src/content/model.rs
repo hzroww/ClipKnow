@@ -113,13 +113,31 @@ pub struct Artifact {
 
 impl Artifact {
     pub fn ok(kind: ArtifactKind, raw: String) -> Self {
-        Artifact { kind, status: FetchStatus::Ok, raw_json: Some(raw), error: None, fetched_at: now_ts() }
+        Artifact {
+            kind,
+            status: FetchStatus::Ok,
+            raw_json: Some(raw),
+            error: None,
+            fetched_at: now_ts(),
+        }
     }
     pub fn unavailable(kind: ArtifactKind, raw: String) -> Self {
-        Artifact { kind, status: FetchStatus::Unavailable, raw_json: Some(raw), error: None, fetched_at: now_ts() }
+        Artifact {
+            kind,
+            status: FetchStatus::Unavailable,
+            raw_json: Some(raw),
+            error: None,
+            fetched_at: now_ts(),
+        }
     }
     pub fn failed(kind: ArtifactKind, err: String) -> Self {
-        Artifact { kind, status: FetchStatus::Failed, raw_json: None, error: Some(err), fetched_at: now_ts() }
+        Artifact {
+            kind,
+            status: FetchStatus::Failed,
+            raw_json: None,
+            error: Some(err),
+            fetched_at: now_ts(),
+        }
     }
 }
 

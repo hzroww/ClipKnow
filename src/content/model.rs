@@ -54,12 +54,94 @@ pub struct Comment {
     pub published_at: Option<i64>,
 }
 
-/// 一次抓取的完整结果：元数据 + 可选的文字稿 + 评论。
+/// 一次端点调用的结局。
+///
+/// 关键是区分 `Unavailable` 和 `Failed`：
+/// - `Unavailable`：调用成功，内容**确实没有**（纯画面视频没人声、视频没评论）。
+///   这是确定的信息，应该覆盖掉旧数据。
+/// - `Failed`：调用**失败了**，我们不知道有没有。这时绝不能覆盖旧数据——
+///   否则 `--refresh` 遇到一次网络抖动，就把上次抓好的评论清空了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStatus {
+    Ok,
+    Unavailable,
+    Failed,
+}
+
+impl FetchStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FetchStatus::Ok => "ok",
+            FetchStatus::Unavailable => "unavailable",
+            FetchStatus::Failed => "failed",
+        }
+    }
+
+    /// 这个结局是否足以确定内容状态、可以覆盖旧数据。
+    pub fn is_conclusive(&self) -> bool {
+        matches!(self, FetchStatus::Ok | FetchStatus::Unavailable)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Detail,
+    Transcript,
+    Comments,
+}
+
+impl ArtifactKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArtifactKind::Detail => "detail",
+            ArtifactKind::Transcript => "transcript",
+            ArtifactKind::Comments => "comments",
+        }
+    }
+}
+
+/// 一次端点调用的完整记录：结局 + 原始响应。
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    pub kind: ArtifactKind,
+    pub status: FetchStatus,
+    /// 原始响应，原样保存。解析漏了字段以后能从这里补，不用重新花钱抓。
+    pub raw_json: Option<String>,
+    pub error: Option<String>,
+    pub fetched_at: i64,
+}
+
+impl Artifact {
+    pub fn ok(kind: ArtifactKind, raw: String) -> Self {
+        Artifact { kind, status: FetchStatus::Ok, raw_json: Some(raw), error: None, fetched_at: now_ts() }
+    }
+    pub fn unavailable(kind: ArtifactKind, raw: String) -> Self {
+        Artifact { kind, status: FetchStatus::Unavailable, raw_json: Some(raw), error: None, fetched_at: now_ts() }
+    }
+    pub fn failed(kind: ArtifactKind, err: String) -> Self {
+        Artifact { kind, status: FetchStatus::Failed, raw_json: None, error: Some(err), fetched_at: now_ts() }
+    }
+}
+
+/// 一次抓取的完整结果：元数据 + 可选的文字稿 + 评论 + 每个端点的结局。
 #[derive(Debug, Clone)]
 pub struct FetchedVideo {
     pub video: Video,
     pub transcript: Option<Transcript>,
     pub comments: Vec<Comment>,
+    /// 三个端点各一条。写库时用它决定「能不能覆盖旧数据」。
+    pub artifacts: Vec<Artifact>,
+}
+
+impl FetchedVideo {
+    pub fn status_of(&self, kind: ArtifactKind) -> FetchStatus {
+        self.artifacts
+            .iter()
+            .find(|a| a.kind == kind)
+            .map(|a| a.status)
+            // 没有记录就当失败处理：宁可保留旧数据，也不要误删
+            .unwrap_or(FetchStatus::Failed)
+    }
 }
 
 /// 当前 Unix 时间戳（秒）。

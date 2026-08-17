@@ -30,7 +30,8 @@ impl Platform {
     }
 
     /// 从数据库读回来时用。
-    pub fn from_str(s: &str) -> Option<Platform> {
+    /// 刻意不叫 from_str：那个名字会和标准库的 `std::str::FromStr` 撞。
+    pub fn from_db(s: &str) -> Option<Platform> {
         match s {
             "youtube" => Some(Platform::YouTube),
             "tiktok" => Some(Platform::TikTok),
@@ -88,10 +89,10 @@ fn parse_youtube(s: &str, raw: &str) -> Result<ParsedUrl> {
     // /watch?v=ID 形式：从 query 里找 v 参数
     if let Some(q) = s.split_once('?').map(|(_, q)| q) {
         for pair in q.split('&') {
-            if let Some(v) = pair.strip_prefix("v=") {
-                if !v.is_empty() {
-                    return ok(Platform::YouTube, v.to_string());
-                }
+            if let Some(v) = pair.strip_prefix("v=")
+                && !v.is_empty()
+            {
+                return ok(Platform::YouTube, v.to_string());
             }
         }
     }
@@ -253,7 +254,7 @@ mod tests {
     #[test]
     fn platform_string_roundtrip() {
         for p in [Platform::YouTube, Platform::TikTok, Platform::Instagram] {
-            assert_eq!(Platform::from_str(p.as_str()), Some(p));
+            assert_eq!(Platform::from_db(p.as_str()), Some(p));
         }
     }
 }

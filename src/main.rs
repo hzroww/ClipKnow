@@ -21,7 +21,9 @@
 use clap::{Parser, Subcommand};
 
 use clipknow::agent::llm::{build_client, ModelRequest, Msg, Provider, StopReason};
-use clipknow::content::evidence::{build_evidence, format_date, format_duration, SYSTEM_PROMPT};
+use clipknow::content::evidence::{
+    build_evidence, format_date, format_duration, QUESTION_CLOSE, QUESTION_OPEN, SYSTEM_PROMPT,
+};
 use clipknow::error::{ClipKnowError, Result};
 use clipknow::ingest::scrapecreators::ScrapeCreators;
 use clipknow::ingest::url;
@@ -105,11 +107,11 @@ fn run(cli: Cli) -> Result<()> {
 fn ensure_ingested(store: &mut SqliteStore, raw_url: &str, refresh: bool) -> Result<StoredVideo> {
     let parsed = url::parse(raw_url)?;
 
-    if !refresh {
-        if let Some(sv) = store.find_by_native(parsed.platform, &parsed.native_id)? {
-            println!("· 命中缓存（加 --refresh 可强制重抓）");
-            return Ok(sv);
-        }
+    if !refresh
+        && let Some(sv) = store.find_by_native(parsed.platform, &parsed.native_id)?
+    {
+        println!("· 命中缓存（加 --refresh 可强制重抓）");
+        return Ok(sv);
     }
 
     println!("· 正在抓取 {} ...", parsed.platform.as_str());
@@ -141,8 +143,11 @@ fn cmd_ask(
 ) -> Result<()> {
     let sv = ensure_ingested(store, raw_url, refresh)?;
 
+    // 材料自带 <video-material> 包裹（内容里伪造的标签已被中和），
+    // 用户的问题单独用 <user-question> 包起来——系统提示词里说了，
+    // 只有这个标签里的内容才是真正要执行的指令。
     let evidence = build_evidence(&sv);
-    let prompt = format!("{evidence}\n\n=== 用户的问题 ===\n{question}");
+    let prompt = format!("{evidence}\n{QUESTION_OPEN}\n{question}\n{QUESTION_CLOSE}");
 
     // 这里拿到的是 Box<dyn LlmClient>，下面的代码完全不知道背后是哪一家
     let llm = build_client(provider)?;

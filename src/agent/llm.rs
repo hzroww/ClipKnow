@@ -135,8 +135,11 @@ impl AnthropicClient {
     pub fn from_env() -> Result<Self> {
         let key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| ClipKnowError::MissingEnv("ANTHROPIC_API_KEY"))?;
+        // 每家一个独立的变量。共用一个 CLIPKNOW_MODEL 会出事：
+        // 设了 claude-opus-5 之后再 --provider deepseek，模型名会被发给
+        // DeepSeek，直接 400。
         let model =
-            std::env::var("CLIPKNOW_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+            std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         Ok(Self::new(key, model))
     }
 
@@ -286,7 +289,7 @@ impl DeepSeekClient {
     pub fn from_env() -> Result<Self> {
         let key = std::env::var("DEEPSEEK_API_KEY")
             .map_err(|_| ClipKnowError::MissingEnv("DEEPSEEK_API_KEY"))?;
-        let model = std::env::var("CLIPKNOW_MODEL")
+        let model = std::env::var("DEEPSEEK_MODEL")
             .unwrap_or_else(|_| DEEPSEEK_DEFAULT_MODEL.to_string());
         Ok(Self::new(key, model))
     }

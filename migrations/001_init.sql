@@ -43,6 +43,32 @@ CREATE TABLE IF NOT EXISTS comments (
 );
 CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id);
 
+-- 3.5 抓取产物（artifacts）
+--
+-- 一次摄取会调三个端点（详情/文字稿/评论），每个都可能有三种结局。
+-- 不区分的话会出两类问题：
+--   a) 「调用失败」被当成「确实没有」，永久缓存下来，以后再也不会补抓
+--   b) --refresh 时评论请求失败，旧评论被清空 → 新元数据 + 空评论的混合状态
+-- 所以每个端点单独记状态，并把**原始响应**存下来。
+--
+-- status:
+--   ok          — 拿到内容了
+--   unavailable — 调用成功，但确实没有（纯画面视频没人声、视频没评论）
+--   failed      — 调用失败（网络错误、SC 报错、AI 转录重试后仍失败）
+--
+-- raw_json 存每个端点的原始响应。videos.raw_json 只有详情那一份，
+-- 文字稿和评论的原始数据以前是丢掉的——所以「解析漏字段随时能补」
+-- 这个承诺之前并不成立（改 Instagram transcripts[] 时只能付费重抓）。
+CREATE TABLE IF NOT EXISTS artifacts (
+  video_id   TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL,      -- detail / transcript / comments
+  status     TEXT NOT NULL,      -- ok / unavailable / failed
+  raw_json   TEXT,               -- 原始响应；failed 且没拿到响应时为 NULL
+  error      TEXT,               -- failed 时的错误信息
+  fetched_at INTEGER NOT NULL,
+  PRIMARY KEY (video_id, kind)
+);
+
 -- 4/5. 会话和消息。
 -- 第一版一问一答、答完就退出，不往这两张表写东西。
 -- 但表先建好：第二步加 agent 循环时立刻要用，到时候不用改表结构、不用迁数据。

@@ -7,12 +7,14 @@
 //! 取字段用的是「多候选路径」的写法而不是强类型 struct，原因有二：
 //! 1. 三家字段名差异太大，写三套 struct 很啰嗦
 //! 2. 平台字段随时可能改；取不到就是 None，不会让整次抓取崩掉
-//! 反正原始 JSON 我们整个存进 `raw_json` 了，将来要补字段随时能补。
+//!
+//! 反正每个端点的原始响应都存进了 `artifacts` 表，将来要补字段随时能补。
 
 use serde_json::Value;
 
 use crate::content::model::{
-    now_ts, new_id, parse_iso8601, Comment, FetchedVideo, Transcript, Video,
+    new_id, now_ts, parse_iso8601, Artifact, ArtifactKind, Comment, FetchedVideo, Transcript,
+    Video,
 };
 use crate::error::{ClipKnowError, Result};
 use crate::ingest::url::{ParsedUrl, Platform};
@@ -47,7 +49,10 @@ impl ScrapeCreators {
     /// 元数据抓不到就整个失败（没有元数据这条记录没意义）；
     /// 文字稿和评论抓不到只是缺一块证据，不影响主流程。
     pub fn fetch(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo> {
+        let mut artifacts = Vec::new();
+
         let detail = self.get(detail_endpoint(parsed.platform), raw_url)?;
+        artifacts.push(Artifact::ok(ArtifactKind::Detail, detail.to_string()));
 
         let video = match parsed.platform {
             Platform::YouTube => normalize_youtube(&detail, parsed, raw_url),
@@ -55,19 +60,40 @@ impl ScrapeCreators {
             Platform::Instagram => normalize_instagram(&detail, parsed, raw_url),
         };
 
-        // 文字稿：失败不致命，打个提示继续
-        let transcript = self.fetch_transcript(parsed.platform, raw_url, &video.id);
+        // 文字稿：失败不致命，但要记下「是失败还是确实没有」
+        let (transcript, tr_artifact) = self.fetch_transcript(parsed.platform, raw_url, &video.id);
+        artifacts.push(tr_artifact);
 
-        // 评论：同样失败不致命
-        let comments = match self.get(comments_endpoint(parsed.platform), raw_url) {
-            Ok(v) => extract_comments(&v, &video.id, parsed.platform),
-            Err(e) => {
-                eprintln!("  ! 评论抓取失败（继续）: {e}");
-                Vec::new()
+        // 评论：同上
+        let (comments, cm_artifact) = self.fetch_comments(parsed.platform, raw_url, &video.id);
+        artifacts.push(cm_artifact);
+
+        Ok(FetchedVideo { video, transcript, comments, artifacts })
+    }
+
+    fn fetch_comments(
+        &self,
+        platform: Platform,
+        url: &str,
+        video_id: &str,
+    ) -> (Vec<Comment>, Artifact) {
+        match self.get(comments_endpoint(platform), url) {
+            Ok(v) => {
+                let comments = extract_comments(&v, video_id, platform);
+                let raw = v.to_string();
+                if comments.is_empty() {
+                    // 调用成功但没评论——这是确定信息（视频真的没人评论）
+                    (comments, Artifact::unavailable(ArtifactKind::Comments, raw))
+                } else {
+                    (comments, Artifact::ok(ArtifactKind::Comments, raw))
+                }
             }
-        };
-
-        Ok(FetchedVideo { video, transcript, comments })
+            Err(e) => {
+                // 调用失败——我们不知道有没有评论，绝不能拿空数组去覆盖旧数据
+                eprintln!("  ! 评论抓取失败（保留上次的结果）: {e}");
+                (Vec::new(), Artifact::failed(ArtifactKind::Comments, e.to_string()))
+            }
+        }
     }
 
     /// 抓文字稿，AI 转录失败时重试一次。
@@ -79,18 +105,24 @@ impl ScrapeCreators {
     ///
     /// 代价是失败那次多花 1 个 credit。只在**确认是 AI 失败**时才重试——
     /// 真的没有人声（纯画面 + BGM）不会触发，避免白花钱。
-    fn fetch_transcript(&self, platform: Platform, url: &str, video_id: &str) -> Option<Transcript> {
+    fn fetch_transcript(
+        &self,
+        platform: Platform,
+        url: &str,
+        video_id: &str,
+    ) -> (Option<Transcript>, Artifact) {
         for attempt in 1..=2 {
             let body = match self.get(transcript_endpoint(platform), url) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("  ! 文字稿抓取失败（继续）: {e}");
-                    return None;
+                    eprintln!("  ! 文字稿抓取失败（保留上次的结果）: {e}");
+                    return (None, Artifact::failed(ArtifactKind::Transcript, e.to_string()));
                 }
             };
 
             if let Some(t) = extract_transcript(&body, video_id) {
-                return Some(t);
+                let raw = body.to_string();
+                return (Some(t), Artifact::ok(ArtifactKind::Transcript, raw));
             }
 
             // 提取不到。区分两种情况：AI 转录失败（值得重试）vs 真的没人声（别浪费钱）
@@ -102,9 +134,18 @@ impl ScrapeCreators {
                 eprintln!("  ! AI 转录这次失败了，重试一次 ...");
                 continue;
             }
-            return None;
+
+            let raw = body.to_string();
+            return if is_ai_failure {
+                // 重试完还是失败——是 SC 那边的问题，不是视频没人声
+                eprintln!("  ! AI 转录重试后仍失败（保留上次的结果）");
+                (None, Artifact::failed(ArtifactKind::Transcript, "AI 转录重试后仍失败".into()))
+            } else {
+                // 确实没有语音内容，这是确定信息
+                (None, Artifact::unavailable(ArtifactKind::Transcript, raw))
+            };
         }
-        None
+        unreachable!("循环最多两轮，每轮都会 return")
     }
 
     /// 发一个 GET 请求，检查 SC 的 success 字段，返回解析好的 JSON。
@@ -415,11 +456,16 @@ fn pick_f64(v: &Value, paths: &[&str]) -> Option<f64> {
     first_present(v, paths)?.as_f64()
 }
 
+/// 截断字符串用于错误信息。
+///
+/// 必须按**字符**切而不是字节：`&s[..200]` 如果切点落在一个中文字或 emoji
+/// 中间，Rust 会直接 panic（不是抛异常，是程序当场崩）。SC 返回中文错误
+/// 信息时就会踩到这个。
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
 }
 

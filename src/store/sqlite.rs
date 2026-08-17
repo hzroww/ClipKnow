@@ -6,7 +6,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::content::model::{Comment, FetchedVideo, Transcript, Video};
+use crate::content::model::{ArtifactKind, Comment, FetchedVideo, Transcript, Video};
 use crate::error::Result;
 use crate::ingest::url::Platform;
 use crate::store::{Store, StoredVideo};
@@ -125,24 +125,41 @@ impl Store for SqliteStore {
             ],
         )?;
 
-        if let Some(t) = &fetched.transcript {
-            tx.execute(
-                "INSERT INTO transcripts (video_id, text, source, lang, fetched_at)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(video_id) DO UPDATE SET
-                    text=excluded.text, source=excluded.source,
-                    lang=excluded.lang, fetched_at=excluded.fetched_at",
-                params![video_id, t.text, t.source, t.lang, t.fetched_at],
-            )?;
+        // ★ 文字稿：只有「结论明确」时才动旧数据。
+        // 抓取失败（网络错误 / AI 转录挂了）时保持原样——否则 --refresh
+        // 碰上一次抖动，就把上次抓好的内容弄丢了。
+        if fetched.status_of(ArtifactKind::Transcript).is_conclusive() {
+            tx.execute("DELETE FROM transcripts WHERE video_id = ?1", params![video_id])?;
+            if let Some(t) = &fetched.transcript {
+                tx.execute(
+                    "INSERT INTO transcripts (video_id, text, source, lang, fetched_at)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![video_id, t.text, t.source, t.lang, t.fetched_at],
+                )?;
+            }
         }
 
-        // 评论先清后插：重抓时以最新一批为准，不留旧数据
-        tx.execute("DELETE FROM comments WHERE video_id = ?1", params![video_id])?;
-        for c in &fetched.comments {
+        // ★ 评论：同样的规则。以前是无条件先删后插，评论请求一失败
+        // 就把旧评论全清空了。
+        if fetched.status_of(ArtifactKind::Comments).is_conclusive() {
+            tx.execute("DELETE FROM comments WHERE video_id = ?1", params![video_id])?;
+            for c in &fetched.comments {
+                tx.execute(
+                    "INSERT OR REPLACE INTO comments (id, video_id, author, text, like_count, published_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![c.id, video_id, c.author, c.text, c.like_count, c.published_at],
+                )?;
+            }
+        }
+
+        // 三个端点的结局和原始响应都记下来。
+        // 原始响应是「以后解析漏了字段能补回来」的唯一依靠——
+        // 之前只存了详情那一份，文字稿和评论的原始数据是丢掉的。
+        for a in &fetched.artifacts {
             tx.execute(
-                "INSERT OR REPLACE INTO comments (id, video_id, author, text, like_count, published_at)
+                "INSERT OR REPLACE INTO artifacts (video_id, kind, status, raw_json, error, fetched_at)
                  VALUES (?1,?2,?3,?4,?5,?6)",
-                params![c.id, video_id, c.author, c.text, c.like_count, c.published_at],
+                params![video_id, a.kind.as_str(), a.status.as_str(), a.raw_json, a.error, a.fetched_at],
             )?;
         }
 
@@ -171,7 +188,7 @@ fn row_to_video(r: &Row) -> rusqlite::Result<Video> {
     Ok(Video {
         id: r.get(0)?,
         // 库里的值只可能来自 Platform::as_str()，取不回来说明数据被手改过
-        platform: Platform::from_str(&platform_str).unwrap_or(Platform::YouTube),
+        platform: Platform::from_db(&platform_str).unwrap_or(Platform::YouTube),
         native_id: r.get(2)?,
         url: r.get(3)?,
         title: r.get(4)?,
@@ -192,7 +209,16 @@ fn row_to_video(r: &Row) -> rusqlite::Result<Video> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::model::{new_id, now_ts};
+    use crate::content::model::{new_id, now_ts, Artifact};
+
+    /// 三个端点都成功的 artifacts。
+    fn all_ok() -> Vec<Artifact> {
+        vec![
+            Artifact::ok(ArtifactKind::Detail, r#"{"detail":true}"#.into()),
+            Artifact::ok(ArtifactKind::Transcript, r#"{"transcript":true}"#.into()),
+            Artifact::ok(ArtifactKind::Comments, r#"{"comments":true}"#.into()),
+        ]
+    }
 
     fn sample(native_id: &str, title: &str) -> FetchedVideo {
         let vid = new_id();
@@ -231,6 +257,7 @@ mod tests {
                     text: "热门评论".into(), like_count: Some(999), published_at: Some(1755412863),
                 },
             ],
+            artifacts: all_ok(),
         }
     }
 
@@ -297,6 +324,142 @@ mod tests {
         let got = s.find_by_native(Platform::YouTube, "silent").unwrap().unwrap();
         assert!(got.transcript.is_none());
         assert!(got.comments.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // 抓取失败不能破坏已有数据（Codex review 的 P1）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn failed_transcript_fetch_keeps_the_old_transcript() {
+        let mut s = SqliteStore::in_memory().unwrap();
+        s.save(&sample("abc", "t")).unwrap();
+
+        // 第二次抓：转录端点挂了
+        let mut second = sample("abc", "t");
+        second.transcript = None;
+        second.artifacts = vec![
+            Artifact::ok(ArtifactKind::Detail, "{}".into()),
+            Artifact::failed(ArtifactKind::Transcript, "网络超时".into()),
+            Artifact::ok(ArtifactKind::Comments, "{}".into()),
+        ];
+        s.save(&second).unwrap();
+
+        let got = s.find_by_native(Platform::YouTube, "abc").unwrap().unwrap();
+        assert_eq!(
+            got.transcript.map(|t| t.text).as_deref(),
+            Some("hello world"),
+            "抓取失败时必须保留上次的转录，不能因为一次网络抖动就丢数据"
+        );
+    }
+
+    #[test]
+    fn failed_comments_fetch_keeps_the_old_comments() {
+        // 这是原来最隐蔽的一个 bug：评论无条件先删后插，
+        // 请求一失败就等于把旧评论清空了
+        let mut s = SqliteStore::in_memory().unwrap();
+        s.save(&sample("abc", "t")).unwrap();
+
+        let mut second = sample("abc", "t");
+        second.comments.clear();
+        second.artifacts = vec![
+            Artifact::ok(ArtifactKind::Detail, "{}".into()),
+            Artifact::ok(ArtifactKind::Transcript, "{}".into()),
+            Artifact::failed(ArtifactKind::Comments, "HTTP 500".into()),
+        ];
+        s.save(&second).unwrap();
+
+        let got = s.find_by_native(Platform::YouTube, "abc").unwrap().unwrap();
+        assert_eq!(got.comments.len(), 2, "评论抓取失败时必须保留旧评论");
+    }
+
+    #[test]
+    fn unavailable_does_clear_old_data() {
+        // 和上面相反：调用成功、确认「就是没有」，这时该清掉旧数据。
+        // 否则视频作者删了字幕，我们还一直拿着过期的转录。
+        let mut s = SqliteStore::in_memory().unwrap();
+        s.save(&sample("abc", "t")).unwrap();
+
+        let mut second = sample("abc", "t");
+        second.transcript = None;
+        second.comments.clear();
+        second.artifacts = vec![
+            Artifact::ok(ArtifactKind::Detail, "{}".into()),
+            Artifact::unavailable(ArtifactKind::Transcript, r#"{"transcript":null}"#.into()),
+            Artifact::unavailable(ArtifactKind::Comments, r#"{"comments":[]}"#.into()),
+        ];
+        s.save(&second).unwrap();
+
+        let got = s.find_by_native(Platform::YouTube, "abc").unwrap().unwrap();
+        assert!(got.transcript.is_none(), "确认没有时应该清掉旧转录");
+        assert!(got.comments.is_empty(), "确认没有时应该清掉旧评论");
+    }
+
+    #[test]
+    fn missing_artifact_record_is_treated_as_failed() {
+        // 保守默认：没有状态记录时当失败处理，宁可保留旧数据也不误删
+        let mut s = SqliteStore::in_memory().unwrap();
+        s.save(&sample("abc", "t")).unwrap();
+
+        let mut second = sample("abc", "t");
+        second.transcript = None;
+        second.comments.clear();
+        second.artifacts = vec![Artifact::ok(ArtifactKind::Detail, "{}".into())]; // 只有详情
+        s.save(&second).unwrap();
+
+        let got = s.find_by_native(Platform::YouTube, "abc").unwrap().unwrap();
+        assert!(got.transcript.is_some(), "没有状态记录时应保守保留旧数据");
+        assert_eq!(got.comments.len(), 2);
+    }
+
+    #[test]
+    fn stores_raw_response_of_every_endpoint() {
+        // 之前只存了详情那一份原始响应，文字稿和评论的直接丢了——
+        // 所以「解析漏字段随时能补」这个承诺并不成立。
+        let mut s = SqliteStore::in_memory().unwrap();
+        let id = s.save(&sample("abc", "t")).unwrap();
+
+        let mut stmt = s
+            .conn
+            .prepare("SELECT kind, status, raw_json FROM artifacts WHERE video_id = ?1 ORDER BY kind")
+            .unwrap();
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 3, "三个端点都要有记录");
+        for (kind, status, raw) in &rows {
+            assert_eq!(status, "ok");
+            assert!(raw.is_some(), "{kind} 的原始响应必须存下来");
+        }
+        assert_eq!(rows[0].0, "comments");
+        assert_eq!(rows[1].0, "detail");
+        assert_eq!(rows[2].0, "transcript");
+    }
+
+    #[test]
+    fn failed_artifact_records_the_error() {
+        let mut s = SqliteStore::in_memory().unwrap();
+        let mut f = sample("abc", "t");
+        f.artifacts = vec![
+            Artifact::ok(ArtifactKind::Detail, "{}".into()),
+            Artifact::failed(ArtifactKind::Transcript, "AI 转录重试后仍失败".into()),
+            Artifact::ok(ArtifactKind::Comments, "{}".into()),
+        ];
+        let id = s.save(&f).unwrap();
+
+        let (status, err): (String, Option<String>) = s
+            .conn
+            .query_row(
+                "SELECT status, error FROM artifacts WHERE video_id = ?1 AND kind = 'transcript'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(err.as_deref(), Some("AI 转录重试后仍失败"));
     }
 
     #[test]

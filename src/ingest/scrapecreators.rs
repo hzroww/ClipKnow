@@ -243,7 +243,6 @@ fn normalize_youtube(v: &Value, parsed: &ParsedUrl, raw_url: &str) -> Video {
         like_count: pick_i64(v, &["likeCountInt"]),
         comment_count: pick_i64(v, &["commentCountInt"]),
         description: pick_str(v, &["description"]),
-        raw_json: v.to_string(),
         fetched_at: now_ts(),
     }
 }
@@ -267,7 +266,6 @@ fn normalize_tiktok(v: &Value, parsed: &ParsedUrl, raw_url: &str) -> Video {
         like_count: pick_i64(a, &["statistics.digg_count"]),
         comment_count: pick_i64(a, &["statistics.comment_count"]),
         description: pick_str(a, &["desc"]),
-        raw_json: v.to_string(),
         fetched_at: now_ts(),
     }
 }
@@ -299,7 +297,6 @@ fn normalize_instagram(v: &Value, parsed: &ParsedUrl, raw_url: &str) -> Video {
         like_count: pick_i64(n, &["like_count", "edge_media_preview_like.count"]),
         comment_count: pick_i64(n, &["comment_count", "edge_media_to_comment.count"]),
         description: pick_str(n, &["caption.text", "caption"]),
-        raw_json: v.to_string(),
         fetched_at: now_ts(),
     }
 }
@@ -580,7 +577,7 @@ mod tests {
         assert_eq!(got.like_count, Some(1));
         assert_eq!(got.comment_count, None, "SC 实测这个字段可能是 null");
         assert_eq!(got.published_at, Some(1772402418));
-        assert!(!got.raw_json.is_empty(), "原始 JSON 必须存下来");
+        // 原始响应不在 Video 上了，改由 fetch() 组装成 Artifact 存进 artifacts 表
     }
 
     #[test]

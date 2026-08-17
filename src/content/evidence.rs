@@ -192,7 +192,6 @@ mod tests {
             like_count: Some(1),
             comment_count: None,
             description: Some("聊聊冷启动".into()),
-            raw_json: "{}".into(),
             fetched_at: 0,
         }
     }

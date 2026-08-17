@@ -25,11 +25,9 @@ pub struct Video {
     pub like_count: Option<i64>,
     pub comment_count: Option<i64>,
     pub description: Option<String>,
-    /// ★ SC 返回的原始 JSON，整个存下来。
-    /// 解析时一定会漏字段（当时没想到要用封面图、或者 SC 后来加了新字段），
-    /// 有它在就随时能补，不用重新花钱抓一遍。
-    pub raw_json: String,
     pub fetched_at: i64,
+    // 注意这里没有 raw_json。原始响应统一放在 Artifact 里——
+    // 三个端点各存一份，而不是只留详情那一份。
 }
 
 /// 视频的文字稿。
@@ -81,6 +79,15 @@ impl FetchStatus {
     pub fn is_conclusive(&self) -> bool {
         matches!(self, FetchStatus::Ok | FetchStatus::Unavailable)
     }
+
+    pub fn from_db(s: &str) -> FetchStatus {
+        match s {
+            "ok" => FetchStatus::Ok,
+            "unavailable" => FetchStatus::Unavailable,
+            // 认不出来就当失败：保守，不会导致误删旧数据
+            _ => FetchStatus::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +103,24 @@ impl ArtifactKind {
             ArtifactKind::Detail => "detail",
             ArtifactKind::Transcript => "transcript",
             ArtifactKind::Comments => "comments",
+        }
+    }
+
+    pub fn from_db(s: &str) -> Option<ArtifactKind> {
+        match s {
+            "detail" => Some(ArtifactKind::Detail),
+            "transcript" => Some(ArtifactKind::Transcript),
+            "comments" => Some(ArtifactKind::Comments),
+            _ => None,
+        }
+    }
+
+    /// 给人看的名字，`show --raw` 里用。
+    pub fn label(&self) -> &'static str {
+        match self {
+            ArtifactKind::Detail => "视频详情",
+            ArtifactKind::Transcript => "文字稿",
+            ArtifactKind::Comments => "评论",
         }
     }
 }

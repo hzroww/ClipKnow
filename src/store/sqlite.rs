@@ -6,7 +6,9 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::content::model::{ArtifactKind, Comment, FetchedVideo, Transcript, Video};
+use crate::content::model::{
+    Artifact, ArtifactKind, Comment, FetchStatus, FetchedVideo, Transcript, Video,
+};
 use crate::error::Result;
 use crate::ingest::url::Platform;
 use crate::store::{Store, StoredVideo};
@@ -32,8 +34,39 @@ impl SqliteStore {
         // 外键约束在 SQLite 里默认是关的，要显式打开
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(include_str!("../../migrations/001_init.sql"))?;
+        migrate_drop_video_raw_json(&conn)?;
         Ok(Self { conn })
     }
+}
+
+/// 迁移：把 `videos.raw_json` 搬进 `artifacts` 表，然后删掉这一列。
+///
+/// 早期版本只把**详情端点**的原始响应存在 `videos.raw_json`，转录和评论的
+/// 直接丢了——所以「解析漏字段无需重抓」的承诺当时只兑现了三分之一。
+/// `artifacts` 表统一保存三个端点后，这一列就纯属冗余。
+///
+/// 幂等：列已经不在就直接返回，所以新建的库跑到这里什么都不做。
+/// 搬运用 `INSERT OR IGNORE`，已经有 detail 记录的视频不会被覆盖。
+fn migrate_drop_video_raw_json(conn: &Connection) -> Result<()> {
+    let has_col = conn
+        .prepare("PRAGMA table_info(videos)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == "raw_json");
+
+    if !has_col {
+        return Ok(());
+    }
+
+    // 先把数据搬走再删列，别把旧库里唯一一份原始响应弄丢了
+    conn.execute(
+        "INSERT OR IGNORE INTO artifacts (video_id, kind, status, raw_json, error, fetched_at)
+         SELECT id, 'detail', 'ok', raw_json, NULL, fetched_at
+         FROM videos WHERE raw_json IS NOT NULL AND raw_json != ''",
+        [],
+    )?;
+    conn.execute("ALTER TABLE videos DROP COLUMN raw_json", [])?;
+    Ok(())
 }
 
 impl Store for SqliteStore {
@@ -112,15 +145,15 @@ impl Store for SqliteStore {
         tx.execute(
             "INSERT INTO videos (id, platform, native_id, url, title, author_handle, author_name,
                                  duration_sec, published_at, view_count, like_count, comment_count,
-                                 description, raw_json, fetched_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                                 description, fetched_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(platform, native_id) DO UPDATE SET
                 url=excluded.url, title=excluded.title,
                 author_handle=excluded.author_handle, author_name=excluded.author_name,
                 duration_sec=excluded.duration_sec, published_at=excluded.published_at,
                 view_count=excluded.view_count, like_count=excluded.like_count,
                 comment_count=excluded.comment_count, description=excluded.description,
-                raw_json=excluded.raw_json, fetched_at=excluded.fetched_at",
+                fetched_at=excluded.fetched_at",
             params![
                 video_id,
                 v.platform.as_str(),
@@ -135,7 +168,6 @@ impl Store for SqliteStore {
                 v.like_count,
                 v.comment_count,
                 v.description,
-                v.raw_json,
                 v.fetched_at
             ],
         )?;
@@ -188,6 +220,40 @@ impl Store for SqliteStore {
         Ok(video_id)
     }
 
+    fn get_artifacts(&self, video_id: &str) -> Result<Vec<Artifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, status, raw_json, error, fetched_at
+             FROM artifacts WHERE video_id = ?1 ORDER BY kind",
+        )?;
+        let rows = stmt
+            .query_map(params![video_id], |r| {
+                let kind: String = r.get(0)?;
+                let status: String = r.get(1)?;
+                Ok((
+                    kind,
+                    status,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(kind, status, raw_json, error, fetched_at)| {
+                // 认不出的 kind 直接跳过：库里被手改过也不该让程序崩
+                Some(Artifact {
+                    kind: ArtifactKind::from_db(&kind)?,
+                    status: FetchStatus::from_db(&status),
+                    raw_json,
+                    error,
+                    fetched_at,
+                })
+            })
+            .collect())
+    }
+
     fn list_videos(&self, limit: usize) -> Result<Vec<Video>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {VIDEO_COLS} FROM videos ORDER BY fetched_at DESC LIMIT ?1"
@@ -201,8 +267,7 @@ impl Store for SqliteStore {
 
 /// 列名列一次，SELECT 的地方复用，避免顺序和 `row_to_video` 对不上。
 const VIDEO_COLS: &str = "id, platform, native_id, url, title, author_handle, author_name, \
-     duration_sec, published_at, view_count, like_count, comment_count, description, \
-     raw_json, fetched_at";
+     duration_sec, published_at, view_count, like_count, comment_count, description, fetched_at";
 
 fn row_to_video(r: &Row) -> rusqlite::Result<Video> {
     let platform_str: String = r.get(1)?;
@@ -221,8 +286,7 @@ fn row_to_video(r: &Row) -> rusqlite::Result<Video> {
         like_count: r.get(10)?,
         comment_count: r.get(11)?,
         description: r.get(12)?,
-        raw_json: r.get(13)?,
-        fetched_at: r.get(14)?,
+        fetched_at: r.get(13)?,
     })
 }
 
@@ -258,7 +322,6 @@ mod tests {
                 like_count: Some(1),
                 comment_count: None,
                 description: Some("desc".into()),
-                raw_json: r#"{"ok":true}"#.into(),
                 fetched_at: now_ts(),
             },
             transcript: Some(Transcript {
@@ -505,6 +568,100 @@ mod tests {
             .unwrap();
         assert_eq!(status, "failed");
         assert_eq!(err.as_deref(), Some("AI 转录重试后仍失败"));
+    }
+
+    #[test]
+    fn migrates_legacy_raw_json_into_artifacts_without_losing_data() {
+        // 手工搭一个旧版 schema：videos 带 raw_json 列，没有 artifacts 表
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE videos (
+               id TEXT PRIMARY KEY, platform TEXT NOT NULL, native_id TEXT NOT NULL,
+               url TEXT NOT NULL, title TEXT, author_handle TEXT, author_name TEXT,
+               duration_sec INTEGER, published_at INTEGER, view_count INTEGER,
+               like_count INTEGER, comment_count INTEGER, description TEXT,
+               raw_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
+               UNIQUE(platform, native_id));
+             INSERT INTO videos (id, platform, native_id, url, raw_json, fetched_at)
+             VALUES ('v-old', 'youtube', 'legacy', 'https://x', '{\"legacy\":true}', 111);",
+        )
+        .unwrap();
+
+        // 打开时应自动迁移
+        let store = SqliteStore::init(conn).unwrap();
+
+        // 1) 老的原始响应被搬进了 artifacts，没丢
+        let arts = store.get_artifacts("v-old").unwrap();
+        assert_eq!(
+            arts.len(),
+            1,
+            "旧的 raw_json 应该被搬成一条 detail artifact"
+        );
+        assert_eq!(arts[0].kind, ArtifactKind::Detail);
+        assert_eq!(arts[0].status, FetchStatus::Ok);
+        assert_eq!(arts[0].raw_json.as_deref(), Some(r#"{"legacy":true}"#));
+        assert_eq!(arts[0].fetched_at, 111, "抓取时间要跟着一起搬");
+
+        // 2) videos 表上的冗余列已经删掉
+        let still_there = store
+            .conn
+            .prepare("PRAGMA table_info(videos)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|c| c == "raw_json");
+        assert!(!still_there, "raw_json 列应该已经被删掉");
+
+        // 3) 视频本身还在，能正常读出来
+        assert!(
+            store
+                .find_by_native(Platform::YouTube, "legacy")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent_on_fresh_db() {
+        // 新库没有 raw_json 列，迁移应该直接跳过而不是报错
+        let s = SqliteStore::in_memory().unwrap();
+        assert!(migrate_drop_video_raw_json(&s.conn).is_ok());
+        assert!(
+            migrate_drop_video_raw_json(&s.conn).is_ok(),
+            "跑两次也该没事"
+        );
+    }
+
+    #[test]
+    fn migration_does_not_overwrite_existing_detail_artifact() {
+        // 已经有新版 detail artifact 的视频，迁移不该拿旧 raw_json 覆盖它
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE videos (
+               id TEXT PRIMARY KEY, platform TEXT NOT NULL, native_id TEXT NOT NULL,
+               url TEXT NOT NULL, title TEXT, author_handle TEXT, author_name TEXT,
+               duration_sec INTEGER, published_at INTEGER, view_count INTEGER,
+               like_count INTEGER, comment_count INTEGER, description TEXT,
+               raw_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
+               UNIQUE(platform, native_id));
+             CREATE TABLE artifacts (
+               video_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+               raw_json TEXT, error TEXT, fetched_at INTEGER NOT NULL,
+               PRIMARY KEY (video_id, kind));
+             INSERT INTO videos (id, platform, native_id, url, raw_json, fetched_at)
+             VALUES ('v1', 'youtube', 'a', 'https://x', '{\"old\":true}', 100);
+             INSERT INTO artifacts VALUES ('v1', 'detail', 'ok', '{\"new\":true}', NULL, 200);",
+        )
+        .unwrap();
+
+        let store = SqliteStore::init(conn).unwrap();
+        let arts = store.get_artifacts("v1").unwrap();
+        assert_eq!(
+            arts[0].raw_json.as_deref(),
+            Some(r#"{"new":true}"#),
+            "新数据不该被旧的覆盖"
+        );
     }
 
     #[test]

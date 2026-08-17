@@ -184,10 +184,36 @@ fn cmd_show(store: &SqliteStore, raw_url: &str, raw: bool) -> Result<()> {
     };
 
     println!("{}", build_evidence(&sv));
+
+    // 三个端点的抓取产物。以前这里只有详情那一份原始响应，
+    // 现在文字稿和评论的也在，「原始数据都在」这句话才算数。
+    let artifacts = store.get_artifacts(&sv.video.id)?;
+
+    if artifacts.is_empty() {
+        println!("(这条记录是加 artifacts 表之前抓的，没有存原始响应。`--refresh` 重抓可以补上)");
+        return Ok(());
+    }
+
     if raw {
-        println!("=== 原始 JSON ===\n{}", sv.video.raw_json);
+        for a in &artifacts {
+            println!(
+                "=== 原始响应：{} [{}] ===",
+                a.kind.label(),
+                a.status.as_str()
+            );
+            match (&a.raw_json, &a.error) {
+                (Some(j), _) => println!("{j}\n"),
+                (None, Some(e)) => println!("(抓取失败：{e})\n"),
+                (None, None) => println!("(没有内容)\n"),
+            }
+        }
     } else {
-        println!("(加 --raw 可以看 SC 返回的原始 JSON)");
+        let summary: Vec<String> = artifacts
+            .iter()
+            .map(|a| format!("{}={}", a.kind.label(), a.status.as_str()))
+            .collect();
+        println!("抓取状态: {}", summary.join("  "));
+        println!("(加 --raw 可以看三个端点的原始响应)");
     }
     Ok(())
 }

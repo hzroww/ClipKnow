@@ -7,7 +7,7 @@
 
 pub mod sqlite;
 
-use crate::content::model::{Comment, FetchedVideo, Transcript, Video};
+use crate::content::model::{Artifact, Comment, FetchedVideo, Transcript, Video};
 use crate::error::Result;
 use crate::ingest::url::Platform;
 
@@ -29,4 +29,8 @@ pub trait Store {
 
     /// 列出库里所有视频，最近抓的排前面。
     fn list_videos(&self, limit: usize) -> Result<Vec<Video>>;
+
+    /// 取一个视频的全部抓取产物（三个端点各一条），含原始响应和状态。
+    /// `show --raw` 用它——这样看到的是三份原始数据，不只是详情那一份。
+    fn get_artifacts(&self, video_id: &str) -> Result<Vec<Artifact>>;
 }

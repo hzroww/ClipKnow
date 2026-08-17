@@ -18,10 +18,12 @@ CREATE TABLE IF NOT EXISTS videos (
   like_count    INTEGER,
   comment_count INTEGER,
   description   TEXT,
-  raw_json      TEXT NOT NULL,      -- SC 返回的原始 JSON，整个存下来
   fetched_at    INTEGER NOT NULL,
   UNIQUE(platform, native_id)       -- 同一个视频不会有两条记录
 );
+-- 注：原始响应不在这张表里，统一存在下面的 artifacts 表。
+-- 早期版本这里有个 raw_json 列，但它只装得下「详情」那一份，
+-- 转录和评论的原始数据是丢掉的。旧库的迁移见 migrate_drop_video_raw_json()。
 
 -- 2. 文字稿。一个视频一条，所以 video_id 直接当主键。
 CREATE TABLE IF NOT EXISTS transcripts (

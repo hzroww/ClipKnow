@@ -7,3 +7,4 @@
 pub mod content;
 pub mod error;
 pub mod ingest;
+pub mod store;

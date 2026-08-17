@@ -6,14 +6,30 @@
 
 ## 准备
 
-需要两个 key，都放进 `~/.zshrc`（或项目目录下的 `.env`）：
+抓取的 key 是必需的，大模型的 key 两家有一个就行：
 
 ```bash
-export SCRAPECREATORS_API_KEY=...   # 抓取用，https://scrapecreators.com
-export ANTHROPIC_API_KEY=...        # 大模型用，https://console.anthropic.com/settings/keys
+SCRAPECREATORS_API_KEY=...   # 必需，https://scrapecreators.com
+DEEPSEEK_API_KEY=...         # https://platform.deepseek.com
+ANTHROPIC_API_KEY=...        # https://console.anthropic.com/settings/keys
 ```
 
+放进项目目录的 `.env`（已在 `.gitignore` 里）或 `~/.zshrc`。
+两家都设了默认用 DeepSeek，`--provider anthropic` 可切回 Claude。
+
 > 注意：Claude Code 的登录态不能当 `ANTHROPIC_API_KEY` 用，得去 Console 单独建一个。
+
+### 两家的实测对比
+
+同一个视频、同一个问题（57 秒的产品宣传片）：
+
+| | 输入/输出 token | 成本 | 表现 |
+|---|---|---|---|
+| Claude Opus 5 | 970 / 471 | $0.0166 | 主动标注「这条来自简介而非文字稿」、指出转录把 Braun 识别成 brawn、说明画面信息材料里没有 |
+| DeepSeek | 609 / 134 | $0.0003 | 答案准确干净，但未区分信息来自文字稿还是简介 |
+
+**成本差 55 倍。** 日常开发调试用 DeepSeek 足够；需要严格溯源、不能编造的场景切回 Claude 对照。
+第二步做 agent 循环时要重新评估——循环对「严格遵守指令」的要求比单次问答高得多。
 
 Rust 工具链（本机已装）：
 

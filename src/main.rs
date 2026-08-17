@@ -20,9 +20,7 @@
 
 use clap::{Parser, Subcommand};
 
-use clipknow::agent::llm::{
-    AnthropicClient, LlmClient, ModelRequest, Msg, StopReason, DEFAULT_MAX_TOKENS,
-};
+use clipknow::agent::llm::{build_client, ModelRequest, Msg, Provider, StopReason};
 use clipknow::content::evidence::{build_evidence, format_date, format_duration, SYSTEM_PROMPT};
 use clipknow::error::{ClipKnowError, Result};
 use clipknow::ingest::scrapecreators::ScrapeCreators;
@@ -36,6 +34,11 @@ struct Cli {
     /// 数据库文件路径
     #[arg(long, default_value = "clipknow.db", global = true)]
     db: String,
+
+    /// 用哪家大模型：deepseek 或 anthropic。
+    /// 不指定时按环境变量里设了谁的 key 自动挑（两家都有则优先 DeepSeek）。
+    #[arg(long, global = true)]
+    provider: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -79,9 +82,20 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // --provider 给了但拼错时，明确报错而不是悄悄用默认的那家
+    let provider = match &cli.provider {
+        Some(s) => Some(
+            Provider::parse(s)
+                .ok_or_else(|| ClipKnowError::Llm(format!("不认识的 provider: {s}（可选 deepseek / anthropic）")))?,
+        ),
+        None => None,
+    };
+
     let mut store = SqliteStore::open(&cli.db)?;
     match cli.command {
-        Command::Ask { url, question, refresh } => cmd_ask(&mut store, &url, &question, refresh),
+        Command::Ask { url, question, refresh } => {
+            cmd_ask(&mut store, &url, &question, refresh, provider)
+        }
         Command::Show { url, raw } => cmd_show(&store, &url, raw),
         Command::List { limit } => cmd_list(&store, limit),
     }
@@ -118,18 +132,26 @@ fn ensure_ingested(store: &mut SqliteStore, raw_url: &str, refresh: bool) -> Res
         })
 }
 
-fn cmd_ask(store: &mut SqliteStore, raw_url: &str, question: &str, refresh: bool) -> Result<()> {
+fn cmd_ask(
+    store: &mut SqliteStore,
+    raw_url: &str,
+    question: &str,
+    refresh: bool,
+    provider: Option<Provider>,
+) -> Result<()> {
     let sv = ensure_ingested(store, raw_url, refresh)?;
 
     let evidence = build_evidence(&sv);
     let prompt = format!("{evidence}\n\n=== 用户的问题 ===\n{question}");
 
-    println!("· 正在问模型 ...\n");
-    let llm = AnthropicClient::from_env()?;
+    // 这里拿到的是 Box<dyn LlmClient>，下面的代码完全不知道背后是哪一家
+    let llm = build_client(provider)?;
+    println!("· 正在问 {} ...\n", llm.model_name());
+
     let resp = llm.complete(&ModelRequest {
         system: SYSTEM_PROMPT.to_string(),
         messages: vec![Msg::user(prompt)],
-        max_tokens: DEFAULT_MAX_TOKENS,
+        max_tokens: llm.max_tokens_limit(),
     })?;
 
     println!("{}", resp.text);
@@ -138,10 +160,11 @@ fn cmd_ask(store: &mut SqliteStore, raw_url: &str, question: &str, refresh: bool
         eprintln!("\n(注意：回答因为达到长度上限被截断了)");
     }
     eprintln!(
-        "\n— {} 输入 / {} 输出 token，约 ${:.4}",
+        "\n— {} · {} 输入 / {} 输出 token，约 ${:.4}",
+        llm.model_name(),
         resp.input_tokens,
         resp.output_tokens,
-        resp.cost_usd()
+        llm.pricing().cost_usd(resp.input_tokens, resp.output_tokens)
     );
     Ok(())
 }

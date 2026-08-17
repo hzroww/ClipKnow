@@ -56,13 +56,7 @@ impl ScrapeCreators {
         };
 
         // 文字稿：失败不致命，打个提示继续
-        let transcript = match self.get(transcript_endpoint(parsed.platform), raw_url) {
-            Ok(v) => extract_transcript(&v, &video.id),
-            Err(e) => {
-                eprintln!("  ! 文字稿抓取失败（继续）: {e}");
-                None
-            }
-        };
+        let transcript = self.fetch_transcript(parsed.platform, raw_url, &video.id);
 
         // 评论：同样失败不致命
         let comments = match self.get(comments_endpoint(parsed.platform), raw_url) {
@@ -74,6 +68,43 @@ impl ScrapeCreators {
         };
 
         Ok(FetchedVideo { video, transcript, comments })
+    }
+
+    /// 抓文字稿，AI 转录失败时重试一次。
+    ///
+    /// 为什么要重试：TikTok / Instagram 走的是 SC 自己跑的 AI 转录，实测**不稳定**——
+    /// 同一个视频这次返回「Please provide the audio file...」（模型的错误回复），
+    /// 下一次却能返回完整正确的文字稿。不重试的话用户会随机遇到
+    /// 「这个视频没有文字稿」的假象，而实际上是有的。
+    ///
+    /// 代价是失败那次多花 1 个 credit。只在**确认是 AI 失败**时才重试——
+    /// 真的没有人声（纯画面 + BGM）不会触发，避免白花钱。
+    fn fetch_transcript(&self, platform: Platform, url: &str, video_id: &str) -> Option<Transcript> {
+        for attempt in 1..=2 {
+            let body = match self.get(transcript_endpoint(platform), url) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("  ! 文字稿抓取失败（继续）: {e}");
+                    return None;
+                }
+            };
+
+            if let Some(t) = extract_transcript(&body, video_id) {
+                return Some(t);
+            }
+
+            // 提取不到。区分两种情况：AI 转录失败（值得重试）vs 真的没人声（别浪费钱）
+            let is_ai_failure = raw_transcript_text(&body)
+                .map(|s| looks_like_transcription_failure(&s))
+                .unwrap_or(false);
+
+            if attempt == 1 && is_ai_failure {
+                eprintln!("  ! AI 转录这次失败了，重试一次 ...");
+                continue;
+            }
+            return None;
+        }
+        None
     }
 
     /// 发一个 GET 请求，检查 SC 的 success 字段，返回解析好的 JSON。
@@ -187,9 +218,8 @@ fn normalize_tiktok(v: &Value, parsed: &ParsedUrl, raw_url: &str) -> Video {
     }
 }
 
-/// Instagram：字段路径尚未实测（手上没有可用的公开 reel 链接），
-/// 所以每个字段给了多个候选路径。第一次跑真实 IG 链接时如果取不到值，
-/// 用 `clipknow show <url>` 看 raw_json 就能确认真实路径，再来补这里。
+/// Instagram：已用真实 reel 实测通过（标题/作者/时长/播放量/点赞全部正确提取）。
+/// 多候选路径保留着——IG 的返回结构在不同内容类型间会变，多留几个候选更耐改。
 fn normalize_instagram(v: &Value, parsed: &ParsedUrl, raw_url: &str) -> Video {
     // SC 可能把内容包在 data / items[0] / 直接平铺，都试一遍
     let n = first_present(v, &["data.xdt_shortcode_media", "data", "items.0", "post"]).unwrap_or(v);
@@ -213,15 +243,28 @@ fn normalize_instagram(v: &Value, parsed: &ParsedUrl, raw_url: &str) -> Video {
     }
 }
 
-/// 文字稿。三家的返回结构里都有 `transcript_only_text`（YouTube 实测确认），
-/// 拿不到就退而求其次从分段数组拼。
+/// 文字稿。三个平台的返回格式**完全不同**，都是实测出来的：
+///
+/// | 平台      | 字段                   | 格式                    |
+/// |-----------|------------------------|-------------------------|
+/// | YouTube   | `transcript_only_text` | 纯文本                  |
+/// | TikTok    | `transcript`           | WEBVTT 字幕（带时间戳） |
+/// | Instagram | `transcripts[].text`   | 纯文本（注意是复数）    |
+///
+/// 另外 IG/TikTok 走的是 SC 自己跑的 AI 转录，失败时不会报错，
+/// 而是返回一句模型的错误回复（比如「Please provide the audio file...」）。
+/// 这种要识别出来当作「没有转录」，否则会拿一句废话去喂模型。
 fn extract_transcript(v: &Value, video_id: &str) -> Option<Transcript> {
-    let text = pick_str(v, &["transcript_only_text", "text", "transcript_text"])
-        .or_else(|| join_segments(v))?;
+    let raw = raw_transcript_text(v)?;
+
+    // WEBVTT 要把时间戳行剥掉，只留台词
+    let text = if is_webvtt(&raw) { strip_webvtt(&raw) } else { raw };
     let text = text.trim().to_string();
-    if text.is_empty() {
+
+    if text.is_empty() || looks_like_transcription_failure(&text) {
         return None;
     }
+
     Some(Transcript {
         video_id: video_id.to_string(),
         text,
@@ -229,6 +272,60 @@ fn extract_transcript(v: &Value, video_id: &str) -> Option<Transcript> {
         lang: pick_str(v, &["language"]),
         fetched_at: now_ts(),
     })
+}
+
+/// 从响应里把文字稿原文取出来（不做任何过滤）。
+/// 三个平台字段名各不相同，都是实测出来的。
+fn raw_transcript_text(v: &Value) -> Option<String> {
+    pick_str(v, &["transcript_only_text", "text", "transcript_text"])
+        // Instagram：transcripts 是复数，取第一条
+        .or_else(|| pick_str(v, &["transcripts.0.text"]))
+        // TikTok：transcript 直接是一个 WEBVTT 字符串
+        .or_else(|| pick_str(v, &["transcript"]))
+        // YouTube 备用：transcript 是 [{text, startMs}] 数组
+        .or_else(|| join_segments(v))
+}
+
+fn is_webvtt(s: &str) -> bool {
+    s.trim_start().starts_with("WEBVTT")
+}
+
+/// 把 WEBVTT 字幕剥成纯文本：丢掉头部标记、时间戳行、序号行和空行。
+fn strip_webvtt(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && *l != "WEBVTT"
+                && !l.contains("-->")
+                // 纯数字的是字幕序号
+                && !l.chars().all(|c| c.is_ascii_digit())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 识别 AI 转录失败时吐出来的模型错误回复。
+///
+/// 只匹配很明确的几种说法，并且限制长度——真实的转录不会这么短又
+/// 恰好长这样，这样能避免误杀正常内容。
+fn looks_like_transcription_failure(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    // 超过这个长度基本就是真内容了，不再怀疑
+    if t.chars().count() > 200 {
+        return false;
+    }
+    const MARKERS: &[&str] = &[
+        "please provide the audio",
+        "please provide the video",
+        "would like me to transcribe",
+        "i cannot transcribe",
+        "i'm unable to transcribe",
+        "i am unable to transcribe",
+        "no audio content",
+        "no speech detected",
+    ];
+    MARKERS.iter().any(|m| t.contains(m))
 }
 
 /// 从 `transcript: [{text, startMs, ...}]` 拼出纯文本。
@@ -442,6 +539,70 @@ mod tests {
         // 纯画面+BGM 的视频会走到这里，必须返回 None，让上层老实说「没有语音内容」
         assert!(extract_transcript(&json!({"transcript_only_text": "   "}), "v").is_none());
         assert!(extract_transcript(&json!({}), "v").is_none());
+    }
+
+    #[test]
+    fn parses_tiktok_webvtt_transcript() {
+        // TikTok 实测返回的就是这个格式：一整个 WEBVTT 字符串，不是数组
+        let v = json!({
+            "transcript": "WEBVTT\n\n\n00:00:00.000 --> 00:00:01.460\nWell, if you know Tom,\n\n00:00:01.461 --> 00:00:04.181\nyou must know Jerry."
+        });
+        let t = extract_transcript(&v, "vid-1").expect("WEBVTT 也要能解析出文字稿");
+        assert_eq!(t.text, "Well, if you know Tom, you must know Jerry.");
+        assert!(!t.text.contains("-->"), "时间戳必须被剥掉");
+        assert!(!t.text.contains("WEBVTT"), "头部标记必须被剥掉");
+    }
+
+    #[test]
+    fn strips_webvtt_cue_numbers() {
+        let vtt = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\n第一句\n\n2\n00:00:01.000 --> 00:00:02.000\n第二句";
+        assert_eq!(strip_webvtt(vtt), "第一句 第二句", "序号行也要丢掉");
+    }
+
+    #[test]
+    fn parses_instagram_plural_transcripts_field() {
+        // Instagram 实测：字段名是复数 transcripts，内容在 [0].text
+        let v = json!({
+            "transcripts": [{"id": "1", "shortcode": "ABC", "text": "先把锅烧热，然后下油。"}]
+        });
+        let t = extract_transcript(&v, "vid-1").expect("IG 的复数字段也要认");
+        assert_eq!(t.text, "先把锅烧热，然后下油。");
+    }
+
+    #[test]
+    fn rejects_ai_transcription_failure_message() {
+        // IG 实测遇到的真实垃圾输出：SC 的 AI 转录失败时返回模型的错误回复。
+        // 不识别的话，模型会拿着这句废话去分析视频。
+        let v = json!({
+            "transcripts": [{
+                "text": "Please provide the audio or video file you would like me to transcribe."
+            }]
+        });
+        assert!(
+            extract_transcript(&v, "vid-1").is_none(),
+            "AI 转录失败的回复必须当作「没有转录」"
+        );
+    }
+
+    #[test]
+    fn failure_detection_does_not_eat_real_content() {
+        // 防误杀：真实转录里可能碰巧提到「audio」之类的词
+        let v = json!({
+            "transcript_only_text": "今天教大家怎么给视频配音。首先打开软件，导入 audio 文件，\
+调整音量。然后我们来看第二步，这一步很关键，很多人都做错了。记得把降噪打开，\
+不然背景里的杂音会很明显。最后导出的时候选择高质量。"
+        });
+        assert!(
+            extract_transcript(&v, "vid-1").is_some(),
+            "正常内容不能被误判成失败"
+        );
+    }
+
+    #[test]
+    fn long_text_is_never_treated_as_failure() {
+        // 超过 200 字的内容一律当真内容，即使开头像失败提示
+        let long = format!("please provide the audio{}", "内容".repeat(200));
+        assert!(!looks_like_transcription_failure(&long));
     }
 
     #[test]

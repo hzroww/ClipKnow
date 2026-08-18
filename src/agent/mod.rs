@@ -5,4 +5,6 @@
 //! 才会加 runner.rs（循环）和 tools.rs（工具集）：那时候要查哪几个频道
 //! 取决于上一步搜到了什么，没法提前写死，循环才真正必要。
 
+pub mod context;
 pub mod llm;
+pub mod tools;

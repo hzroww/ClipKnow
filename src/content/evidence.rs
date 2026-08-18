@@ -127,7 +127,7 @@ pub fn build_evidence(sv: &StoredVideo) -> String {
 /// 不处理的话，模型看到的就是一个提前闭合的材料段 + 一段像系统指令的文本。
 /// 转义掉尖括号后标签失效，但内容依然完整可读——模型仍能如实描述
 /// 「这条评论试图指挥你」。
-fn neutralize(s: &str) -> String {
+pub fn neutralize(s: &str) -> String {
     s.replace("</video-material>", "&lt;/video-material&gt;")
         .replace("<video-material>", "&lt;video-material&gt;")
         .replace("</user-question>", "&lt;/user-question&gt;")

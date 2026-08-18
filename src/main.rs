@@ -158,6 +158,7 @@ fn cmd_ask(
         system: SYSTEM_PROMPT.to_string(),
         messages: vec![Msg::user(prompt)],
         max_tokens: llm.max_tokens_limit(),
+        tools: vec![],
     })?;
 
     println!("{}", resp.text);

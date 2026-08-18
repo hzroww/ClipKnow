@@ -31,32 +31,92 @@ pub const DEFAULT_MAX_TOKENS: u32 = 16000;
 // 中立类型：不属于任何一家厂商
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    User,
-    Assistant,
+/// 工具执行完的结果，要回传给模型。
+///
+/// `call_id` 必须和当初那个 `ToolCall::id` 一模一样。这是配对不变量的
+/// 另一半，见设计文档 9.1。
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub content: String,
+    /// 工具失败了也要回传（内容写清失败原因），**不能中止循环**。
+    /// 见设计文档 7.3：ExecutingTools 只有一条出边。
+    pub is_error: bool,
 }
 
+/// 对话历史里的一条消息。
+///
+/// 做成 enum 而不是「struct + 一堆 Option 字段」，是为了让非法状态
+/// 压根表示不出来——比如「一条 user 消息带着 tool_calls」。
+/// C++ 里对应 `std::variant`，但 Rust 的 match 会强制你处理每一种。
 #[derive(Debug, Clone)]
-pub struct Msg {
-    pub role: Role,
-    pub text: String,
+pub enum Msg {
+    User(String),
+    /// `text` 和 `tool_calls` 是并存的：实测 DeepSeek 发起工具调用时
+    /// 常常同时说一句话，两个都要存进历史。
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool(ToolResult),
 }
 
 impl Msg {
     pub fn user(text: impl Into<String>) -> Self {
-        Msg {
-            role: Role::User,
+        Msg::User(text.into())
+    }
+
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Msg::Assistant {
             text: text.into(),
+            tool_calls: Vec::new(),
         }
+    }
+
+    pub fn assistant_with_tools(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Msg::Assistant {
+            text: text.into(),
+            tool_calls,
+        }
+    }
+
+    pub fn tool_result(r: ToolResult) -> Self {
+        Msg::Tool(r)
     }
 }
 
+/// 告诉模型「你可以调这个工具」。
+///
+/// `params` 是一份 JSON Schema。两家对它的叫法不同——Anthropic 叫
+/// `input_schema`，OpenAI 系叫 `parameters`——所以这里用中立的名字，
+/// 由各家的 `to_*_body` 负责翻译。
 #[derive(Debug, Clone)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub params: Value,
+}
+
+/// 模型说「我要调这个工具」。
+///
+/// `id` 是配对的命脉：回传结果时必须原样带回去，少一个或对不上，
+/// 下一轮请求直接 400。见设计文档 9.1。
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// 已经解析好的参数。线上传的是 JSON **字符串**，在这一层就 parse 掉，
+    /// 不把这个坑漏给业务代码。
+    pub args: Value,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ModelRequest {
     pub system: String,
     pub messages: Vec<Msg>,
     pub max_tokens: u32,
+    /// 空表示这次不给模型任何工具（第一版的单视频问答就是这种）。
+    pub tools: Vec<ToolDef>,
 }
 
 /// 模型为什么停下来。
@@ -68,12 +128,19 @@ pub enum StopReason {
     MaxTokens,
     /// 安全分类器拒绝了，此时没有正文
     Refusal,
+    /// 模型要调工具，还没说完
+    ToolUse,
     Other(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelResponse {
+    /// 可能是空串。注意它和 `tool_calls` 是**并存**关系，不是二选一——
+    /// 实测 DeepSeek 发起工具调用时常常同时说一句「我来帮你……」。
     pub text: String,
+    /// 空表示模型这轮不要工具，循环该结束了。
+    /// **循环的终止条件只看这个，不看 `text` 是否为空。**
+    pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -154,11 +221,16 @@ impl AnthropicClient {
         let messages: Vec<Value> = req
             .messages
             .iter()
-            .map(|m| {
-                json!({
-                    "role": match m.role { Role::User => "user", Role::Assistant => "assistant" },
-                    "content": m.text,
-                })
+            .map(|m| match m {
+                Msg::User(t) => json!({ "role": "user", "content": t }),
+                Msg::Assistant { text, .. } => json!({ "role": "assistant", "content": text }),
+                // 到不了这里：带工具的请求在 complete() 入口就被拒了。
+                // 真的到了，也宁可让模型看到一句明显不对的话，
+                // 而不是把工具结果伪装成正常回答。
+                Msg::Tool(r) => json!({
+                    "role": "user",
+                    "content": format!("[未支持的工具结果 {}]", r.call_id),
+                }),
             })
             .collect();
 
@@ -192,6 +264,15 @@ impl LlmClient for AnthropicClient {
     }
 
     fn complete(&self, req: &ModelRequest) -> Result<ModelResponse> {
+        // 这一版只实现了 DeepSeek 的工具格式（设计文档第 15 节）。
+        // 在这里明确拒绝，而不是把 tools 悄悄丢掉照常发请求——那样会得到
+        // 一个看起来正常、实际一个工具都没调过的答案，最难查。
+        if !req.tools.is_empty() || req.messages.iter().any(|m| matches!(m, Msg::Tool(_))) {
+            return Err(ClipKnowError::Llm(
+                "Anthropic 的工具调用这一版还没实现，请用 --provider deepseek".into(),
+            ));
+        }
+
         let resp = self
             .http
             .post("https://api.anthropic.com/v1/messages")
@@ -258,6 +339,9 @@ fn parse_anthropic_response(body: &Value) -> Result<ModelResponse> {
 
     Ok(ModelResponse {
         text,
+        // 这一版只实现 DeepSeek 的工具格式（见设计文档第 15 节）。
+        // Anthropic 的 tool_use block 解析留到需要时再补，类型已经能装下。
+        tool_calls: Vec::new(),
         stop_reason,
         input_tokens: get_u32("input_tokens"),
         output_tokens: get_u32("output_tokens"),
@@ -310,19 +394,60 @@ impl DeepSeekClient {
     /// - 其余结构基本一致
     fn to_openai_body(&self, req: &ModelRequest) -> Value {
         let mut messages = vec![json!({ "role": "system", "content": req.system })];
-        messages.extend(req.messages.iter().map(|m| {
-            json!({
-                "role": match m.role { Role::User => "user", Role::Assistant => "assistant" },
-                "content": m.text,
-            })
+        messages.extend(req.messages.iter().map(|m| match m {
+            Msg::User(t) => json!({ "role": "user", "content": t }),
+            Msg::Assistant { text, tool_calls } if tool_calls.is_empty() => {
+                json!({ "role": "assistant", "content": text })
+            }
+            Msg::Assistant { text, tool_calls } => json!({
+                "role": "assistant",
+                "content": text,
+                "tool_calls": tool_calls.iter().map(|c| json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        // ★ 收到时是字符串→我们 parse 成了 Value，
+                        //   发回去必须再变回字符串，否则 DeepSeek 不认。
+                        "arguments": c.args.to_string(),
+                    }
+                })).collect::<Vec<_>>(),
+            }),
+            // ★ OpenAI 格式里工具结果是独立一条消息，
+            //   不是塞进 user 消息的 block（那是 Anthropic 的做法）。
+            Msg::Tool(r) => json!({
+                "role": "tool",
+                "tool_call_id": r.call_id,
+                "content": r.content,
+            }),
         }));
 
-        json!({
+        let mut body = json!({
             "model": self.model,
             "max_tokens": req.max_tokens.min(self.max_tokens_limit()),
             "messages": messages,
             "stream": false,
-        })
+        });
+
+        // 没有工具时整个字段都不带。传 "tools": [] 有些 OpenAI 兼容端点会报错。
+        if !req.tools.is_empty() {
+            body["tools"] = Value::Array(
+                req.tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.params,
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        body
     }
 }
 
@@ -381,6 +506,7 @@ fn parse_openai_response(body: &Value) -> Result<ModelResponse> {
         Some("stop") => StopReason::EndTurn,
         Some("length") => StopReason::MaxTokens,
         Some("content_filter") => StopReason::Refusal,
+        Some("tool_calls") => StopReason::ToolUse,
         Some(other) => StopReason::Other(other.to_string()),
         None => StopReason::Other("missing".into()),
     };
@@ -405,8 +531,40 @@ fn parse_openai_response(body: &Value) -> Result<ModelResponse> {
             .unwrap_or(0) as u32
     };
 
+    // ★ 第五个差异：工具调用挂在 message.tool_calls 上，
+    //   而且 arguments 是**字符串**——要 parse 第二次。
+    let mut tool_calls = Vec::new();
+    if let Some(arr) = choice
+        .pointer("/message/tool_calls")
+        .and_then(Value::as_array)
+    {
+        for c in arr {
+            let id = c.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name = c
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let raw_args = c
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            // 模型偶尔吐出截断的 JSON，报错而不是 unwrap 崩掉。
+            let args: Value = serde_json::from_str(raw_args).map_err(|e| {
+                ClipKnowError::Llm(format!(
+                    "工具 {name} 的参数不是合法 JSON: {e}（原文: {raw_args}）"
+                ))
+            })?;
+            tool_calls.push(ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                args,
+            });
+        }
+    }
+
     Ok(ModelResponse {
         text,
+        tool_calls,
         stop_reason,
         input_tokens: get_u32("prompt_tokens"),
         output_tokens: get_u32("completion_tokens"),
@@ -536,6 +694,7 @@ mod tests {
             system: "你是助手".into(),
             messages: vec![Msg::user("你好")],
             max_tokens: 16000,
+            tools: vec![],
         });
         assert!(body.get("temperature").is_none(), "不能传 temperature");
         assert!(body.get("top_p").is_none(), "不能传 top_p");
@@ -566,6 +725,7 @@ mod tests {
             system: "你是助手".into(),
             messages: vec![Msg::user("你好")],
             max_tokens: 8192,
+            tools: vec![],
         });
 
         assert!(
@@ -588,6 +748,7 @@ mod tests {
             system: "s".into(),
             messages: vec![Msg::user("u")],
             max_tokens: 16_000,
+            tools: vec![],
         });
         assert_eq!(body["max_tokens"], 8192);
     }
@@ -653,6 +814,7 @@ mod tests {
             system: "你是助手".into(),
             messages: vec![Msg::user("你好")],
             max_tokens: 8000,
+            tools: vec![],
         };
 
         let anthropic = AnthropicClient::new("k".into(), DEFAULT_MODEL.into());
@@ -668,6 +830,272 @@ mod tests {
         // 两家都能把用户的话带上
         assert_eq!(a_body["messages"][0]["content"], "你好");
         assert_eq!(d_body["messages"][1]["content"], "你好");
+    }
+
+    // -----------------------------------------------------------------
+    // 工具调用（第二版）
+    // -----------------------------------------------------------------
+
+    fn search_tool() -> ToolDef {
+        ToolDef {
+            name: "search_videos".into(),
+            description: "在指定平台按关键词搜索视频".into(),
+            params: json!({
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string", "enum": ["youtube", "tiktok"]},
+                    "query": {"type": "string"}
+                },
+                "required": ["platform", "query"]
+            }),
+        }
+    }
+
+    #[test]
+    fn deepseek_wraps_tools_in_openai_function_envelope() {
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: vec![Msg::user("hi")],
+            max_tokens: 100,
+            tools: vec![search_tool()],
+        });
+
+        let t = &body["tools"][0];
+        assert_eq!(t["type"], "function");
+        assert_eq!(t["function"]["name"], "search_videos");
+        assert_eq!(t["function"]["description"], "在指定平台按关键词搜索视频");
+        // OpenAI 管它叫 parameters，不是 input_schema（那是 Anthropic 的叫法）
+        assert_eq!(t["function"]["parameters"]["required"][0], "platform");
+    }
+
+    #[test]
+    fn deepseek_omits_tools_field_entirely_when_there_are_none() {
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: vec![Msg::user("hi")],
+            max_tokens: 100,
+            tools: vec![],
+        });
+        // 传 "tools": [] 有些端点会报错，干脆不带这个字段
+        assert!(body.get("tools").is_none(), "没有工具时不该出现 tools 字段");
+    }
+
+    /// 这份响应体是 2026-08-18 用真 key 打 deepseek-chat 抓回来的原样结构，
+    /// 不是照文档编的。三个细节都来自实测：
+    ///   - id 形如 call_00_xxx
+    ///   - arguments 是**字符串**不是对象
+    ///   - content 和 tool_calls **同时**非空
+    fn real_deepseek_tool_call_body() -> Value {
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "我来帮你同时进行这两个操作：搜索YouTube上的科普视频，以及查询博主 @yykp 的粉丝数。",
+                    "tool_calls": [
+                        {"id": "call_00_hny590CbqPea0cQFPNti1601", "type": "function",
+                         "function": {"name": "search_videos",
+                                      "arguments": "{\"platform\": \"youtube\", \"query\": \"科普\"}"}},
+                        {"id": "call_01_eK895XXJgRj9tesmnoyP7932", "type": "function",
+                         "function": {"name": "get_creator",
+                                      "arguments": "{\"platform\": \"youtube\", \"handle\": \"yykp\"}"}}
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 406, "completion_tokens": 134}
+        })
+    }
+
+    #[test]
+    fn openai_tool_call_arguments_are_parsed_from_string_into_json() {
+        let r = parse_openai_response(&real_deepseek_tool_call_body()).unwrap();
+
+        assert_eq!(r.tool_calls.len(), 2);
+        let first = &r.tool_calls[0];
+        assert_eq!(first.id, "call_00_hny590CbqPea0cQFPNti1601");
+        assert_eq!(first.name, "search_videos");
+        // 关键：线上传的是字符串，中立类型里必须已经是解析好的 JSON
+        assert_eq!(first.args["platform"], "youtube");
+        assert_eq!(first.args["query"], "科普");
+    }
+
+    #[test]
+    fn openai_keeps_both_content_and_tool_calls() {
+        // 实测发现：DeepSeek 发起工具调用时常常同时说一句话。
+        // 只取 tool_calls 会把这句话丢掉，历史就不完整了。
+        let r = parse_openai_response(&real_deepseek_tool_call_body()).unwrap();
+        assert!(r.text.contains("我来帮你同时进行这两个操作"));
+        assert_eq!(r.tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn openai_tool_calls_finish_reason_maps_to_tool_use() {
+        let r = parse_openai_response(&real_deepseek_tool_call_body()).unwrap();
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn openai_plain_answer_has_no_tool_calls() {
+        // 回归：没有工具的普通回答，tool_calls 必须是空的而不是报错
+        let body = json!({
+            "choices": [{"message": {"role": "assistant", "content": "讲的是早期获客。"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let r = parse_openai_response(&body).unwrap();
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn openai_malformed_tool_arguments_error_instead_of_panicking() {
+        // 模型偶尔会吐出截断的 JSON。这时要报错，不能 unwrap 崩掉。
+        let body = json!({
+            "choices": [{"message": {"role": "assistant", "content": "",
+                "tool_calls": [{"id": "call_0", "type": "function",
+                    "function": {"name": "search_videos", "arguments": "{\"platform\": \"you"}}]},
+                "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        assert!(parse_openai_response(&body).is_err());
+    }
+
+    #[test]
+    fn assistant_message_with_tool_calls_serializes_arguments_back_to_string() {
+        // 收到时 arguments 是字符串→我们 parse 成了 Value；
+        // 发回去时必须再变回字符串，否则 DeepSeek 不认。
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: vec![
+                Msg::user("找科普博主"),
+                Msg::assistant_with_tools(
+                    "我来搜一下。",
+                    vec![ToolCall {
+                        id: "call_00_abc".into(),
+                        name: "search_videos".into(),
+                        args: json!({"platform": "youtube", "query": "科普"}),
+                    }],
+                ),
+            ],
+            max_tokens: 100,
+            tools: vec![search_tool()],
+        });
+
+        let a = &body["messages"][2];
+        assert_eq!(a["role"], "assistant");
+        assert_eq!(a["content"], "我来搜一下。");
+        assert_eq!(a["tool_calls"][0]["id"], "call_00_abc");
+        assert_eq!(a["tool_calls"][0]["type"], "function");
+        assert_eq!(a["tool_calls"][0]["function"]["name"], "search_videos");
+
+        let args = a["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments 必须是字符串，不能是对象");
+        let parsed: Value = serde_json::from_str(args).unwrap();
+        assert_eq!(parsed["query"], "科普");
+    }
+
+    #[test]
+    fn tool_result_becomes_its_own_message_with_role_tool() {
+        // OpenAI 格式里工具结果是独立一条 role:"tool" 消息，
+        // 不是塞进 user 消息的 block（那是 Anthropic 的做法）。
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: vec![Msg::tool_result(ToolResult {
+                call_id: "call_00_abc".into(),
+                content: "[20 条视频]".into(),
+                is_error: false,
+            })],
+            max_tokens: 100,
+            tools: vec![],
+        });
+
+        let t = &body["messages"][1];
+        assert_eq!(t["role"], "tool");
+        assert_eq!(t["tool_call_id"], "call_00_abc");
+        assert_eq!(t["content"], "[20 条视频]");
+    }
+
+    #[test]
+    fn failed_tool_result_still_goes_back_as_a_normal_tool_message() {
+        // 工具失败**不能**中止循环，必须照样产出一条配对的 tool 消息，
+        // 让模型自己决定绕路。见设计文档 7.3。
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: vec![Msg::tool_result(ToolResult {
+                call_id: "call_00_abc".into(),
+                content: "SC 返回 503".into(),
+                is_error: true,
+            })],
+            max_tokens: 100,
+            tools: vec![],
+        });
+
+        let t = &body["messages"][1];
+        assert_eq!(t["role"], "tool");
+        assert_eq!(t["tool_call_id"], "call_00_abc");
+        // 失败要让模型看得出来，不能伪装成正常结果
+        assert!(
+            t["content"].as_str().unwrap().contains("SC 返回 503"),
+            "错误内容必须原样带给模型"
+        );
+    }
+
+    #[test]
+    fn one_full_round_trip_keeps_call_ids_paired() {
+        // 端到端：解析响应 → 拿 id 造 result → 再发回去，id 必须一路对得上
+        let resp = parse_openai_response(&real_deepseek_tool_call_body()).unwrap();
+        let mut msgs = vec![Msg::user("找科普博主")];
+        msgs.push(Msg::assistant_with_tools(
+            &resp.text,
+            resp.tool_calls.clone(),
+        ));
+        for tc in &resp.tool_calls {
+            msgs.push(Msg::tool_result(ToolResult {
+                call_id: tc.id.clone(),
+                content: "ok".into(),
+                is_error: false,
+            }));
+        }
+
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: msgs,
+            max_tokens: 100,
+            tools: vec![search_tool()],
+        });
+
+        let m = body["messages"].as_array().unwrap();
+        // system + user + assistant + 2 条 tool
+        assert_eq!(m.len(), 5);
+        assert_eq!(m[3]["tool_call_id"], m[2]["tool_calls"][0]["id"]);
+        assert_eq!(m[4]["tool_call_id"], m[2]["tool_calls"][1]["id"]);
+    }
+
+    #[test]
+    fn anthropic_rejects_tools_with_a_clear_error_this_version() {
+        // 这一版只实现 DeepSeek 的工具格式（设计文档第 15 节）。
+        // 拿 --provider anthropic 跑 find 时要明确报错，
+        // 而不是悄悄把工具丢掉、给出一个看起来正常但没调过工具的答案。
+        let c = AnthropicClient::new("k".into(), DEFAULT_MODEL.into());
+        let err = c
+            .complete(&ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::user("hi")],
+                max_tokens: 100,
+                tools: vec![search_tool()],
+            })
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("Anthropic"),
+            "错误信息要说清是哪家不支持，实际: {err}"
+        );
     }
 
     #[test]

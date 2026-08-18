@@ -2,3 +2,4 @@
 clipknow.db
 .env
 docs/
+.DS_Store

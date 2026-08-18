@@ -243,3 +243,195 @@ mod tests {
         assert!(a < b, "v7 应该按时间有序: {a} vs {b}");
     }
 }
+
+/// 搜索/列表结果里的一条视频。比 `Video` 轻——没有文字稿、没有评论，
+/// 只有挑选候选时需要的信息。
+///
+/// 这是**给模型看的**类型：字段少是刻意的，多一个字段就是每轮多一份 token。
+/// 原始响应在 `tool_calls` 表里，漏了随时能补。
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoSummary {
+    pub platform: Platform,
+    pub native_id: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub channel_name: Option<String>,
+    /// 用于展示和调下一个 API。**不能拿来做比较或去重**——
+    /// 跨端点格式不一致（`laogao` vs `@hafu`）、中文是 URL 编码、用户还能改。
+    pub channel_handle: Option<String>,
+    /// 稳定 ID，去重就用它。YouTube 是 `UC...`，TikTok 是数字串，IG 是 pk。
+    pub channel_id: Option<String>,
+    pub view_count: Option<i64>,
+    pub like_count: Option<i64>,
+    pub comment_count: Option<i64>,
+    pub duration_sec: Option<i64>,
+    /// Unix 秒。YouTube 只能用 publishDate 算，见 discovery.rs 的注释。
+    pub published_at: Option<i64>,
+}
+
+/// 一个博主。搜索结果和主页详情共用这一个类型——虽然两个端点的字段名
+/// 完全不同（见 discovery.rs 的注释），但对模型来说它们是同一个概念。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Creator {
+    pub platform: Platform,
+    /// 平台的稳定 ID，**去重只能用它**。
+    /// YouTube 是 `UC...`，TikTok 是数字 uid，Instagram 是数字 id。
+    pub id: Option<String>,
+    /// 展示 + 调下一个 API 用。已统一剥掉开头的 `@`。
+    /// 中文 handle 是 URL 编码串（实测 SC 编码/解码两种都认，原样透传即可）。
+    pub handle: Option<String>,
+    pub name: Option<String>,
+    pub bio: Option<String>,
+    pub follower_count: Option<i64>,
+    pub video_count: Option<i64>,
+    pub verified: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// 会话存储的中立类型（第二版）
+// ---------------------------------------------------------------------------
+
+/// 一条历史条目的类型。
+///
+/// 类型名写全，不另设「方向」字段。
+///
+/// 有些实现把 user 和 assistant 消息都叫 `message`，再用一个 direction
+/// 字段区分谁说的——那是为了兼容 OpenAI Responses API 的格式。这里没有
+/// 这个包袱，把四种类型直接写清楚，一个字段就够，查询时也不用两个条件拼。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    UserMessage,
+    AssistantMessage,
+    FunctionCall,
+    FunctionCallOutput,
+}
+
+impl ItemKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ItemKind::UserMessage => "user_message",
+            ItemKind::AssistantMessage => "assistant_message",
+            ItemKind::FunctionCall => "function_call",
+            ItemKind::FunctionCallOutput => "function_call_output",
+        }
+    }
+
+    pub fn from_db(s: &str) -> Option<ItemKind> {
+        Some(match s {
+            "user_message" => ItemKind::UserMessage,
+            "assistant_message" => ItemKind::AssistantMessage,
+            "function_call" => ItemKind::FunctionCall,
+            "function_call_output" => ItemKind::FunctionCallOutput,
+            _ => return None,
+        })
+    }
+}
+
+/// 一次提问的终态。对应状态机的 Done / Failed。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStatus {
+    Done,
+    Failed(String),
+}
+
+impl TurnStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TurnStatus::Done => "done",
+            TurnStatus::Failed(_) => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Turn {
+    pub id: String,
+    pub seq: i64,
+    pub model: String,
+    pub status: TurnStatus,
+    pub created_at: i64,
+}
+
+/// 历史里的一条。
+///
+/// `payload` 存的是**当时实际发给模型的那段文本**，不是结构化数据——
+/// 大模型 API 无状态，每轮要把完整历史重发；存结构化的话重建时得重新渲染，
+/// 而渲染代码一改，模型看到的「自己上一轮读过的材料」就悄悄变了样。
+///
+/// `raw_json` 只有 `FunctionCallOutput` 有，而且**重建历史时不加载**。
+#[derive(Debug, Clone)]
+pub struct Item {
+    pub idx: i64,
+    pub kind: ItemKind,
+    pub iteration: Option<i64>,
+    pub call_id: Option<String>,
+    pub payload: serde_json::Value,
+    pub raw_json: Option<String>,
+}
+
+impl Item {
+    pub fn user_message(idx: i64, text: &str) -> Item {
+        Item {
+            idx,
+            kind: ItemKind::UserMessage,
+            iteration: None,
+            call_id: None,
+            payload: serde_json::json!({ "text": text }),
+            raw_json: None,
+        }
+    }
+
+    pub fn assistant_message(idx: i64, iteration: i64, text: &str) -> Item {
+        Item {
+            idx,
+            kind: ItemKind::AssistantMessage,
+            iteration: Some(iteration),
+            call_id: None,
+            payload: serde_json::json!({ "text": text }),
+            raw_json: None,
+        }
+    }
+
+    pub fn function_call(
+        idx: i64,
+        iteration: i64,
+        call_id: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Item {
+        Item {
+            idx,
+            kind: ItemKind::FunctionCall,
+            iteration: Some(iteration),
+            call_id: Some(call_id.into()),
+            payload: serde_json::json!({ "name": name, "args": args }),
+            raw_json: None,
+        }
+    }
+
+    pub fn function_call_output(
+        idx: i64,
+        iteration: i64,
+        call_id: &str,
+        content: &str,
+        is_error: bool,
+        raw_json: Option<String>,
+    ) -> Item {
+        Item {
+            idx,
+            kind: ItemKind::FunctionCallOutput,
+            iteration: Some(iteration),
+            call_id: Some(call_id.into()),
+            payload: serde_json::json!({ "content": content, "is_error": is_error }),
+            raw_json,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+}

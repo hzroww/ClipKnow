@@ -1,0 +1,157 @@
+{
+ "success": true,
+ "credits_charged": 1,
+ "data": {
+  "user": {
+   "pk": "2093326268",
+   "friendship_status": null,
+   "gating": null,
+   "fbid_v2": "17841402108061665",
+   "is_memorialized": false,
+   "is_private": false,
+   "has_story_archive": null,
+   "is_coppa_enforced": null,
+   "supervision_info": null,
+   "is_regulated_c18": false,
+   "regulated_news_in_locations": [],
+   "bio_links": [],
+   "linked_fb_info": null,
+   "text_post_app_badge_label": "science",
+   "show_text_post_app_badge": true,
+   "username": "science",
+   "live_broadcast_visibility": null,
+   "live_broadcast_id": null,
+   "profile_pic_url": "https://scontent-dfw5-2.cdninstagram.com/v/t51.2885-19/362000730_169320776159107_4935218323587592974_n.jpg?stp=dst-jpg_s150x150_tt6&_nc_cat=100&ccb=7-5&_nc_sid=f7ccc5&efg=eyJ2ZW5jb2RlX3RhZyI6InByb2ZpbGVfcGljLnd3dy4zMzYuQzMifQ%3D%3D&_nc_ohc=pIoMLQNqImAQ7kNvwFhpEI5&_nc_oc=Adr5prgg25ZHBXOaNzn05n4qdKOJLk-ws2935TCimUXsfBHGFXHJEX1fh4AXFAa9WsE&_nc_zt=24&_nc_ht=scontent-dfw5-2.cdninstagram.com&_nc_ss=7f689&oh=00_AQGsDRKM8dNfFFA2HXq_AtSpUQPLGrp_hgk3gvssb1-7kw&oe=6A89C378",
+   "hd_profile_pic_url_info": {
+    "url": "https://scontent-dfw5-2.cdninstagram.com/v/t51.2885-19/362000730_169320776159107_4935218323587592974_n.jpg?_nc_cat=100&ccb=7-5&_nc_sid=bf7eb4&efg=eyJ2ZW5jb2RlX3RhZyI6InByb2ZpbGVfcGljLnd3dy4zMzYuQzMifQ%3D%3D&_nc_ohc=pIoMLQNqImAQ7kNvwFhpEI5&_nc_oc=Adr5prgg25ZHBXOaNzn05n4qdKOJLk-ws2935TCimUXsfBHGFXHJEX1fh4AXFAa9WsE&_nc_zt=24&_nc_ht=scontent-dfw5-2.cdninstagram.com&_nc_ss=7f689&oh=00_AQF7v-K7kn4GEn9CSeS4Ri0X-yKSdBO2qdkShPv9npzT3A&oe=6A89C378"
+   },
+   "is_unpublished": false,
+   "latest_reel_media": null,
+   "has_profile_pic": null,
+   "profile_pic_genai_tool_info": [],
+   "biography": "🧲🧬🔭@science\nLearn Something New Everyday\nWe’re now on Tik Tok too! @science \n✉️Business inquiries 👉 partner@memesmediagroup.com",
+   "full_name": "Science 🧬",
+   "is_verified": false,
+   "show_account_transparency_details": true,
+   "account_type": 2,
+   "follower_count": 1852477,
+   "mutual_followers_count": null,
+   "profile_context_links_with_user_ids": null,
+   "profile_context_facepile_users": null,
+   "address_street": null,
+   "city_name": null,
+   "is_business": false,
+   "zip": null,
+   "biography_with_entities": {
+    "raw_text": "🧲🧬🔭@science\nLearn Something New Everyday\nWe’re now on Tik Tok too! @science \n✉️Business inquiries 👉 partner@memesmediagroup.com",
+    "entities": [
+     {
+      "hashtag": null,
+      "user": {
+       "username": "science",
+       "id": "2093326268"
+      }
+     }
+    ]
+   },
+   "category": "",
+   "should_show_category": false,
+   "aigm_account_label_info": null,
+   "is_ring_creator": null,
+   "show_ring_award": null,
+   "ring_creator_metadata": null,
+   "account_badges": [],
+   "ai_agent_type": null,
+   "external_lynx_url": null,
+   "external_url": null,
+   "pronouns": [],
+   "transparency_label": null,
+   "transparency_product": null,
+   "hide_creator_marketplace_badge": false,
+   "id": "2093326268",
+   "has_chaining": null,
+   "remove_message_entrypoint": false,
+   "is_embeds_disabled": false,
+   "is_cannes": false,
+   "is_professional_account": true,
+   "following_count": 53,
+   "media_count": null,
+   "total_clips_count": 1,
+   "latest_besties_reel_media": null,
+   "reel_media_seen_timestamp": null,
+   "ai_agent_owner_username": null,
+   "fb_profile_biolink": null,
+   "blocked_by_viewer": false,
+   "restricted_by_viewer": null,
+   "country_block": false,
+   "eimu_id": null,
+   "external_url_linkshimmed": null,
+   "edge_followed_by": {
+    "count": 1852477
+   },
+   "fbid": "17841402108061665",
+   "followed_by_viewer": false,
+   "edge_follow": {
+    "count": 53
+   },
+   "follows_viewer": false,
+   "group_metadata": null,
+   "has_ar_effects": false,
+   "has_clips": true,
+   "has_guides": false,
+   "has_channel": false,
+   "has_blocked_viewer": false,
+   "highlight_reel_count": 0,
+   "has_onboarded_to_text_post_app": false,
+   "has_requested_viewer": false,
+   "hide_like_and_view_counts": false,
+   "is_business_account": false,
+   "is_supervision_enabled": false,
+   "is_guardian_of_viewer": false,
+   "is_supervised_by_viewer": false,
+   "is_supervised_user": false,
+   "is_joined_recently": false,
+   "guardian_id": null,
+   "business_address_json": {
+    "city_name": null,
+    "city_id": null,
+    "latitude": null,
+    "longitude": null,
+    "street_address": null,
+    "zip_code": null
+   },
+   "business_contact_method": null,
+   "business_email": null,
+   "business_phone_number": null,
+   "business_category_name": null,
+   "overall_category_name": null,
+   "category_enum": null,
+   "category_name": null,
+   "is_verified_by_mv4b": false,
+   "edge_mutual_followed_by": {
+    "count": 0,
+    "edges": []
+   },
+   "pinned_channels_list_count": 0,
+   "profile_pic_url_hd": "https://scontent-dfw5-2.cdninstagram.com/v/t51.2885-19/362000730_169320776159107_4935218323587592974_n.jpg?_nc_cat=100&ccb=7-5&_nc_sid=bf7eb4&efg=eyJ2ZW5jb2RlX3RhZyI6InByb2ZpbGVfcGljLnd3dy4zMzYuQzMifQ%3D%3D&_nc_ohc=pIoMLQNqImAQ7kNvwFhpEI5&_nc_oc=Adr5prgg25ZHBXOaNzn05n4qdKOJLk-ws2935TCimUXsfBHGFXHJEX1fh4AXFAa9WsE&_nc_zt=24&_nc_ht=scontent-dfw5-2.cdninstagram.com&_nc_ss=7f689&oh=00_AQF7v-K7kn4GEn9CSeS4Ri0X-yKSdBO2qdkShPv9npzT3A&oe=6A89C378",
+   "requested_by_viewer": false,
+   "should_show_public_contacts": true,
+   "edge_felix_video_timeline": {
+    "count": 0
+   },
+   "edge_owner_to_timeline_media": {
+    "count": 4887
+   },
+   "edge_saved_media": {
+    "count": 0
+   },
+   "edge_media_collections": {
+    "count": 0
+   },
+   "edge_related_profiles": {
+    "edges": []
+   }
+  }
+ },
+ "status": "ok"
+}

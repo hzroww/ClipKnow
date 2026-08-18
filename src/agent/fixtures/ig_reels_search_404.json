@@ -1,0 +1,8 @@
+{
+ "success": false,
+ "credits_remaining": null,
+ "credits_charged": 0,
+ "error": "not_found",
+ "errorStatus": 404,
+ "message": "No scrapeable reels found for that query. You were not charged for this request."
+}

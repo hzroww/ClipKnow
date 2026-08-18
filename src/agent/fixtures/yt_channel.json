@@ -1,0 +1,83 @@
+{
+ "success": true,
+ "credits_charged": 1,
+ "channelId": "UCXMVaxrax7RNDPdfRrXXgtQ",
+ "channel": "http://www.youtube.com/@hafu",
+ "handle": "@hafu",
+ "isVerified": true,
+ "name": "Hafu Go",
+ "description": "Everything is a learning experience! Subscribe to get better.\n\nBusiness Inquiries: hafu@greenlightgroup.co\n\nFacebook: HAFU GO Instagram: hafugo\n",
+ "subscriberCount": 19100000,
+ "subscriberCountText": "19.1M subscribers",
+ "videoCountText": "507 videos",
+ "videoCount": 507,
+ "viewCountText": "6,812,177,389 views",
+ "viewCount": 6812177389,
+ "joinedDateText": "Joined Feb 8, 2017",
+ "tags": "hafu, hafu go, fitness, challenge, 7 days, I tried, I trained, browney, Brandon william, Jesse James west, Elliot choy, kelly wakasa",
+ "email": "hafu@greenlightgroup.co",
+ "country": "United States",
+ "shop_featured_products": "https://beacons.ai/hafu",
+ "links": [
+  "https://beacons.ai/hafu"
+ ],
+ "keywords": [
+  "hafu",
+  "hafu go",
+  "fitness",
+  "challenge",
+  "7 days",
+  "I tried",
+  "I trained",
+  "browney",
+  "Brandon william",
+  "Jesse James west",
+  "Elliot choy",
+  "kelly wakasa"
+ ],
+ "isFamilySafe": true,
+ "avatar": {
+  "image": {
+   "sources": [
+    {
+     "url": "https://yt3.googleusercontent.com/0RF0JFi8CHl63ObDeX1igAguhZhFoJ38Ntr9HjwOAWY4im48wpMiZ5T4UK0ssIvtJy6tHJqxPA=s68-c-k-c0x00ffffff-no-rj",
+     "width": 68,
+     "height": 68
+    }
+   ]
+  },
+  "avatarImageSize": "AVATAR_SIZE_M"
+ },
+ "banner": [
+  {
+   "url": "https://yt3.googleusercontent.com/Q4xZw6levJ5upeJYpsdy3w3v0xrk1bS3h8_tjHJD0guk6AUXAKop9yr-d9vfJZCNwGSBcICpNA=w1060-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj",
+   "width": 1060,
+   "height": 175
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/Q4xZw6levJ5upeJYpsdy3w3v0xrk1bS3h8_tjHJD0guk6AUXAKop9yr-d9vfJZCNwGSBcICpNA=w1138-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj",
+   "width": 1138,
+   "height": 188
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/Q4xZw6levJ5upeJYpsdy3w3v0xrk1bS3h8_tjHJD0guk6AUXAKop9yr-d9vfJZCNwGSBcICpNA=w1707-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj",
+   "width": 1707,
+   "height": 283
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/Q4xZw6levJ5upeJYpsdy3w3v0xrk1bS3h8_tjHJD0guk6AUXAKop9yr-d9vfJZCNwGSBcICpNA=w2120-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj",
+   "width": 2120,
+   "height": 351
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/Q4xZw6levJ5upeJYpsdy3w3v0xrk1bS3h8_tjHJD0guk6AUXAKop9yr-d9vfJZCNwGSBcICpNA=w2276-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj",
+   "width": 2276,
+   "height": 377
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/Q4xZw6levJ5upeJYpsdy3w3v0xrk1bS3h8_tjHJD0guk6AUXAKop9yr-d9vfJZCNwGSBcICpNA=w2560-fcrop64=1,00005a57ffffa5a8-k-c0xffffffff-no-nd-rj",
+   "width": 2560,
+   "height": 424
+  }
+ ]
+}

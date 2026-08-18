@@ -163,11 +163,17 @@ impl ScrapeCreators {
 
     /// 发一个 GET 请求，检查 SC 的 success 字段，返回解析好的 JSON。
     fn get(&self, path: &str, url_param: &str) -> Result<Value> {
+        self.get_with(path, &[("url", url_param.to_string())])
+    }
+
+    /// 任意查询参数的版本。发现类端点用的参数名各不相同
+    /// （query / handle / type / sortBy…），不能只支持 `url`。
+    pub(crate) fn get_with(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
         let resp = self
             .http
             .get(format!("{BASE_URL}{path}"))
             .header("x-api-key", &self.api_key)
-            .query(&[("url", url_param)])
+            .query(params)
             .send()?;
 
         let status = resp.status();
@@ -452,7 +458,7 @@ fn extract_comments(v: &Value, video_id: &str, platform: Platform) -> Vec<Commen
 // ---------------------------------------------------------------------------
 
 /// 按点号路径深入取值。`items.0.name` 会依次取 items → 第 0 个元素 → name。
-fn dig<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+pub(crate) fn dig<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
         cur = match part.parse::<usize>() {
@@ -464,13 +470,13 @@ fn dig<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 /// 依次尝试多个路径，返回第一个存在且非 null 的节点。
-fn first_present<'a>(v: &'a Value, paths: &[&str]) -> Option<&'a Value> {
+pub(crate) fn first_present<'a>(v: &'a Value, paths: &[&str]) -> Option<&'a Value> {
     paths
         .iter()
         .find_map(|p| dig(v, p).filter(|x| !x.is_null()))
 }
 
-fn pick_str(v: &Value, paths: &[&str]) -> Option<String> {
+pub(crate) fn pick_str(v: &Value, paths: &[&str]) -> Option<String> {
     let node = first_present(v, paths)?;
     match node {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
@@ -479,7 +485,7 @@ fn pick_str(v: &Value, paths: &[&str]) -> Option<String> {
     }
 }
 
-fn pick_i64(v: &Value, paths: &[&str]) -> Option<i64> {
+pub(crate) fn pick_i64(v: &Value, paths: &[&str]) -> Option<i64> {
     let node = first_present(v, paths)?;
     node.as_i64()
         .or_else(|| node.as_f64().map(|f| f as i64))
@@ -487,7 +493,7 @@ fn pick_i64(v: &Value, paths: &[&str]) -> Option<i64> {
         .or_else(|| node.as_str().and_then(|s| s.parse::<i64>().ok()))
 }
 
-fn pick_f64(v: &Value, paths: &[&str]) -> Option<f64> {
+pub(crate) fn pick_f64(v: &Value, paths: &[&str]) -> Option<f64> {
     first_present(v, paths)?.as_f64()
 }
 
@@ -496,7 +502,7 @@ fn pick_f64(v: &Value, paths: &[&str]) -> Option<f64> {
 /// 必须按**字符**切而不是字节：`&s[..200]` 如果切点落在一个中文字或 emoji
 /// 中间，Rust 会直接 panic（不是抛异常，是程序当场崩）。SC 返回中文错误
 /// 信息时就会踩到这个。
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

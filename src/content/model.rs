@@ -383,12 +383,25 @@ impl Item {
     }
 
     pub fn assistant_message(idx: i64, iteration: i64, text: &str) -> Item {
+        Self::assistant_message_full(idx, iteration, text, "")
+    }
+
+    /// 带上思考过程。
+    ///
+    /// 「它做了什么」和「它为什么这么做」是两件事，后者只在这里。
+    /// 实测第一轮常常 `text` 是空的、只有思考和 tool_calls——
+    /// 不存的话库里就是一条 `{"text":""}`，什么都看不出来。
+    pub fn assistant_message_full(idx: i64, iteration: i64, text: &str, reasoning: &str) -> Item {
+        let mut payload = serde_json::json!({ "text": text });
+        if !reasoning.is_empty() {
+            payload["reasoning"] = serde_json::Value::from(reasoning);
+        }
         Item {
             idx,
             kind: ItemKind::AssistantMessage,
             iteration: Some(iteration),
             call_id: None,
-            payload: serde_json::json!({ "text": text }),
+            payload,
             raw_json: None,
         }
     }

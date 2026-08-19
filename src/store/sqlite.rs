@@ -585,6 +585,31 @@ mod tests {
     }
 
     #[test]
+    fn an_assistant_item_keeps_the_reasoning_alongside_the_text() {
+        // items 表存在的全部理由是让循环不是黑盒。
+        // 「它做了什么」原来看得见，「它为什么这么做」原来看不见。
+        let it = Item::assistant_message_full(1, 1, "我搜一下", "用户想找科普博主");
+        assert_eq!(it.payload["text"], "我搜一下");
+        assert_eq!(it.payload["reasoning"], "用户想找科普博主");
+    }
+
+    #[test]
+    fn reasoning_survives_a_round_trip_through_the_database() {
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Done,
+            &[Item::assistant_message_full(1, 1, "", "思考：先搜关键词")],
+        )
+        .unwrap();
+
+        let back = st.load_history(&sid).unwrap();
+        assert_eq!(back[0].payload["reasoning"], "思考：先搜关键词");
+    }
+
+    #[test]
     fn a_session_title_can_be_set_after_the_fact() {
         // 建会话时还不知道标题（要等第一个问题）。
         // 没标题的话 `clipknow sessions` 列出来全是「(无标题)」，认不出是哪次。

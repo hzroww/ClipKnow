@@ -56,6 +56,13 @@ pub enum Msg {
     /// 常常同时说一句话，两个都要存进历史。
     Assistant {
         text: String,
+        /// 模型的思考过程（DeepSeek 的 `reasoning_content`）。
+        ///
+        /// 2026-08-19 实测：丢掉它**不会**导致 400（三种做法都试过）。
+        /// 带上是因为历史更完整，而且这是「循环为什么这么决定」的唯一记录——
+        /// `items` 表存在的全部理由就是让循环不是黑盒，丢了它就只剩
+        /// 「做了什么」，没有「为什么」。
+        reasoning: String,
         tool_calls: Vec<ToolCall>,
     },
     Tool(ToolResult),
@@ -69,6 +76,7 @@ impl Msg {
     pub fn assistant(text: impl Into<String>) -> Self {
         Msg::Assistant {
             text: text.into(),
+            reasoning: String::new(),
             tool_calls: Vec::new(),
         }
     }
@@ -76,6 +84,7 @@ impl Msg {
     pub fn assistant_with_tools(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
         Msg::Assistant {
             text: text.into(),
+            reasoning: String::new(),
             tool_calls,
         }
     }
@@ -138,6 +147,9 @@ pub struct ModelResponse {
     /// 可能是空串。注意它和 `tool_calls` 是**并存**关系，不是二选一——
     /// 实测 DeepSeek 发起工具调用时常常同时说一句「我来帮你……」。
     pub text: String,
+    /// 模型的思考过程。DeepSeek 放在 `reasoning_content` 里，
+    /// 没有这个字段就是空串。
+    pub reasoning: String,
     /// 空表示模型这轮不要工具，循环该结束了。
     /// **循环的终止条件只看这个，不看 `text` 是否为空。**
     pub tool_calls: Vec<ToolCall>,
@@ -356,6 +368,8 @@ fn parse_anthropic_response(body: &Value) -> Result<ModelResponse> {
         // 这一版只实现 DeepSeek 的工具格式（见设计文档第 15 节）。
         // Anthropic 的 tool_use block 解析留到需要时再补，类型已经能装下。
         tool_calls: Vec::new(),
+        // Anthropic 的 thinking block 这一版不解析（跳过了）
+        reasoning: String::new(),
         stop_reason,
         input_tokens: get_u32("input_tokens"),
         // Anthropic 的缓存要显式声明 cache_control，这一版没做
@@ -415,12 +429,26 @@ impl DeepSeekClient {
         let mut messages = vec![json!({ "role": "system", "content": req.system })];
         messages.extend(req.messages.iter().map(|m| match m {
             Msg::User(t) => json!({ "role": "user", "content": t }),
-            Msg::Assistant { text, tool_calls } if tool_calls.is_empty() => {
-                json!({ "role": "assistant", "content": text })
+            Msg::Assistant {
+                text,
+                reasoning,
+                tool_calls,
+            } if tool_calls.is_empty() => {
+                let mut m = json!({ "role": "assistant", "content": text });
+                if !reasoning.is_empty() {
+                    m["reasoning_content"] = Value::from(reasoning.as_str());
+                }
+                m
             }
-            Msg::Assistant { text, tool_calls } => json!({
+            Msg::Assistant {
+                text,
+                reasoning,
+                tool_calls,
+            } => json!({
                 "role": "assistant",
                 "content": text,
+                // 空的就不发，别塞噪音
+                "reasoning_content": if reasoning.is_empty() { Value::Null } else { Value::from(reasoning.as_str()) },
                 "tool_calls": tool_calls.iter().map(|c| json!({
                     "id": c.id,
                     "type": "function",
@@ -598,8 +626,15 @@ fn parse_openai_response(body: &Value) -> Result<ModelResponse> {
         }
     }
 
+    let reasoning = choice
+        .pointer("/message/reasoning_content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
     Ok(ModelResponse {
         text,
+        reasoning,
         tool_calls,
         stop_reason,
         input_tokens: get_u32("prompt_tokens"),
@@ -1196,6 +1231,83 @@ mod tests {
             with_cache < without / 2.0,
             "缓存该便宜得多: {with_cache} vs {without}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // reasoning_content：模型的思考过程
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reasoning_content_is_parsed_not_dropped() {
+        // 2026-08-19 实测：deepseek-v4-flash 的 message 里有四个字段
+        // ['role', 'content', 'reasoning_content', 'tool_calls']。
+        // 之前只读 content 和 tool_calls，思考过程直接落地了——
+        // 模型下一轮看不到自己为什么这么决定，我们调试时也看不到。
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "用户想找科普博主。先搜一下「科普」看有哪些人。",
+                    "tool_calls": [{"id": "call_00_x", "type": "function",
+                        "function": {"name": "search_videos", "arguments": "{}"}}]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let r = parse_openai_response(&body).unwrap();
+        assert!(r.reasoning.contains("先搜一下"));
+        // content 是空的、reasoning 有内容 —— 实测第一轮常常就是这样
+        assert_eq!(r.text, "");
+        assert_eq!(r.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn a_response_without_reasoning_gives_an_empty_string_not_an_error() {
+        let body = json!({
+            "choices": [{"message": {"content": "答案"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        assert_eq!(parse_openai_response(&body).unwrap().reasoning, "");
+    }
+
+    #[test]
+    fn reasoning_is_sent_back_in_the_assistant_message() {
+        // 实测三种做法都不会 400（丢掉、回传、连 content 也不带）。
+        // 选择回传是因为历史更完整，不是为了防报错。
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: vec![Msg::Assistant {
+                text: "我搜一下".into(),
+                reasoning: "用户想找科普博主，先搜关键词".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call_00_x".into(),
+                    name: "search_videos".into(),
+                    args: json!({"query": "科普"}),
+                }],
+            }],
+            max_tokens: 100,
+            tools: vec![search_tool()],
+        });
+
+        let a = &body["messages"][1];
+        assert_eq!(a["content"], "我搜一下");
+        assert_eq!(a["reasoning_content"], "用户想找科普博主，先搜关键词");
+    }
+
+    #[test]
+    fn an_empty_reasoning_field_is_omitted_from_the_request() {
+        // 别发一个空字符串上去，那是噪音
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        let body = c.to_openai_body(&ModelRequest {
+            system: "s".into(),
+            messages: vec![Msg::assistant("普通回答")],
+            max_tokens: 100,
+            tools: vec![],
+        });
+        assert!(body["messages"][1].get("reasoning_content").is_none());
     }
 
     #[test]

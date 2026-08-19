@@ -135,7 +135,9 @@ fn est_messages(msgs: &[Msg]) -> usize {
     msgs.iter()
         .map(|m| match m {
             Msg::User(t) => est_tokens(t),
-            Msg::Assistant { text, tool_calls } => {
+            Msg::Assistant {
+                text, tool_calls, ..
+            } => {
                 est_tokens(text)
                     + tool_calls
                         .iter()
@@ -313,7 +315,12 @@ fn settle_assistant(
     iteration: i64,
     resp: &crate::agent::llm::ModelResponse,
 ) {
-    items.push(Item::assistant_message(*idx, iteration, &resp.text));
+    items.push(Item::assistant_message_full(
+        *idx,
+        iteration,
+        &resp.text,
+        &resp.reasoning,
+    ));
     *idx += 1;
     // ★ idx 在这里就按开单顺序全部分配好，不等执行完。
     //   以后改并发时，谁先完成无所谓，各填各的槽位——
@@ -326,6 +333,7 @@ fn settle_assistant(
     }
     messages.push(Msg::Assistant {
         text: resp.text.clone(),
+        reasoning: resp.reasoning.clone(),
         tool_calls: resp.tool_calls.clone(),
     });
 }
@@ -388,6 +396,7 @@ mod tests {
     fn says(text: &str) -> ModelResponse {
         ModelResponse {
             text: text.into(),
+            reasoning: String::new(),
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
             input_tokens: 10,
@@ -399,6 +408,7 @@ mod tests {
     fn wants(text: &str, calls: &[(&str, &str)]) -> ModelResponse {
         ModelResponse {
             text: text.into(),
+            reasoning: String::new(),
             tool_calls: calls
                 .iter()
                 .enumerate()

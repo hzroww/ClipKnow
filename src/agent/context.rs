@@ -24,6 +24,8 @@ pub fn to_messages(items: &[Item]) -> Vec<Msg> {
             ItemKind::AssistantMessage => {
                 out.push(Msg::Assistant {
                     text: str_field(it, "text"),
+                    // 存了但还原时丢掉，等于没存
+                    reasoning: str_field(it, "reasoning"),
                     tool_calls: Vec::new(),
                 });
             }
@@ -40,6 +42,7 @@ pub fn to_messages(items: &[Item]) -> Vec<Msg> {
                     Some(Msg::Assistant { tool_calls, .. }) => tool_calls.push(call),
                     _ => out.push(Msg::Assistant {
                         text: String::new(),
+                        reasoning: String::new(),
                         tool_calls: vec![call],
                     }),
                 }
@@ -89,7 +92,9 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert!(matches!(&msgs[0], Msg::User(t) if t.contains("科普")));
         match &msgs[1] {
-            Msg::Assistant { text, tool_calls } => {
+            Msg::Assistant {
+                text, tool_calls, ..
+            } => {
                 assert_eq!(text, "我先搜一下");
                 assert_eq!(tool_calls.len(), 1, "工具请求要并进 assistant 消息");
                 assert_eq!(tool_calls[0].id, "call_00_A");
@@ -143,7 +148,9 @@ mod tests {
 
         assert_eq!(msgs.len(), 3);
         match &msgs[1] {
-            Msg::Assistant { text, tool_calls } => {
+            Msg::Assistant {
+                text, tool_calls, ..
+            } => {
                 assert!(text.is_empty());
                 assert_eq!(tool_calls.len(), 1);
             }
@@ -170,5 +177,20 @@ mod tests {
     #[test]
     fn an_empty_history_produces_no_messages() {
         assert!(to_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn reasoning_is_restored_when_rebuilding_the_message_array() {
+        // 存了但还原时丢掉，等于没存
+        let items = vec![Item::assistant_message_full(1, 1, "我搜一下", "先搜关键词")];
+        match &to_messages(&items)[0] {
+            Msg::Assistant {
+                text, reasoning, ..
+            } => {
+                assert_eq!(text, "我搜一下");
+                assert_eq!(reasoning, "先搜关键词");
+            }
+            other => panic!("实际 {other:?}"),
+        }
     }
 }

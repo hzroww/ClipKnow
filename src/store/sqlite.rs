@@ -346,6 +346,15 @@ impl SqliteStore {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// 补一个标题。建会话时还不知道，要等第一个问题进来。
+    pub fn set_session_title(&mut self, session_id: &str, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            params![session_id, title],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&mut self, session_id: &str) -> Result<()> {
         // turns / items 靠 ON DELETE CASCADE 跟着走（init 里开了 foreign_keys）
         self.conn
@@ -428,18 +437,36 @@ impl SqliteStore {
     }
 
     /// 单独取某次工具调用的原始响应。调试和补解析用，永不进上下文。
-    pub fn get_raw_json(&self, session_id: &str, call_id: &str) -> Result<Option<String>> {
+    ///
+    /// **按 turn 定位，不是按 session**：`call_id` 是模型生成的，实测 `call_00_`
+    /// 这个前缀每一轮都从 0 重新开始，只有后缀是随机的。我们只能假设它在一轮
+    /// 迭代内不重复；按 session 找会跨 turn 撞名，取到别的 turn 的响应。
+    pub fn get_raw_json(&self, turn_id: &str, call_id: &str) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT i.raw_json FROM items i JOIN turns t ON t.id = i.turn_id
-             WHERE t.session_id = ?1 AND i.call_id = ?2
-               AND i.item_type = 'function_call_output'
-             ORDER BY t.seq DESC, i.idx DESC LIMIT 1",
+            "SELECT raw_json FROM items
+             WHERE turn_id = ?1 AND call_id = ?2 AND item_type = 'function_call_output'
+             ORDER BY idx DESC LIMIT 1",
         )?;
-        let mut rows = stmt.query(params![session_id, call_id])?;
+        let mut rows = stmt.query(params![turn_id, call_id])?;
         Ok(match rows.next()? {
             Some(r) => r.get(0)?,
             None => None,
         })
+    }
+
+    /// 这个会话实际花了多少 credit。
+    ///
+    /// **不能用 `count(*)` 代替**：实测失败的调用（Instagram 搜视频那个 404）
+    /// 返回 `credits_charged: 0`，按行数算会高估。
+    pub fn total_credits(&self, session_id: &str) -> Result<i64> {
+        let n: Option<i64> = self.conn.query_row(
+            "SELECT SUM(json_extract(i.payload_json,'$.credits_charged'))
+             FROM items i JOIN turns t ON t.id = i.turn_id
+             WHERE t.session_id = ?1 AND i.item_type = 'function_call_output'",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.unwrap_or(0))
     }
 
     pub fn list_turns(&self, session_id: &str) -> Result<Vec<Turn>> {
@@ -473,8 +500,10 @@ impl SqliteStore {
             "SELECT i.call_id FROM items i JOIN turns t ON t.id = i.turn_id
              WHERE t.session_id = ?1 AND i.item_type = 'function_call'
              AND NOT EXISTS (
-               SELECT 1 FROM items o JOIN turns t2 ON t2.id = o.turn_id
-               WHERE t2.session_id = ?1 AND o.item_type = 'function_call_output'
+               -- ★ 同一个 turn 内找配对，不能跨 turn：call_id 会重名，
+               --   跨 turn 匹配会让别的 turn 里的孤儿被掩盖
+               SELECT 1 FROM items o
+               WHERE o.turn_id = i.turn_id AND o.item_type = 'function_call_output'
                  AND o.call_id = i.call_id
              )
              ORDER BY t.seq, i.idx",
@@ -515,6 +544,60 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_output_item_records_the_endpoint_and_credits_in_its_payload() {
+        // 这两个不单独开列（只有需要 join/排序的才提升成列），
+        // 但必须在 payload 里 —— 否则「这次会话花了多少 credit」查不出来。
+        let it = Item::function_call_output_full(
+            1,
+            1,
+            "c1",
+            "内容",
+            false,
+            Some("{}".into()),
+            Some("/v1/youtube/search"),
+            Some(1),
+        );
+        assert_eq!(it.payload["endpoint"], "/v1/youtube/search");
+        assert_eq!(it.payload["credits_charged"], 1);
+    }
+
+    #[test]
+    fn credits_can_be_summed_with_one_query() {
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Done,
+            &[
+                Item::function_call_output_full(1, 1, "a", "x", false, None, Some("/e"), Some(1)),
+                Item::function_call_output_full(2, 1, "b", "x", true, None, None, Some(0)),
+                Item::function_call_output_full(3, 1, "c", "x", false, None, Some("/e"), Some(1)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            st.total_credits(&sid).unwrap(),
+            2,
+            "失败那次不扣费，不能按行数算"
+        );
+    }
+
+    #[test]
+    fn a_session_title_can_be_set_after_the_fact() {
+        // 建会话时还不知道标题（要等第一个问题）。
+        // 没标题的话 `clipknow sessions` 列出来全是「(无标题)」，认不出是哪次。
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.set_session_title(&sid, "帮我找几个做科普的博主")
+            .unwrap();
+
+        let s = st.list_sessions(10).unwrap();
+        assert_eq!(s[0].title.as_deref(), Some("帮我找几个做科普的博主"));
+    }
+
+    #[test]
     fn a_turn_and_its_items_survive_a_round_trip() {
         let mut st = mem();
         let sid = st.create_session(Some("找科普博主")).unwrap();
@@ -543,20 +626,21 @@ mod tests {
         let mut st = mem();
         let sid = st.create_session(None).unwrap();
         let huge = format!(r#"{{"junk":"{}"}}"#, "x".repeat(50_000));
-        st.save_turn(
-            &sid,
-            "m",
-            TurnStatus::Done,
-            &[out_item(1, 1, "c1", "精简后的文本", &huge)],
-        )
-        .unwrap();
+        let tid = st
+            .save_turn(
+                &sid,
+                "m",
+                TurnStatus::Done,
+                &[out_item(1, 1, "c1", "精简后的文本", &huge)],
+            )
+            .unwrap();
 
         let back = st.load_history(&sid).unwrap();
         assert_eq!(back[0].payload["content"], "精简后的文本");
         assert!(back[0].raw_json.is_none(), "重建历史时不该带 raw_json");
 
         // 但要能单独取出来 —— 这是它存在的全部理由
-        let raw = st.get_raw_json(&sid, "c1").unwrap();
+        let raw = st.get_raw_json(&tid, "c1").unwrap();
         assert!(raw.unwrap().len() > 50_000);
     }
 
@@ -592,6 +676,88 @@ mod tests {
         let turns = st.list_turns(&sid).unwrap();
         assert_eq!(turns.len(), 1);
         assert!(matches!(turns[0].status, TurnStatus::Failed(_)));
+    }
+
+    #[test]
+    fn a_repeated_call_id_across_turns_does_not_hide_an_orphan() {
+        // call_id 是模型生成的，实测 call_00_ 这个前缀每轮都从 0 重来。
+        // 我们**只能假设它在一轮迭代内不重复**，turn 之间、会话之间都不能假设。
+        // 按 session 匹配的话：第一个 turn 里配对好的同名 id，会把第二个 turn
+        // 里的孤儿藏起来 —— 自查函数漏报比不报还糟。
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Done,
+            &[
+                call_item(1, 1, "call_00_dup", "search_videos"),
+                out_item(2, 1, "call_00_dup", "ok", "{}"),
+            ],
+        )
+        .unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Failed("崩了".into()),
+            &[
+                call_item(1, 1, "call_00_dup", "get_creator"), // 同名，但这次是孤儿
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            st.unpaired_call_ids(&sid).unwrap(),
+            vec!["call_00_dup"],
+            "第二个 turn 的孤儿不该被第一个 turn 的配对掩盖"
+        );
+    }
+
+    #[test]
+    fn get_raw_json_is_scoped_to_the_turn_not_the_whole_session() {
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        let t1 = st
+            .save_turn(
+                &sid,
+                "m",
+                TurnStatus::Done,
+                &[out_item(
+                    1,
+                    1,
+                    "call_00_dup",
+                    "内容",
+                    r#"{"which":"第一个turn"}"#,
+                )],
+            )
+            .unwrap();
+        let t2 = st
+            .save_turn(
+                &sid,
+                "m",
+                TurnStatus::Done,
+                &[out_item(
+                    1,
+                    1,
+                    "call_00_dup",
+                    "内容",
+                    r#"{"which":"第二个turn"}"#,
+                )],
+            )
+            .unwrap();
+
+        assert!(
+            st.get_raw_json(&t1, "call_00_dup")
+                .unwrap()
+                .unwrap()
+                .contains("第一个")
+        );
+        assert!(
+            st.get_raw_json(&t2, "call_00_dup")
+                .unwrap()
+                .unwrap()
+                .contains("第二个")
+        );
     }
 
     #[test]

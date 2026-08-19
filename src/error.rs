@@ -29,6 +29,9 @@ pub enum ClipKnowError {
     #[error("网络错误: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("读写失败: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("JSON 解析失败: {0}")]
     Json(#[from] serde_json::Error),
 

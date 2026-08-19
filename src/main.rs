@@ -18,12 +18,16 @@
 //! 一次调用足够，加循环是绕路。等第二步做「找博主」这类需要边找边看的
 //! 需求时，循环才会真正需要。
 
+use std::io::{self, Write};
+
 use clap::{Parser, Subcommand};
 
-use clipknow::agent::llm::{ModelRequest, Msg, Provider, StopReason, build_client};
+use clipknow::agent::llm::{LlmClient, ModelRequest, Msg, Provider, StopReason, build_client};
+use clipknow::agent::runner::{LoopConfig, TurnOutcome, run_turn};
 use clipknow::content::evidence::{
     QUESTION_CLOSE, QUESTION_OPEN, SYSTEM_PROMPT, build_evidence, format_date, format_duration,
 };
+use clipknow::content::model::TurnStatus;
 use clipknow::error::{ClipKnowError, Result};
 use clipknow::ingest::scrapecreators::ScrapeCreators;
 use clipknow::ingest::url;
@@ -65,6 +69,19 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// 发现类需求：找博主、找素材。不给问题就进交互模式。
+    Find {
+        /// 你的问题。不给就进交互模式，可以连续追问
+        question: Option<String>,
+        /// 接着最近一次有活动的会话聊
+        #[arg(long)]
+        continue_: bool,
+    },
+    /// 列出历史会话
+    Sessions {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// 列出已抓过的视频
     List {
         #[arg(long, default_value_t = 20)]
@@ -102,6 +119,11 @@ fn run(cli: Cli) -> Result<()> {
             refresh,
         } => cmd_ask(&mut store, &url, &question, refresh, provider),
         Command::Show { url, raw } => cmd_show(&store, &url, raw),
+        Command::Find {
+            question,
+            continue_,
+        } => cmd_find(&mut store, question, continue_, provider),
+        Command::Sessions { limit } => cmd_sessions(&store, limit),
         Command::List { limit } => cmd_list(&store, limit),
     }
 }
@@ -172,7 +194,188 @@ fn cmd_ask(
         resp.input_tokens,
         resp.output_tokens,
         llm.pricing()
-            .cost_usd(resp.input_tokens, resp.output_tokens)
+            .cost_usd(resp.input_tokens, 0, resp.output_tokens)
+    );
+    Ok(())
+}
+
+/// `find`：发现类需求。给了问题就跑一次退出，不给就进交互模式。
+///
+/// 交互模式是因为这一版的核心场景本来就是多轮追问——「第三个那人多久发一条」
+/// 之类。每次敲 `--continue` 是别扭的，而且还得记住上次是哪个会话。
+fn cmd_find(
+    store: &mut SqliteStore,
+    question: Option<String>,
+    continue_: bool,
+    provider: Option<Provider>,
+) -> Result<()> {
+    let llm = build_client(provider)?;
+    let api = ScrapeCreators::from_env()?;
+    let cfg = LoopConfig::default();
+
+    let mut session_id = if continue_ {
+        match store.latest_session()? {
+            Some(s) => {
+                let n = store.load_history(&s.id)?.len();
+                println!(
+                    "· 接着聊：{}（{n} 条历史）",
+                    s.title.as_deref().unwrap_or("(无标题)")
+                );
+                s.id
+            }
+            None => {
+                println!("· 没有历史会话，开一个新的");
+                store.create_session(None)?
+            }
+        }
+    } else {
+        store.create_session(None)?
+    };
+
+    // 一次性模式
+    if let Some(q) = question {
+        return one_turn(store, &*llm, &api, &cfg, &session_id, &q).map(|_| ());
+    }
+
+    // 交互模式
+    println!(
+        "· {} · 输入问题回车；/new 开新会话，/quit 退出",
+        llm.model_name()
+    );
+    loop {
+        print!("\n> ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        // 读到 0 字节 = Ctrl-D
+        if io::stdin().read_line(&mut line)? == 0 {
+            println!();
+            return Ok(());
+        }
+        let q = line.trim();
+        match q {
+            "" => continue,
+            "/quit" | "/exit" => return Ok(()),
+            "/new" => {
+                session_id = store.create_session(None)?;
+                println!("· 已开新会话（上一个已存好，`--continue` 能回去）");
+                continue;
+            }
+            _ => {}
+        }
+        // 单次提问失败不该把你踢出交互
+        if let Err(e) = one_turn(store, &*llm, &api, &cfg, &session_id, q) {
+            eprintln!("错误: {e}");
+        }
+    }
+}
+
+/// 跑一次提问：读历史 → 循环 → 落库 → 打印。
+fn one_turn(
+    store: &mut SqliteStore,
+    llm: &dyn LlmClient,
+    api: &ScrapeCreators,
+    cfg: &LoopConfig,
+    session_id: &str,
+    question: &str,
+) -> Result<()> {
+    let history = store.load_history(session_id)?;
+    let res = run_turn(llm, api, store, &history, question, cfg);
+
+    let status = match &res.outcome {
+        TurnOutcome::Done => TurnStatus::Done,
+        TurnOutcome::IterationCap => TurnStatus::Failed("超过迭代上限".into()),
+        TurnOutcome::ContextBudget { .. } => TurnStatus::Failed("上下文预算不足".into()),
+        TurnOutcome::ModelError(e) => TurnStatus::Failed(format!("模型调用失败: {e}")),
+    };
+
+    // 上下文闸门是在发请求之前拦下的，这一轮什么都没发生，不必落库
+    if !matches!(res.outcome, TurnOutcome::ContextBudget { .. }) {
+        store.save_turn(session_id, llm.model_name(), status, &res.items)?;
+        // 第一次提问顺手拿它当标题，`clipknow sessions` 才认得出是哪次
+        if history.is_empty() {
+            store.set_session_title(session_id, &truncate_chars(question, 40))?;
+        }
+    }
+
+    match res.outcome {
+        TurnOutcome::Done => println!("\n{}", res.answer),
+        TurnOutcome::IterationCap => println!(
+            "\n(跑了 {} 轮还没收敛，已停下。已经查到的都在库里，可以换个更具体的问法)",
+            res.iterations
+        ),
+        TurnOutcome::ContextBudget { used, limit } => {
+            println!(
+                "\n⚠ 这个会话的历史太长了（约 {used} token，上限 {limit}）。\n\
+                 \x20 继续问会被模型拒掉。输入 /new 开新会话（当前会话已存好，\
+                 随时 `--continue` 回来），或用 `clipknow ask <链接> \"...\"` 问单个视频。"
+            );
+            return Ok(());
+        }
+        TurnOutcome::ModelError(ref e) => println!("\n模型调用失败: {e}"),
+    }
+
+    // 快满时提前提醒，别等撞墙
+    let used = est_history_tokens(store, session_id)?;
+    if used * 10 > cfg.context_budget_tokens * 9 {
+        eprintln!(
+            "\n(提示：会话历史已用约 {used} / {} token，接近上限，建议 /new 开新会话)",
+            cfg.context_budget_tokens
+        );
+    }
+
+    eprintln!(
+        "\n— {} 轮 · {} 次工具调用（扣 {} credit）· 输入 {}（其中 {} 命中缓存）/ 输出 {} token · 约 ${:.4}",
+        res.iterations,
+        res.tool_calls_made,
+        res.credits_charged,
+        res.input_tokens,
+        res.cached_input_tokens,
+        res.output_tokens,
+        llm.pricing()
+            .cost_usd(res.input_tokens, res.cached_input_tokens, res.output_tokens)
+    );
+    Ok(())
+}
+
+fn est_history_tokens(store: &SqliteStore, session_id: &str) -> Result<usize> {
+    Ok(store
+        .load_history(session_id)?
+        .iter()
+        .map(|i| i.payload.to_string().chars().count() * 10 / 19)
+        .sum())
+}
+
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn cmd_sessions(store: &SqliteStore, limit: usize) -> Result<()> {
+    let ss = store.list_sessions(limit)?;
+    if ss.is_empty() {
+        println!("还没有会话。跑一次 `clipknow find` 开始。");
+        return Ok(());
+    }
+    for s in &ss {
+        let turns = store.list_turns(&s.id)?;
+        let failed = turns
+            .iter()
+            .filter(|t| !matches!(t.status, TurnStatus::Done))
+            .count();
+        println!(
+            "{}  {:<40} {} 次提问{}",
+            format_date(s.created_at),
+            truncate_chars(s.title.as_deref().unwrap_or("(无标题)"), 40),
+            turns.len(),
+            if failed > 0 {
+                format!("（{failed} 次失败）")
+            } else {
+                String::new()
+            }
+        );
+    }
+    println!(
+        "\n共 {} 个会话。`clipknow find --continue` 接着最近一个聊。",
+        ss.len()
     );
     Ok(())
 }

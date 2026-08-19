@@ -7,4 +7,5 @@
 
 pub mod context;
 pub mod llm;
+pub mod runner;
 pub mod tools;

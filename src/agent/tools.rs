@@ -11,12 +11,14 @@
 use serde_json::json;
 
 use crate::agent::llm::{ToolCall, ToolDef, ToolResult};
-use crate::content::evidence::{format_date, neutralize};
+use crate::content::evidence::{build_evidence_with_limit, format_date, neutralize};
 use crate::content::model::{Creator, VideoSummary};
 use crate::ingest::discovery::{
     DiscoveryApi, Endpoint, parse_creator, parse_search_creators, parse_search_videos,
 };
 use crate::ingest::url::Platform;
+use crate::store::Store;
+use crate::store::sqlite::SqliteStore;
 
 /// 三家平台的枚举值。给模型的字符串,和 `Platform::as_str()` 对齐。
 const ALL_PLATFORMS: [&str; 3] = ["youtube", "tiktok", "instagram"];
@@ -202,6 +204,9 @@ pub struct ToolOutcome {
     pub result: ToolResult,
     pub endpoint: Option<String>,
     pub raw_json: Option<String>,
+    /// SC 实际扣的 credit。**不能用调用次数代替**——实测失败的调用
+    /// （比如 Instagram 搜视频那个 404）返回 `credits_charged: 0`，不扣费。
+    pub credits_charged: Option<i64>,
 }
 
 impl ToolOutcome {
@@ -216,6 +221,8 @@ impl ToolOutcome {
             },
             endpoint: None,
             raw_json: None,
+            // 在打网络之前拒掉的，明确是 0 而不是「不知道」
+            credits_charged: Some(0),
         }
     }
 }
@@ -250,15 +257,23 @@ fn need_platform(
 /// **永远返回 ToolOutcome，永远不返回 Err。** 任何失败——工具名不认识、
 /// 参数不对、平台不支持、SC 挂了——都变成 `is_error: true` 的结果回传给模型，
 /// 让它自己决定绕路。这是 tool 配对不变量在这一层的体现。
-pub fn execute(api: &dyn DiscoveryApi, call: &ToolCall) -> ToolOutcome {
+/// 循环里给模型的文字稿长度上限。
+///
+/// ⚠️ 原来是 6000 字，理由是「一条 2 万 token 吃掉 DeepSeek 三分之一上下文」——
+/// 那个前提（64K 窗口）是错的，实测是 1M。所以放宽到和第一版 `ask` 一致。
+///
+/// 仍然设上限而不是无限，是因为**成本**：历史每轮重发，一条超长文字稿会被
+/// 重复计费多次。DeepSeek 自动缓存能吃掉大部分（实测命中率 97%），
+/// 但第一次进上下文那次是全价。
+pub const LOOP_TRANSCRIPT_LIMIT_CHARS: usize = 40_000;
+
+pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall) -> ToolOutcome {
     let (ep, allowed) = match call.name.as_str() {
         "search_videos" => (Endpoint::SearchVideos, &SEARCHABLE_PLATFORMS[..]),
         "search_creators" => (Endpoint::SearchCreators, &ALL_PLATFORMS[..]),
         "get_creator" => (Endpoint::GetCreator, &ALL_PLATFORMS[..]),
         "get_creator_videos" => (Endpoint::GetCreatorVideos, &ALL_PLATFORMS[..]),
-        "fetch_video" => {
-            return ToolOutcome::err(&call.id, "fetch_video 还没接上，先用其它工具");
-        }
+        "fetch_video" => return fetch_video(api, store, call),
         other => {
             return ToolOutcome::err(
                 &call.id,
@@ -313,8 +328,67 @@ pub fn execute(api: &dyn DiscoveryApi, call: &ToolCall) -> ToolOutcome {
             content,
             is_error: false,
         },
+        credits_charged: raw
+            .body
+            .get("credits_charged")
+            .and_then(serde_json::Value::as_i64),
         endpoint: Some(raw.endpoint),
         raw_json: Some(raw.body.to_string()),
+    }
+}
+
+/// 抓一条视频的完整内容。接的是第一版那条链路。
+///
+/// 和四个发现类工具的两点不同：
+///   1. **走缓存**。同一条抓过就不重抓——模型在一次会话里对同一条视频调两次
+///      很常见（先搜到、后深挖），第二次不该花钱。
+///   2. **立刻落库**，不等终态。视频资料是独立的资料库、不是会话状态，
+///      循环跑一半崩了，已抓到的留着是纯赚，也不破坏任何不变量。
+fn fetch_video(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall) -> ToolOutcome {
+    let url = match need_str(&call.args, "url") {
+        Ok(u) => u,
+        Err(e) => return ToolOutcome::err(&call.id, e),
+    };
+    // 认不出的链接在打网络之前就拒掉
+    let parsed = match crate::ingest::url::parse(&url) {
+        Ok(p) => p,
+        Err(e) => return ToolOutcome::err(&call.id, format!("这个链接用不了：{e}")),
+    };
+
+    let cached = store.find_by_native(parsed.platform, &parsed.native_id);
+    let sv = match cached {
+        Ok(Some(sv)) => sv,
+        Ok(None) => match api.fetch_video(&parsed, &url) {
+            Ok(fetched) => {
+                if let Err(e) = store.save(&fetched) {
+                    return ToolOutcome::err(&call.id, format!("抓到了但写库失败：{e}"));
+                }
+                match store.find_by_native(parsed.platform, &parsed.native_id) {
+                    Ok(Some(sv)) => sv,
+                    _ => return ToolOutcome::err(&call.id, "刚写进去却读不出来"),
+                }
+            }
+            Err(e) => return ToolOutcome::err(&call.id, format!("抓取失败：{e}")),
+        },
+        Err(e) => return ToolOutcome::err(&call.id, format!("查库失败：{e}")),
+    };
+
+    ToolOutcome {
+        result: ToolResult {
+            call_id: call.id.clone(),
+            // build_evidence 自带 <video-material> 包裹和标签中和，
+            // 而且每一段都有 [状态：...] 显式标注——截断/没有文字稿都明说，
+            // 不让模型靠「没看见标记」反推。
+            content: build_evidence_with_limit(&sv, LOOP_TRANSCRIPT_LIMIT_CHARS),
+            is_error: false,
+        },
+        endpoint: Some("fetch_video".into()),
+        // 第一版那条链路打三个端点，扣费数在 artifacts 表里；
+        // 命中缓存时是 0。这里不重复统计，留 None 表示「不在这张表里算」。
+        credits_charged: None,
+        // 原始响应已经在 artifacts 表里（挂在 video_id 上，跨会话长期有效），
+        // 不用在 items 里再存一份。
+        raw_json: None,
     }
 }
 
@@ -598,6 +672,9 @@ mod tests {
                 body,
             })
         }
+        fn fetch_video(&self, _: &ParsedUrl, _: &str) -> Result<FetchedVideo> {
+            panic!("这些用例不该走到 fetch_video")
+        }
     }
 
     fn call(name: &str, args: serde_json::Value) -> ToolCall {
@@ -613,6 +690,7 @@ mod tests {
         let api = FakeApi::default();
         let out = execute(
             &api,
+            &mut store(),
             &call(
                 "search_videos",
                 json!({"platform":"youtube","query":"科普"}),
@@ -630,7 +708,11 @@ mod tests {
     fn unknown_tool_name_returns_an_error_result_not_a_panic() {
         // 模型偶尔会编工具名。要让它看到错误自己改，而不是崩掉整个循环。
         let api = FakeApi::default();
-        let out = execute(&api, &call("search_the_web", json!({"q":"x"})));
+        let out = execute(
+            &api,
+            &mut store(),
+            &call("search_the_web", json!({"q":"x"})),
+        );
 
         assert!(out.result.is_error);
         assert!(out.result.content.contains("search_the_web"));
@@ -640,7 +722,11 @@ mod tests {
     #[test]
     fn missing_required_arg_tells_the_model_which_one() {
         let api = FakeApi::default();
-        let out = execute(&api, &call("search_videos", json!({"platform":"youtube"})));
+        let out = execute(
+            &api,
+            &mut store(),
+            &call("search_videos", json!({"platform":"youtube"})),
+        );
 
         assert!(out.result.is_error);
         assert!(
@@ -658,6 +744,7 @@ mod tests {
         let api = FakeApi::default();
         let out = execute(
             &api,
+            &mut store(),
             &call(
                 "search_videos",
                 json!({"platform":"instagram","query":"科普"}),
@@ -683,6 +770,7 @@ mod tests {
         };
         let out = execute(
             &api,
+            &mut store(),
             &call("get_creator", json!({"platform":"tiktok","handle":"x"})),
         );
 
@@ -697,6 +785,7 @@ mod tests {
         let api = FakeApi::default();
         execute(
             &api,
+            &mut store(),
             &call(
                 "get_creator",
                 json!({"platform":"youtube","handle":"@yykp"}),
@@ -710,6 +799,7 @@ mod tests {
         let api = FakeApi::default();
         let out = execute(
             &api,
+            &mut store(),
             &call("search_videos", json!({"platform":"youtube","query":123})),
         );
         assert!(
@@ -773,5 +863,228 @@ mod tests {
         let out = render_videos(&[v]);
         assert!(out.contains("标题"));
         assert!(out.contains("另外一段简介"), "不一样时简介要给: {out}");
+    }
+
+    // -----------------------------------------------------------------
+    // fetch_video：接第一版那条抓取链路
+    // -----------------------------------------------------------------
+
+    use crate::content::model::{
+        Artifact, ArtifactKind, FetchedVideo, Transcript, Video, new_id, now_ts,
+    };
+    use crate::ingest::url::ParsedUrl;
+
+    const YT_URL: &str = "https://www.youtube.com/watch?v=rCJX4pPz1_A";
+
+    /// 假 SC：记录抓了几次，返回一条带文字稿的视频。
+    #[derive(Default)]
+    struct FakeVideoApi {
+        fetches: RefCell<usize>,
+        transcript: Option<String>,
+        fail: bool,
+    }
+
+    impl DiscoveryApi for FakeVideoApi {
+        fn call(&self, _: Endpoint, p: Platform, _: &str) -> Result<RawResponse> {
+            Ok(RawResponse {
+                endpoint: format!("/x/{}", p.as_str()),
+                body: serde_json::json!({}),
+            })
+        }
+        fn fetch_video(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo> {
+            *self.fetches.borrow_mut() += 1;
+            if self.fail {
+                return Err(ClipKnowError::Fetch {
+                    platform: parsed.platform.as_str().into(),
+                    message: "SC 返回 503".into(),
+                });
+            }
+            let vid = new_id();
+            Ok(FetchedVideo {
+                video: Video {
+                    id: vid.clone(),
+                    platform: parsed.platform,
+                    native_id: parsed.native_id.clone(),
+                    url: raw_url.into(),
+                    title: Some("人類不能吃生肉的真正原因".into()),
+                    author_handle: Some("laogao".into()),
+                    author_name: Some("老高與小茉".into()),
+                    duration_sec: Some(1528),
+                    published_at: Some(1_729_081_628),
+                    view_count: Some(4_780_866),
+                    like_count: Some(59_762),
+                    comment_count: Some(3_100),
+                    description: Some("這期我們聊聊生肉".into()),
+                    fetched_at: now_ts(),
+                },
+                transcript: self.transcript.as_ref().map(|t| Transcript {
+                    video_id: vid.clone(),
+                    text: t.clone(),
+                    source: "sc".into(),
+                    lang: None,
+                    fetched_at: now_ts(),
+                }),
+                comments: vec![],
+                // 三份 artifact 都要有：store.save() 里有个保护——
+                // 没有 Transcript artifact 记录就不写 transcripts 表，
+                // 免得一次失败的抓取把上次抓到的文字稿冲掉。
+                // 真实抓取一定会产出这三份，假数据也得照着来。
+                artifacts: vec![
+                    Artifact::ok(ArtifactKind::Detail, "{}".into()),
+                    match &self.transcript {
+                        Some(_) => Artifact::ok(ArtifactKind::Transcript, "{}".into()),
+                        None => Artifact::unavailable(ArtifactKind::Transcript, "{}".into()),
+                    },
+                    Artifact::ok(ArtifactKind::Comments, "{}".into()),
+                ],
+            })
+        }
+    }
+
+    fn store() -> SqliteStore {
+        SqliteStore::in_memory().unwrap()
+    }
+
+    #[test]
+    fn fetch_video_returns_the_transcript_to_the_model() {
+        let api = FakeVideoApi {
+            transcript: Some("大家好，今天聊聊生肉的寄生虫问题".into()),
+            ..Default::default()
+        };
+        let mut st = store();
+        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+
+        assert!(!out.result.is_error, "实际: {}", out.result.content);
+        assert!(out.result.content.contains("寄生虫"), "文字稿要给模型");
+        assert!(out.result.content.contains("人類不能吃生肉"), "标题也要");
+    }
+
+    #[test]
+    fn fetch_video_writes_to_the_video_tables_immediately() {
+        // 和会话历史不同：视频资料是独立的资料库，可以立刻写。
+        // 循环跑一半崩了，已抓到的留着是纯赚。
+        let api = FakeVideoApi {
+            transcript: Some("内容".into()),
+            ..Default::default()
+        };
+        let mut st = store();
+        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+
+        assert_eq!(st.list_videos(10).unwrap().len(), 1, "该落库");
+    }
+
+    #[test]
+    fn fetching_the_same_video_twice_hits_the_cache_and_costs_nothing() {
+        let api = FakeVideoApi {
+            transcript: Some("内容".into()),
+            ..Default::default()
+        };
+        let mut st = store();
+        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+
+        assert_eq!(*api.fetches.borrow(), 1, "第二次该命中缓存，不再打 SC");
+    }
+
+    #[test]
+    fn an_over_long_transcript_is_truncated_and_says_so() {
+        // 第一版 ask 的阈值是 4 万字（一次性问答，全给模型）。
+        // 循环里一条 4 万字 ≈ 2 万 token，吃掉三分之一上下文，而且每轮重发。
+        let api = FakeVideoApi {
+            transcript: Some("啊".repeat(80_000)),
+            ..Default::default()
+        };
+        let mut st = store();
+        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+
+        let n = out.result.content.chars().count();
+        // 仍然设上限，但理由从「怕撑爆上下文」变成「控成本」：
+        // 窗口实测 1M，撑不爆；但历史每轮重发，超长文字稿会被重复计费。
+        assert!(
+            n > LOOP_TRANSCRIPT_LIMIT_CHARS && n < 60_000,
+            "该截到上限附近，实际 {n} 字符"
+        );
+        assert!(
+            out.result.content.contains("截断"),
+            "截断了要明说，不能让模型以为是完整的"
+        );
+    }
+
+    #[test]
+    fn a_video_without_a_transcript_says_so_explicitly() {
+        // 能明说的状态别让模型猜 —— 第一版那次幻觉的教训
+        let api = FakeVideoApi::default();
+        let mut st = store();
+        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        assert!(
+            out.result.content.contains("没有文字稿"),
+            "实际: {}",
+            out.result.content
+        );
+    }
+
+    #[test]
+    fn an_unparseable_url_is_rejected_before_touching_the_network() {
+        let api = FakeVideoApi::default();
+        let mut st = store();
+        let out = execute(
+            &api,
+            &mut st,
+            &call("fetch_video", json!({"url": "https://example.com/x"})),
+        );
+
+        assert!(out.result.is_error);
+        assert_eq!(*api.fetches.borrow(), 0, "不认识的链接不该白花一次调用");
+    }
+
+    #[test]
+    fn a_fetch_failure_comes_back_as_an_error_result_not_a_panic() {
+        let api = FakeVideoApi {
+            fail: true,
+            ..Default::default()
+        };
+        let mut st = store();
+        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+
+        assert!(out.result.is_error);
+        assert_eq!(out.result.call_id, "call_0", "失败也必须配对");
+        assert!(out.result.content.contains("503"));
+    }
+
+    #[test]
+    fn tool_outcome_carries_the_credits_sc_actually_charged() {
+        // 数行数算成本是错的：实测 Instagram 那个 404 返回 credits_charged: 0，
+        // 失败不扣费。SC 每次响应都带这个字段，取出来统计才准。
+        struct Charging;
+        impl DiscoveryApi for Charging {
+            fn call(&self, _: Endpoint, _: Platform, _: &str) -> Result<RawResponse> {
+                Ok(RawResponse {
+                    endpoint: "/v1/youtube/search".into(),
+                    body: json!({"success": true, "credits_charged": 1, "videos": []}),
+                })
+            }
+            fn fetch_video(&self, _: &ParsedUrl, _: &str) -> Result<FetchedVideo> {
+                unreachable!()
+            }
+        }
+        let out = execute(
+            &Charging,
+            &mut store(),
+            &call("search_videos", json!({"platform":"youtube","query":"x"})),
+        );
+        assert_eq!(out.credits_charged, Some(1));
+    }
+
+    #[test]
+    fn a_rejected_call_reports_zero_credits_not_unknown() {
+        // 在打网络之前拒掉的，明确是 0 —— None 会让统计把它当「不知道」
+        let api = FakeVideoApi::default();
+        let out = execute(
+            &api,
+            &mut store(),
+            &call("search_videos", json!({"platform":"instagram","query":"x"})),
+        );
+        assert!(out.result.is_error);
+        assert_eq!(out.credits_charged, Some(0));
     }
 }

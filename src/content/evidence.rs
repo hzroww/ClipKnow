@@ -51,6 +51,15 @@ pub const QUESTION_CLOSE: &str = "</user-question>";
 /// 所有平台来的文本都会先过 `neutralize()`，防止内容里自己写一个
 /// `</video-material>` 把自己「放出去」，伪装成系统指令。
 pub fn build_evidence(sv: &StoredVideo) -> String {
+    build_evidence_with_limit(sv, TRANSCRIPT_LIMIT_CHARS)
+}
+
+/// 同上，但可以指定文字稿截断长度。
+///
+/// 第一版 `ask` 用 4 万字——一次性问答，材料全给模型没问题。
+/// 但循环里不行：一条 4 万字 ≈ 2 万 token，吃掉三分之一上下文，
+/// **而且每一轮都要原样重发**。所以循环里用小得多的阈值。
+pub fn build_evidence_with_limit(sv: &StoredVideo, transcript_limit: usize) -> String {
     let mut out = String::new();
     out.push_str(MATERIAL_OPEN);
     out.push('\n');
@@ -70,13 +79,13 @@ pub fn build_evidence(sv: &StoredVideo) -> String {
         Some(t) if !t.text.trim().is_empty() => {
             let text = neutralize(&t.text);
             let chars: Vec<char> = text.chars().collect();
-            if chars.len() > TRANSCRIPT_LIMIT_CHARS {
+            if chars.len() > transcript_limit {
                 out.push_str(&format!(
                     "[状态：已截断 —— 原文共 {} 字，以下只给出前 {} 字]\n",
                     chars.len(),
-                    TRANSCRIPT_LIMIT_CHARS
+                    transcript_limit
                 ));
-                let head: String = chars[..TRANSCRIPT_LIMIT_CHARS].iter().collect();
+                let head: String = chars[..transcript_limit].iter().collect();
                 out.push_str(&head);
                 out.push('\n');
             } else {

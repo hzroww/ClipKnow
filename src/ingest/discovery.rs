@@ -14,10 +14,11 @@
 
 use serde_json::Value;
 
+use crate::content::model::FetchedVideo;
 use crate::content::model::{Creator, VideoSummary, parse_iso8601};
 use crate::error::Result;
 use crate::ingest::scrapecreators::{dig, first_present, pick_f64, pick_i64, pick_str, truncate};
-use crate::ingest::url::Platform;
+use crate::ingest::url::{ParsedUrl, Platform};
 
 /// 简介截断长度。它是判断「这人是不是真做这个」的关键信息之一，
 /// 截太狠会误判；不截则一次搜索能到 6000+ token。这个数字要跑通后再调。
@@ -226,6 +227,10 @@ fn first_number(s: &str) -> Option<i64> {
 /// 这和第一版把 `LlmClient` 切成 trait 是同一个理由。
 pub trait DiscoveryApi {
     fn call(&self, ep: Endpoint, p: Platform, arg: &str) -> Result<RawResponse>;
+
+    /// 抓一条视频的完整内容。走的是第一版那条链路（三个端点 + 转录失败重试），
+    /// 和上面四个发现类端点不是一回事，所以单独一个方法。
+    fn fetch_video(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +320,10 @@ pub fn route(ep: Endpoint, p: Platform, arg: &str) -> Option<Route> {
 }
 
 impl DiscoveryApi for crate::ingest::scrapecreators::ScrapeCreators {
+    fn fetch_video(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo> {
+        self.fetch(parsed, raw_url)
+    }
+
     fn call(&self, ep: Endpoint, p: Platform, arg: &str) -> Result<RawResponse> {
         let Some(rt) = route(ep, p, arg) else {
             return Err(crate::error::ClipKnowError::Fetch {

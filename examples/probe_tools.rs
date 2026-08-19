@@ -4,11 +4,13 @@
 use clipknow::agent::llm::ToolCall;
 use clipknow::agent::tools::execute;
 use clipknow::ingest::scrapecreators::ScrapeCreators;
+use clipknow::store::sqlite::SqliteStore;
 use serde_json::json;
 
 fn main() {
     let _ = dotenvy::dotenv();
     let api = ScrapeCreators::from_env().expect("需要 SCRAPECREATORS_API_KEY");
+    let mut store = SqliteStore::in_memory().unwrap();
 
     let cases = [
         (
@@ -33,6 +35,19 @@ fn main() {
             "search_videos",
             json!({"platform":"instagram","query":"科普"}),
         ),
+        // fetch_video：第一次抓，第二次应命中缓存（不再花 credit）
+        (
+            "fetch_video",
+            json!({"url":"https://www.youtube.com/watch?v=UZvJzKNJ3dY"}),
+        ),
+        (
+            "fetch_video",
+            json!({"url":"https://www.youtube.com/watch?v=UZvJzKNJ3dY"}),
+        ),
+        (
+            "fetch_video",
+            json!({"url":"https://example.com/not-a-video"}),
+        ),
     ];
 
     for (name, args) in cases {
@@ -41,7 +56,7 @@ fn main() {
             name: name.into(),
             args: args.clone(),
         };
-        let out = execute(&api, &call);
+        let out = execute(&api, &mut store, &call);
         println!("═══ {name} {args}");
         println!(
             "    is_error={}  endpoint={:?}  原始 {} 字节",

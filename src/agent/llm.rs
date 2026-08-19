@@ -618,6 +618,23 @@ fn parse_openai_response(body: &Value) -> Result<ModelResponse> {
                     "工具 {name} 的参数不是合法 JSON: {e}（原文: {raw_args}）"
                 ))
             })?;
+            // ★ call_id 是配对键，这里必须拦。
+            //   空了或重了，下游没法补救——每个 tool_result 都贴不回去，
+            //   而且是静默破掉：unpaired 检查会看到两个空串在互相配对。
+            //
+            //   注意只校验 call_id。工具名不认识、参数类型不对这些**刻意不管**，
+            //   execute() 会返回 is_error 结果让模型自己改；在这里报错会把
+            //   可恢复的错误升级成「整个 turn 失败」。
+            if id.is_empty() {
+                return Err(ClipKnowError::Llm(format!(
+                    "工具 {name} 的 call_id 是空的。它是配对键，空了结果就贴不回去"
+                )));
+            }
+            if tool_calls.iter().any(|c: &ToolCall| c.id == id) {
+                return Err(ClipKnowError::Llm(format!(
+                    "同一轮里出现重复的 call_id `{id}`，无法判断哪个结果对应哪个请求"
+                )));
+            }
             tool_calls.push(ToolCall {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -1317,5 +1334,73 @@ mod tests {
         assert_eq!(Provider::parse("claude"), Some(Provider::Anthropic));
         assert_eq!(Provider::parse("anthropic"), Some(Provider::Anthropic));
         assert_eq!(Provider::parse("gpt"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // call_id 的协议校验
+    //
+    // 只校验 call_id，不校验工具名/参数类型/type 字段——那几样
+    // execute() 已经会返回 is_error 结果让模型自己改。挪到这里会把
+    // 「可恢复」变成「整个 turn 失败」，是反着改。
+    // call_id 不一样：它是配对键，空了或重了下游没法补救。
+    // -----------------------------------------------------------------
+
+    fn call_with_ids(ids: &[&str]) -> Value {
+        json!({
+            "choices": [{
+                "message": {"content": "", "tool_calls": ids.iter().map(|id| json!({
+                    "id": id, "type": "function",
+                    "function": {"name": "search_videos", "arguments": "{}"}
+                })).collect::<Vec<_>>()},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })
+    }
+
+    #[test]
+    fn an_empty_call_id_is_rejected() {
+        // 配对全靠这个字符串。空了的话每个 tool_result 都贴不回去，
+        // 而且是**静默**破掉——unpaired 检查看到的是两个空串在配对。
+        let err = parse_openai_response(&call_with_ids(&[""])).unwrap_err();
+        assert!(format!("{err}").contains("call_id"), "实际: {err}");
+    }
+
+    #[test]
+    fn duplicate_call_ids_in_one_response_are_rejected() {
+        // 同一轮里两个一样的 id：模型自己也没法区分哪个结果对应哪张单。
+        // 属于 provider bug，但要炸得明确，不能让它悄悄产生两条同名记录。
+        let err = parse_openai_response(&call_with_ids(&["call_00_x", "call_00_x"])).unwrap_err();
+        assert!(format!("{err}").contains("重复"), "实际: {err}");
+    }
+
+    #[test]
+    fn distinct_call_ids_pass() {
+        let r = parse_openai_response(&call_with_ids(&["call_00_a", "call_01_b"])).unwrap();
+        assert_eq!(r.tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn the_same_call_id_in_different_responses_is_fine() {
+        // 实测 call_00_ 这个前缀每轮都从 0 重来。跨响应重名是正常的，
+        // 只有**同一个响应内**重复才是问题。
+        assert!(parse_openai_response(&call_with_ids(&["call_00_x"])).is_ok());
+        assert!(parse_openai_response(&call_with_ids(&["call_00_x"])).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_tool_name_is_left_to_the_tool_layer() {
+        // **刻意不在这里拦。** execute() 会返回一个列出可用工具的
+        // is_error 结果，模型自己改。在这里报错会让整个 turn 失败，
+        // 丢掉前面几轮的工作——把可恢复的错误升级成致命的。
+        let body = json!({
+            "choices": [{"message": {"content": "", "tool_calls": [{
+                "id": "call_00_x", "type": "function",
+                "function": {"name": "search_the_web", "arguments": "{}"}
+            }]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let r = parse_openai_response(&body).unwrap();
+        assert_eq!(r.tool_calls[0].name, "search_the_web");
     }
 }

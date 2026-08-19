@@ -18,14 +18,15 @@
 //! 一次调用足够，加循环是绕路。等第二步做「找博主」这类需要边找边看的
 //! 需求时，循环才会真正需要。
 
-use std::io::{self, Write};
-
 use clap::{Parser, Subcommand};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 use clipknow::agent::llm::{LlmClient, ModelRequest, Msg, Provider, StopReason, build_client};
-use clipknow::agent::runner::{LoopConfig, TurnOutcome, run_turn};
+use clipknow::agent::runner::{LoopConfig, TurnOutcome, echo_received, run_turn};
 use clipknow::content::evidence::{
-    QUESTION_CLOSE, QUESTION_OPEN, SYSTEM_PROMPT, build_evidence, format_date, format_duration,
+    QUESTION_CLOSE, QUESTION_OPEN, SINGLE_VIDEO_SYSTEM_PROMPT, build_evidence, format_date,
+    format_duration,
 };
 use clipknow::content::model::TurnStatus;
 use clipknow::error::{ClipKnowError, Result};
@@ -177,7 +178,7 @@ fn cmd_ask(
     println!("· 正在问 {} ...\n", llm.model_name());
 
     let resp = llm.complete(&ModelRequest {
-        system: SYSTEM_PROMPT.to_string(),
+        system: SINGLE_VIDEO_SYSTEM_PROMPT.to_string(),
         messages: vec![Msg::user(prompt)],
         max_tokens: llm.max_tokens_limit(),
         tools: vec![],
@@ -234,23 +235,32 @@ fn cmd_find(
 
     // 一次性模式
     if let Some(q) = question {
+        println!("{}", echo_received(&q));
         return one_turn(store, &*llm, &api, &cfg, &session_id, &q).map(|_| ());
     }
 
-    // 交互模式
+    // 交互模式。
+    //
+    // 用 rustyline 而不是裸 `read_line`：后者会把终端发来的**一切**当成人打的字。
+    // 实跑撞过一次——终端的转义序列应答（背景色查询、光标位置报告）进了 stdin，
+    // 一整轮被当成提问发给了模型；同一次会话里还丢了四个字，导致模型接着上一轮
+    // 的话题答错了方向，白花 25 次工具调用。
+    // rustyline 在 raw 模式下自己解析转义序列，不认识的直接丢掉。
+    // 顺带白得方向键调历史、Ctrl-C 只清当前行而不是杀进程。
     println!(
-        "· {} · 输入问题回车；/new 开新会话，/quit 退出",
+        "· {} · 输入问题回车；↑ 调历史；/new 开新会话，/quit 退出",
         llm.model_name()
     );
+    let mut rl =
+        DefaultEditor::new().map_err(|e| ClipKnowError::Llm(format!("初始化输入失败: {e}")))?;
     loop {
-        print!("\n> ");
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        // 读到 0 字节 = Ctrl-D
-        if io::stdin().read_line(&mut line)? == 0 {
-            println!();
-            return Ok(());
-        }
+        let line = match rl.readline("\n> ") {
+            Ok(l) => l,
+            // Ctrl-C：只放弃当前这行，不退出
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => return Ok(()),
+            Err(e) => return Err(ClipKnowError::Llm(format!("读输入失败: {e}"))),
+        };
         let q = line.trim();
         match q {
             "" => continue,
@@ -262,6 +272,10 @@ fn cmd_find(
             }
             _ => {}
         }
+        let _ = rl.add_history_entry(q);
+        // ★ 回显收到的问题。终端可能吞字（见 echo_received 的注释），
+        //   在发请求、花钱之前先让你看见程序实际拿到了什么。
+        println!("{}", echo_received(q));
         // 单次提问失败不该把你踢出交互
         if let Err(e) = one_turn(store, &*llm, &api, &cfg, &session_id, q) {
             eprintln!("错误: {e}");
@@ -284,6 +298,9 @@ fn one_turn(
     let status = match &res.outcome {
         TurnOutcome::Done => TurnStatus::Done,
         TurnOutcome::IterationCap => TurnStatus::Failed("超过迭代上限".into()),
+        // 残缺的答案不能标成成功：下次 --continue 时历史里会带着半句话
+        TurnOutcome::Truncated => TurnStatus::Failed("回答被长度上限截断".into()),
+        TurnOutcome::ProtocolError(e) => TurnStatus::Failed(format!("协议异常: {e}")),
         TurnOutcome::ContextBudget { .. } => TurnStatus::Failed("上下文预算不足".into()),
         TurnOutcome::ModelError(e) => TurnStatus::Failed(format!("模型调用失败: {e}")),
     };
@@ -311,6 +328,19 @@ fn one_turn(
             );
             return Ok(());
         }
+        TurnOutcome::Truncated => println!(
+            "\n{}\n\n⚠ 回答达到长度上限被截断了，上面这段是残缺的。\n\
+             \x20 这个 turn 已标记为失败，`--continue` 不会带上它。换个更聚焦的问法再试。",
+            res.answer
+        ),
+        TurnOutcome::ProtocolError(ref e) => println!(
+            "\n模型返回了没见过的结束原因: {e}\n（已拿到的内容：{}）",
+            if res.answer.is_empty() {
+                "无"
+            } else {
+                &res.answer
+            }
+        ),
         TurnOutcome::ModelError(ref e) => println!("\n模型调用失败: {e}"),
     }
 

@@ -22,11 +22,18 @@ ANTHROPIC_API_KEY=...        # 可选，https://console.anthropic.com/settings/k
 
 > Claude Code 的登录态不能当 `ANTHROPIC_API_KEY` 用,得去 Console 单独建一个。
 
-Rust 工具链:
+**两个 key 都是付费服务,先知道大概花多少:**
+
+- **ScrapeCreators** 按次计费(1 次调用 = 1 credit)。实测一次「找博主」用
+  **3–13 credit**,一次「某博主最近在发什么」用 **2–3 credit**。失败的调用不扣费。
+- **DeepSeek** 按 token 计费,实测一次提问 **$0.003–0.017**(见下面「成本」一节)。
+
+**Rust 工具链要 1.88 以上**(代码里用了 let-chains):
 
 ```bash
 brew install rustup && rustup toolchain install stable
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+rustup update stable          # 半年前装的 stable 会编译失败
 cargo build
 ```
 
@@ -35,7 +42,7 @@ cargo build
 ### 发现类需求(第二版)
 
 ```bash
-# 交互模式：连续追问，/new 开新会话，/quit 退出
+# 交互模式：连续追问，↑ 调历史，/new 开新会话，/quit 退出
 ./target/debug/clipknow find
 
 # 一次性
@@ -52,11 +59,17 @@ cargo build
 
 | 工具 | YouTube | TikTok | Instagram |
 |---|---|---|---|
-| `search_videos` 按关键词搜视频 | ✅ | ✅ | ❌ 端点上游失效 |
+| `search_videos` 按关键词搜视频 | ✅ | ✅ | ❌ 端点上游失效，见下 |
 | `search_creators` 按关键词搜账号 | ✅ | ✅ | ✅ |
 | `get_creator` 博主主页数据 | ✅ | ✅ | ✅ |
 | `get_creator_videos` 博主近期视频 | ✅ | ✅ | ✅ |
 | `fetch_video` 单条视频完整内容 | ✅ | ✅ | ✅ |
+
+> **Instagram 的搜视频什么时候能恢复**：`/v2/instagram/reels/search` 现在对所有
+> 查询词返回 404(2026-08-19 实测，含官方文档自己的示例 `dogs`)。如果你 clone 下来
+> 时它已经修好了，把 `src/agent/tools.rs` 里 `SEARCHABLE_PLATFORMS` 加上
+> `"instagram"`、`src/ingest/discovery.rs` 的 `route()` 里那条 `return None` 换成
+> 真实路径即可，两行。
 
 ### 单视频问答(第一版)
 
@@ -103,14 +116,14 @@ src/
 │   └── discovery.rs           发现类端点的路由 + 三家响应 → 中立类型
 ├── content/
 │   ├── model.rs               Video / Creator / VideoSummary / Item …
-│   └── evidence.rs            材料拼成给模型看的文本（含注入防御）
+│   └── evidence.rs            两套系统提示词 + 材料拼装（含注入防御）
 ├── store/
 │   ├── mod.rs                 Store trait
 │   └── sqlite.rs              SQLite 实现
 └── agent/
     ├── llm.rs               ← 唯一知道「用哪家模型」的文件
     ├── tools.rs               五个工具的定义、参数校验、分发
-    ├── runner.rs              agent 循环（状态机）
+    ├── runner.rs              agent 循环（状态机 + 三道闸门）
     ├── context.rs             库里的条目 ↔ 发给模型的消息数组
     └── fixtures/              13 份真实 SC 响应，单测用，不联网不花钱
 ```
@@ -155,7 +168,25 @@ SC 调用上限   25 次（按次计费，真金白银）
 
 上下文判断用 provider 报回的**真实 `prompt_tokens`**,不是数字符——
 ASCII 的 token 密度实测跨度 1.68～6.12 字符/token(句柄数字最密、英文散文最松),
-没有单一比值能既准确又安全。
+没有单一比值能既准确又安全。字符估算只在两处兜底,取最保守的 1.68(宁可高估)。
+
+**每次发请求之前都查一遍预算**,不只在开始时。原来漏了一条路:最后一个工具返回
+20 万 token 之后,循环直接回到下一次模型调用,中间没有再查。
+
+## 一次提问的五种结局
+
+```
+Done              正常给出答案
+Truncated         撞了 max_tokens，答案是残缺的 → 落库 failed
+IterationCap      20 轮还没收敛
+ContextBudget     历史太长，请求没发出去（不落库，因为什么都没发生）
+ProtocolError     provider 返回了没见过的 stop_reason
+ModelError        网络/API 报错
+```
+
+**`Truncated` 单独一种是有原因的**:原来只看「模型有没有要工具」来判断结束,
+撞长度上限被砍掉半句话也会标成成功。然后 `--continue` 追问时历史里带着那半句,
+模型以为自己上一轮就是这么说完的。
 
 ## 成本
 
@@ -181,12 +212,23 @@ ASCII 的 token 密度实测跨度 1.68～6.12 字符/token(句柄数字最密�
 
 **问题越具体越便宜**:「找几个科普博主」要 8 次工具调用,「毕导最近在发什么」只要 2 次。
 
+**为什么加了证据标准之后变贵了**:模型现在每条推荐都要附一行「依据:我实际看到了
+什么」,输出 token 从 ~1,200 涨到 ~3,500。答案从「听起来有道理」变成「每句话有出处」,
+这个交换值得。
+
 ## 跑测试
 
 ```bash
-cargo test                      # 194 个，不联网不花钱
+cargo test                      # 225 个，不联网不花钱（夹具是真实响应）
 cargo clippy --all-targets
-cargo run --example probe_tools # 五个工具各打一次真 SC（要 key，花 credit）
+```
+
+`examples/` 下面三个是**真调 SC 的**,会花 credit:
+
+```bash
+cargo run --example probe_tools   # 五个工具各打一次 + fetch_video ×2 + 一次被拒 ≈ 8 credit
+cargo run --example show_unified  # 只读夹具，不花钱
+cargo run --example demo_rows     # 只读内存库，不花钱
 ```
 
 ## 路线
@@ -205,5 +247,17 @@ cargo run --example probe_tools # 五个工具各打一次真 SC（要 key，花
   Instagram 的发现质量会低于另外两家。
 - 文字稿截断是**取头部**。一小时的访谈如果前 20 分钟在寒暄,砍前 4 万字正好全是废话。
   彻底的解法是分段摘要,要多次模型调用,推迟了。
+- **终端可能吞字。** 实测过一次:打的是「帮我看看有什么美妆博主 tiktok上的」,
+  程序收到的是「帮我看看有什么tiktok上的」——中间四个字在到达 stdin 之前就丢了
+  (库里存着一条纯转义序列的「提问」作证:终端在往 stdin 注背景色查询应答和光标
+  位置报告)。具体机制没查出来。缓解是两条:换了 `rustyline`(raw 模式下自己解析
+  转义序列),以及**每次提问前回显收到的内容**:
+
+  ```
+  · 收到问题（15 字）：帮我看看有什么tiktok上的
+  ```
+
+  少了字一眼能看见,不用等答案出来发现答错了话题。
+
 - 模型偶尔会在回答里汇报「材料里没有试图指挥我的内容」,而系统提示词明确说了
-  没有就别提。DeepSeek 的指令遵守问题。
+  没有就别提。改提示词措辞 + 回传思考过程之后两次没复现,但样本太小,还不确定。

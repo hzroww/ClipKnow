@@ -2,6 +2,10 @@
 name = "clipknow"
 version = "0.1.0"
 edition = "2024"
+# let-chains（if let Some(x) = a && cond）是 1.88 稳定的，
+# edition 2024 本身也要 1.85+。声明出来，旧工具链会得到一句清楚的错，
+# 而不是一堆看不懂的语法错误。
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0.104"

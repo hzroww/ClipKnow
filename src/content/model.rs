@@ -418,12 +418,40 @@ impl Item {
         is_error: bool,
         raw_json: Option<String>,
     ) -> Item {
+        Self::function_call_output_full(
+            idx, iteration, call_id, content, is_error, raw_json, None, None,
+        )
+    }
+
+    /// 带上 endpoint 和实际扣费。
+    ///
+    /// 这两个**不单独开列**——按只把需要 join / 排序的字段提升成列的原则，
+    /// 它们放 payload，用 `json_extract` 查。但必须记下来：
+    /// 数行数算成本是错的（实测失败的调用 `credits_charged` 是 0，不扣费）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn function_call_output_full(
+        idx: i64,
+        iteration: i64,
+        call_id: &str,
+        content: &str,
+        is_error: bool,
+        raw_json: Option<String>,
+        endpoint: Option<&str>,
+        credits_charged: Option<i64>,
+    ) -> Item {
+        let mut payload = serde_json::json!({ "content": content, "is_error": is_error });
+        if let Some(e) = endpoint {
+            payload["endpoint"] = serde_json::Value::from(e);
+        }
+        if let Some(c) = credits_charged {
+            payload["credits_charged"] = serde_json::Value::from(c);
+        }
         Item {
             idx,
             kind: ItemKind::FunctionCallOutput,
             iteration: Some(iteration),
             call_id: Some(call_id.into()),
-            payload: serde_json::json!({ "content": content, "is_error": is_error }),
+            payload,
             raw_json,
         }
     }

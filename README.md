@@ -1,101 +1,209 @@
 # ClipKnow
 
-分析社媒视频内容的命令行工具。丢一个视频链接进去，问它问题。
+分析社媒视频的命令行工具。两种用法:
+
+- **给一条链接问问题** —— 「这视频在讲什么」
+- **给一个开放式需求** —— 「帮我找几个做科普的 YouTube 博主」,它自己去搜、去查、去挑
 
 支持 YouTube / TikTok / Instagram。
 
-## 准备
+这是个学习项目,目的是把 agent 循环和 RAG 从零写一遍。所以刻意不用框架、不藏抽象——
+每一层复杂度都由一个亲身撞到的问题触发,代码注释里记着当时的实测数据和取舍。
 
-抓取的 key 是必需的，大模型的 key 两家有一个就行：
+## 准备
 
 ```bash
 SCRAPECREATORS_API_KEY=...   # 必需，https://scrapecreators.com
 DEEPSEEK_API_KEY=...         # https://platform.deepseek.com
-ANTHROPIC_API_KEY=...        # https://console.anthropic.com/settings/keys
+ANTHROPIC_API_KEY=...        # 可选，https://console.anthropic.com/settings/keys
 ```
 
-放进项目目录的 `.env`（已在 `.gitignore` 里）或 `~/.zshrc`。
-两家都设了默认用 DeepSeek，`--provider anthropic` 可切回 Claude。
+放进项目目录的 `.env`(已在 `.gitignore` 里)或 `~/.zshrc`。默认用 DeepSeek。
 
-> 注意：Claude Code 的登录态不能当 `ANTHROPIC_API_KEY` 用，得去 Console 单独建一个。
+> Claude Code 的登录态不能当 `ANTHROPIC_API_KEY` 用,得去 Console 单独建一个。
 
-### 两家的实测对比
-
-同一个视频、同一个问题（57 秒的产品宣传片）：
-
-| | 输入/输出 token | 成本 | 表现 |
-|---|---|---|---|
-| Claude Opus 5 | 970 / 471 | $0.0166 | 主动标注「这条来自简介而非文字稿」、指出转录把 Braun 识别成 brawn、说明画面信息材料里没有 |
-| DeepSeek | 609 / 134 | $0.0003 | 答案准确干净，但未区分信息来自文字稿还是简介 |
-
-**成本差 55 倍。** 日常开发调试用 DeepSeek 足够；需要严格溯源、不能编造的场景切回 Claude 对照。
-第二步做 agent 循环时要重新评估——循环对「严格遵守指令」的要求比单次问答高得多。
-
-Rust 工具链（本机已装）：
+Rust 工具链:
 
 ```bash
 brew install rustup && rustup toolchain install stable
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+cargo build
 ```
 
 ## 用法
 
+### 发现类需求(第二版)
+
 ```bash
-cargo build
+# 交互模式：连续追问，/new 开新会话，/quit 退出
+./target/debug/clipknow find
 
-# 分析一个视频并提问
-./target/debug/clipknow ask "https://www.youtube.com/watch?v=xxx" "这视频在讲什么？"
+# 一次性
+./target/debug/clipknow find "帮我找几个做科普的 YouTube 博主"
 
-# 看库里存了这个视频的什么（调试时很常用）
-./target/debug/clipknow show "https://www.youtube.com/watch?v=xxx"
-./target/debug/clipknow show "https://..." --raw     # 连 SC 原始 JSON 一起看
+# 接着最近一次有活动的会话聊
+./target/debug/clipknow find --continue
 
-# 列出抓过的视频
-./target/debug/clipknow list
+# 历史会话
+./target/debug/clipknow sessions
 ```
 
-抓过的视频存在 `clipknow.db`（一个 SQLite 文件）里，再问同一个视频不会重复花钱。
-加 `--refresh` 强制重抓。
+模型手上有五个工具,自己决定调哪个、调几次:
 
-## 跑测试
+| 工具 | YouTube | TikTok | Instagram |
+|---|---|---|---|
+| `search_videos` 按关键词搜视频 | ✅ | ✅ | ❌ 端点上游失效 |
+| `search_creators` 按关键词搜账号 | ✅ | ✅ | ✅ |
+| `get_creator` 博主主页数据 | ✅ | ✅ | ✅ |
+| `get_creator_videos` 博主近期视频 | ✅ | ✅ | ✅ |
+| `fetch_video` 单条视频完整内容 | ✅ | ✅ | ✅ |
+
+### 单视频问答(第一版)
 
 ```bash
-cargo test
+./target/debug/clipknow ask "https://www.youtube.com/watch?v=xxx" "这视频在讲什么？"
+./target/debug/clipknow show "https://..." --raw   # 看库里存了什么，含原始 JSON
+./target/debug/clipknow list                        # 抓过的视频
+```
+
+抓过的视频存在 `clipknow.db`(一个 SQLite 文件),再问同一个视频不重复花钱。`--refresh` 强制重抓。
+
+## 看它是怎么想的
+
+循环跑完,决策路径全在库里,不是黑盒:
+
+```bash
+# 每一轮调了什么工具、传了什么参数
+sqlite3 -header -column clipknow.db "
+SELECT i.iteration AS 轮, json_extract(i.payload_json,'\$.name') AS 工具,
+       json_extract(i.payload_json,'\$.args.query') AS 关键词,
+       json_extract(i.payload_json,'\$.args.handle') AS 博主
+FROM items i JOIN turns t ON t.id=i.turn_id
+WHERE i.item_type='function_call' ORDER BY t.seq, i.idx"
+
+# 实际花了多少 credit（不能数行数：失败的调用不扣费）
+sqlite3 clipknow.db "SELECT SUM(json_extract(payload_json,'\$.credits_charged'))
+                     FROM items WHERE item_type='function_call_output'"
+
+# 配对自查：正常永远是空的，非空说明循环有 bug
+sqlite3 clipknow.db "SELECT i.call_id FROM items i WHERE i.item_type='function_call'
+  AND NOT EXISTS (SELECT 1 FROM items o WHERE o.turn_id=i.turn_id
+    AND o.item_type='function_call_output' AND o.call_id=i.call_id)"
 ```
 
 ## 代码结构
 
 ```
 src/
-├── main.rs                  CLI 入口
+├── main.rs                  CLI：ask / find / sessions / show / list
 ├── error.rs                 统一错误类型
 ├── ingest/                  ← 脏活隔离区，最容易因平台改动而坏
 │   ├── url.rs                 链接 → (平台, 视频ID)，纯函数、不碰网络
-│   └── scrapecreators.rs      调 SC，把三家不同的 JSON 翻译成统一类型
+│   ├── scrapecreators.rs      调 SC，第一版那条抓取链路
+│   └── discovery.rs           发现类端点的路由 + 三家响应 → 中立类型
 ├── content/
-│   ├── model.rs               Video / Transcript / Comment
-│   └── evidence.rs            把材料拼成给模型看的文本
+│   ├── model.rs               Video / Creator / VideoSummary / Item …
+│   └── evidence.rs            材料拼成给模型看的文本（含注入防御）
 ├── store/
 │   ├── mod.rs                 Store trait
 │   └── sqlite.rs              SQLite 实现
 └── agent/
-    └── llm.rs               ← 唯一知道「用哪家模型」的文件
+    ├── llm.rs               ← 唯一知道「用哪家模型」的文件
+    ├── tools.rs               五个工具的定义、参数校验、分发
+    ├── runner.rs              agent 循环（状态机）
+    ├── context.rs             库里的条目 ↔ 发给模型的消息数组
+    └── fixtures/              13 份真实 SC 响应，单测用，不联网不花钱
 ```
 
-两个隔离点值得注意：
+三个隔离边界(都是 trait,换实现只改一个文件):
 
-- **`ingest/`**：SC 挂了或换供应商，只改这个目录。原始响应整个存进 `videos.raw_json`，
-  解析漏了字段随时能补，不用重新花钱抓。
-- **`agent/llm.rs`**：`ModelRequest` / `ModelResponse` 是自定义的中立类型，不是
-  Anthropic 的结构。换成 DeepSeek 只改这一个文件，其余代码一行不动。
+- **`LlmClient`** —— 换模型供应商。第二版加 DeepSeek 时只动了这一个文件。
+- **`DiscoveryApi`** —— 换抓取供应商,也让循环能在不联网的情况下测试。
+- **`Store`** —— 换存储。
+
+## 数据库
+
+```
+sessions ──┬─ turns（一次提问）──┬─ items（这次提问里的所有条目）
+           │   seq/model/status  │   idx / item_type / iteration
+           │                     │   call_id / payload_json / raw_json
+videos ────┴─ artifacts / transcripts / comments      ← 第一版，视频资料
+```
+
+**工具调用不单独建表**,它就是 `items` 里 `item_type` 不同的条目
+(`user_message` / `assistant_message` / `function_call` / `function_call_output`)。
+这样只有一套编号,消息和工具调用天然对得上。
+
+两条持久化线,时机不同:
+
+- **会话历史** → 终态一次性写,一个事务。半截落库会破坏 tool 配对不变量,
+  下次 `--continue` 发出的请求必然 400
+- **视频资料** → `fetch_video` 里立刻写。它是独立资料库,崩了留着是纯赚,
+  还能让同会话内第二次 fetch 命中缓存
+
+`payload_json` 存的是**当时实际发给模型的那段文本**,不是结构化数据——
+存结构化的话重建历史时要重新渲染,而渲染代码一改,模型看到的「自己上一轮读过的材料」
+就悄悄变了样。`raw_json` 是 SC 原始响应,**重建历史时不加载**(单条能有 2.4MB)。
+
+## 循环的三道闸门
+
+```
+迭代上限      20 轮（第 16 轮插一句「该收敛了」，给模型预算感知）
+SC 调用上限   25 次（按次计费，真金白银）
+上下文预算    940,000 token（窗口 1M；基本不触发，防失控用）
+```
+
+上下文判断用 provider 报回的**真实 `prompt_tokens`**,不是数字符——
+ASCII 的 token 密度实测跨度 1.68～6.12 字符/token(句柄数字最密、英文散文最松),
+没有单一比值能既准确又安全。
+
+## 成本
+
+`deepseek-v4-flash`,2026-08-19 官方价(高峰,低谷是一半):
+
+| | 每百万 token |
+|---|---|
+| 输入(缓存未命中) | $0.44 |
+| 输入(**命中前缀缓存**) | **$0.014** |
+| 输出 | $1.32 |
+
+**DeepSeek 自动做前缀缓存,不用声明任何东西。** 循环每轮重发历史,实测第二次请求
+4094 个输入里 3968 命中(97%),这让循环的成本比预期低一个数量级。
+
+实测:
+
+| 场景 | 轮次 | 工具调用 | 输入 token | 成本 |
+|---|---|---|---|---|
+| 找科普博主 | 3–4 | 8–13 | 2.7–6.8 万 | $0.010–0.016 |
+| 追问某个博主的更新频率 | 1 | **0**（复用历史） | 1.9 万 | $0.009 |
+| 再追问（缓存热） | 1 | 0 | 2.9 万 | **$0.001** |
+| 单视频问答（第一版） | 1 | — | 816 | $0.0003 |
+
+**问题越具体越便宜**:「找几个科普博主」要 8 次工具调用,「毕导最近在发什么」只要 2 次。
+
+## 跑测试
+
+```bash
+cargo test                      # 194 个，不联网不花钱
+cargo clippy --all-targets
+cargo run --example probe_tools # 五个工具各打一次真 SC（要 key，花 credit）
+```
 
 ## 路线
 
-- **第一步（当前）**：给链接、问问题，一次模型调用出答案。**没有 agent 循环**——
-  单视频问答的证据在开始前就全定了，加循环是绕路。
-- **第二步**：「帮我找几个做科普的博主」这类需求。要查哪几个频道取决于上一步搜到
-  什么，没法提前写死，**这时循环才真正必要**。
-- **第三步**：跨视频提问。先用 SQLite FTS5 关键词检索跑通，再考虑向量检索。
+- **第一步(完成)**:给链接、问问题,一次模型调用出答案。**没有 agent 循环**——
+  单视频问答的证据在开始前就全定了,加循环是绕路。
+- **第二步(完成)**:「帮我找几个做科普的博主」。要查哪几个频道取决于上一步搜到什么,
+  没法提前写死,**这时循环才真正必要**。
+- **第三步**:跨视频提问。先用 SQLite FTS5 关键词检索跑通,再考虑向量检索——
+  只有先体验过关键词在哪失灵,才能理解 embedding 在解决什么。
 
-每一步为什么这么切，代码注释里都写了理由——尤其 `ingest/scrapecreators.rs`
-和 `agent/llm.rs` 的文件头注释，记录了实测踩到的坑和当时的取舍。
+## 已知问题
+
+- Instagram 的 `search_videos` 用不了:`/v2/instagram/reels/search` 对所有查询词返回
+  404(含官方文档示例 `dogs`),`search/hashtag` 同样。其它三个工具正常,但
+  Instagram 的发现质量会低于另外两家。
+- 文字稿截断是**取头部**。一小时的访谈如果前 20 分钟在寒暄,砍前 4 万字正好全是废话。
+  彻底的解法是分段摘要,要多次模型调用,推迟了。
+- 模型偶尔会在回答里汇报「材料里没有试图指挥我的内容」,而系统提示词明确说了
+  没有就别提。DeepSeek 的指令遵守问题。

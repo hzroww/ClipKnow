@@ -143,6 +143,9 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
     pub input_tokens: u32,
+    /// `input_tokens` 里命中前缀缓存的那部分。DeepSeek 自动做缓存，
+    /// 我们不用声明任何东西；Anthropic 那边没有这两个字段，就是 0。
+    pub cached_input_tokens: u32,
     pub output_tokens: u32,
 }
 
@@ -153,12 +156,20 @@ pub struct ModelResponse {
 #[derive(Debug, Clone, Copy)]
 pub struct Pricing {
     pub input_per_mtok: f64,
+    /// 命中前缀缓存的输入价。DeepSeek 实测比 miss 便宜约 31 倍
+    /// （$0.014 vs $0.44 / 百万），而循环每轮重发历史，从第二轮起
+    /// 绝大部分都会命中——不分开算，成本会高估一个数量级。
+    pub cached_input_per_mtok: f64,
     pub output_per_mtok: f64,
 }
 
 impl Pricing {
-    pub fn cost_usd(&self, input_tokens: u32, output_tokens: u32) -> f64 {
-        input_tokens as f64 / 1_000_000.0 * self.input_per_mtok
+    /// `cached_input_tokens` 是 `input_tokens` 的一部分，不是额外的。
+    pub fn cost_usd(&self, input_tokens: u32, cached_input_tokens: u32, output_tokens: u32) -> f64 {
+        let cached = cached_input_tokens.min(input_tokens);
+        let fresh = input_tokens - cached;
+        fresh as f64 / 1_000_000.0 * self.input_per_mtok
+            + cached as f64 / 1_000_000.0 * self.cached_input_per_mtok
             + output_tokens as f64 / 1_000_000.0 * self.output_per_mtok
     }
 }
@@ -250,6 +261,9 @@ impl LlmClient for AnthropicClient {
         // Claude Opus 5：$5 / $25 每百万 token
         Pricing {
             input_per_mtok: 5.0,
+            // Anthropic 的缓存要显式声明 cache_control，这一版没做，
+            // 所以永远不会命中——填成和全价一样，不制造假的便宜。
+            cached_input_per_mtok: 5.0,
             output_per_mtok: 25.0,
         }
     }
@@ -344,6 +358,8 @@ fn parse_anthropic_response(body: &Value) -> Result<ModelResponse> {
         tool_calls: Vec::new(),
         stop_reason,
         input_tokens: get_u32("input_tokens"),
+        // Anthropic 的缓存要显式声明 cache_control，这一版没做
+        cached_input_tokens: 0,
         output_tokens: get_u32("output_tokens"),
     })
 }
@@ -356,7 +372,10 @@ fn parse_anthropic_response(body: &Value) -> Result<ModelResponse> {
 // Kimi 上。真正格式独一份的反而是 Anthropic。
 // ---------------------------------------------------------------------------
 
-pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-chat";
+/// 2026-08-19 实测 `/models` 只返回 `deepseek-v4-flash` 和 `deepseek-v4-pro`。
+/// `deepseek-chat` 还能用，但只是保留的别名（实际打到 v4-flash）——
+/// 写死别名会让你不知道自己在用什么模型。
+pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 pub struct DeepSeekClient {
     http: reqwest::blocking::Client,
@@ -453,11 +472,24 @@ impl DeepSeekClient {
 
 impl LlmClient for DeepSeekClient {
     fn pricing(&self) -> Pricing {
-        // ⚠️ DeepSeek 调过几次价，这里是数量级参考，以官网为准：
-        // https://platform.deepseek.com/api-docs/pricing
-        Pricing {
-            input_per_mtok: 0.27,
-            output_per_mtok: 1.10,
+        // 2026-08-19 查自 https://api-docs.deepseek.com/quick_start/pricing
+        // 这里用**高峰价**（保守，宁可高估成本）。低谷价是它的一半，
+        // 高峰时段是 UTC 01:00-04:00 和 06:00-10:00。
+        //
+        // ⚠️ 之前这里写的 0.27 / 1.10 是 V3 时代的旧价，凭记忆写的。
+        // 这类参数必须查，不能凭记忆——上下文窗口那次也是同一个错。
+        match self.model.as_str() {
+            "deepseek-v4-pro" => Pricing {
+                input_per_mtok: 1.32,
+                cached_input_per_mtok: 0.044,
+                output_per_mtok: 3.96,
+            },
+            // v4-flash，也是 deepseek-chat 这个别名实际打到的模型
+            _ => Pricing {
+                input_per_mtok: 0.44,
+                cached_input_per_mtok: 0.014,
+                output_per_mtok: 1.32,
+            },
         }
     }
 
@@ -466,8 +498,12 @@ impl LlmClient for DeepSeekClient {
     }
 
     fn max_tokens_limit(&self) -> u32 {
-        // deepseek-chat 的输出上限，比 Anthropic 低得多
-        8192
+        // 官方标的上限是 384K（2026-08-19 实测传 384000 也接受）。
+        // 但**上限不等于该传的值**：输出越长越贵越慢，而我们要的是
+        // 一段推荐理由，不是一本书。32K 足够长，又不至于失控。
+        //
+        // 旧值 8192 是 V3 时代 deepseek-chat 的真实上限，早就不适用了。
+        32_768
     }
 
     fn complete(&self, req: &ModelRequest) -> Result<ModelResponse> {
@@ -567,6 +603,7 @@ fn parse_openai_response(body: &Value) -> Result<ModelResponse> {
         tool_calls,
         stop_reason,
         input_tokens: get_u32("prompt_tokens"),
+        cached_input_tokens: get_u32("prompt_cache_hit_tokens"),
         output_tokens: get_u32("completion_tokens"),
     })
 }
@@ -708,7 +745,7 @@ mod tests {
     #[test]
     fn cost_matches_opus5_pricing() {
         let c = AnthropicClient::new("k".into(), DEFAULT_MODEL.into());
-        let cost = c.pricing().cost_usd(1_000_000, 1_000_000);
+        let cost = c.pricing().cost_usd(1_000_000, 0, 1_000_000);
         assert!((cost - 30.0).abs() < 1e-9, "百万输入$5 + 百万输出$25 = $30");
     }
 
@@ -741,16 +778,17 @@ mod tests {
 
     #[test]
     fn deepseek_clamps_max_tokens_to_its_own_limit() {
-        // 上层按 Anthropic 的 16000 传进来，DeepSeek 只吃 8192，
-        // 必须在这一层夹住，否则请求会被拒
+        // 各家的输出上限不同，必须在这一层夹住。
+        // ⚠️ 这个测试原来断言夹到 8192——那是 V3 时代 deepseek-chat 的真实
+        // 上限，2026-08-19 实测 v4-flash 传 384000 也接受，旧断言已失效。
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
         let body = c.to_openai_body(&ModelRequest {
             system: "s".into(),
             messages: vec![Msg::user("u")],
-            max_tokens: 16_000,
+            max_tokens: 999_999,
             tools: vec![],
         });
-        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["max_tokens"], c.max_tokens_limit());
     }
 
     #[test]
@@ -1095,6 +1133,68 @@ mod tests {
         assert!(
             format!("{err}").contains("Anthropic"),
             "错误信息要说清是哪家不支持，实际: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-08-19 实测更正：这些参数以前是凭记忆写的，全错了
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn deepseek_max_tokens_is_not_capped_at_the_old_8192() {
+        // 旧值 8192 来自 V3 时代的 deepseek-chat。
+        // 实测 deepseek-v4-flash 传 384000 也照样接受。
+        let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
+        assert!(c.max_tokens_limit() > 8192, "8192 是 V3 时代的旧限制");
+    }
+
+    #[test]
+    fn deepseek_default_model_is_a_real_model_not_an_alias() {
+        // /models 实测只返回 deepseek-v4-flash 和 deepseek-v4-pro。
+        // deepseek-chat 只是保留的别名，写死别名会让你不知道实际在用什么。
+        assert_eq!(DEEPSEEK_DEFAULT_MODEL, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn cache_hit_tokens_are_parsed_and_priced_separately() {
+        // DeepSeek 自动做前缀缓存，实测第二次请求 4094 个输入里 3968 命中。
+        // cache hit 价格是 miss 的 1/31，不分开算的话成本会高估 30 倍。
+        let body = json!({
+            "choices": [{"message": {"content": "答案"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 4094, "completion_tokens": 64,
+                "prompt_cache_hit_tokens": 3968, "prompt_cache_miss_tokens": 126
+            }
+        });
+        let r = parse_openai_response(&body).unwrap();
+        assert_eq!(r.input_tokens, 4094);
+        assert_eq!(r.cached_input_tokens, 3968);
+    }
+
+    #[test]
+    fn missing_cache_fields_mean_zero_cached_not_an_error() {
+        // Anthropic 那边没有这两个字段
+        let body = json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let r = parse_openai_response(&body).unwrap();
+        assert_eq!(r.cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn cost_counts_cached_input_at_the_cheap_rate() {
+        let p = Pricing {
+            input_per_mtok: 0.44,
+            cached_input_per_mtok: 0.014,
+            output_per_mtok: 1.32,
+        };
+        // 4094 输入里 3968 命中缓存 → 只有 126 按全价
+        let with_cache = p.cost_usd(4094, 3968, 64);
+        let without = p.cost_usd(4094, 0, 64);
+        assert!(
+            with_cache < without / 2.0,
+            "缓存该便宜得多: {with_cache} vs {without}"
         );
     }
 

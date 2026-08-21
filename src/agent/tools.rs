@@ -13,8 +13,9 @@ use serde_json::json;
 use crate::agent::llm::{ToolCall, ToolDef, ToolResult};
 use crate::content::evidence::{build_evidence_with_limit, format_date, neutralize};
 use crate::content::model::{Creator, VideoSummary};
+use crate::error::Result;
 use crate::ingest::discovery::{
-    DiscoveryApi, Endpoint, parse_creator, parse_search_creators, parse_search_videos,
+    DiscoveryApi, Endpoint, next_cursor, parse_creator, parse_search_creators, parse_search_videos,
 };
 use crate::ingest::url::Platform;
 use crate::store::Store;
@@ -86,12 +87,19 @@ pub fn tool_defs() -> Vec<ToolDef> {
             name: "get_creator_videos".into(),
             description: "看一个博主最近发了什么。\
                 **要推荐某个博主，必须先用这个确认他近期内容真的对得上**——\
-                粉丝数和搜索里出现的频次都不能证明这一点。"
+                粉丝数和搜索里出现的频次都不能证明这一点。\
+                默认给最近一页（10-30 条，够判断内容方向）。\
+                要判断更新频率、或想看更长的时间窗，才用 max_videos 多要几条——\
+                它是翻页拿的，要几页就花几次调用。"
                 .into(),
             params: schema(
                 json!({
                     "platform": platform_prop(&ALL_PLATFORMS),
-                    "handle": {"type": "string", "description": "账号 handle，不带 @"}
+                    "handle": {"type": "string", "description": "账号 handle，不带 @"},
+                    "max_videos": {
+                        "type": "integer",
+                        "description": "想要多少条。不填就只拿一页。每多一页多花一次调用"
+                    }
                 }),
                 &["platform", "handle"],
             ),
@@ -207,6 +215,12 @@ pub struct ToolOutcome {
     /// SC 实际扣的 credit。**不能用调用次数代替**——实测失败的调用
     /// （比如 Instagram 搜视频那个 404）返回 `credits_charged: 0`，不扣费。
     pub credits_charged: Option<i64>,
+    /// 这次工具执行实际打了几个外部端点。
+    ///
+    /// **不是恒等于 1。** `fetch_video` 内部打详情 + 文字稿 + 评论三个端点
+    /// （转录失败还会重试一次）；命中缓存则是 0；翻页会更多。
+    /// 循环拿这个数记预算——原来固定加 1，成本闸门一直少算。
+    pub external_calls: usize,
 }
 
 impl ToolOutcome {
@@ -223,6 +237,7 @@ impl ToolOutcome {
             raw_json: None,
             // 在打网络之前拒掉的，明确是 0 而不是「不知道」
             credits_charged: Some(0),
+            external_calls: 0,
         }
     }
 }
@@ -267,6 +282,52 @@ fn need_platform(
 /// 但第一次进上下文那次是全价。
 pub const LOOP_TRANSCRIPT_LIMIT_CHARS: usize = 40_000;
 
+/// 翻页硬上限。
+///
+/// 模型可能填 `max_videos: 10000`——上限必须在代码里，不能指望它填个合理的数。
+/// 3 页在三家分别是 90 / 30 / 36 条，足够判断更新频率；再多就是烧 credit。
+pub const MAX_PAGES: usize = 3;
+
+/// 翻页取博主视频。
+///
+/// **不把游标暴露给模型**：YouTube 的 `continuationToken` 实测 1500+ 字符
+/// （约 750 token），让它抄这个既贵又必错；三家的游标名字和类型还全不一样。
+/// 所以对外只有「我要多少条」，翻页在这里做完。
+fn paged_creator_videos(
+    api: &dyn DiscoveryApi,
+    platform: Platform,
+    handle: &str,
+    want: usize,
+) -> Result<(Vec<VideoSummary>, Vec<String>, usize, i64)> {
+    let mut all = Vec::new();
+    let mut raws = Vec::new();
+    let mut credits = 0i64;
+    let mut cursor: Option<String> = None;
+
+    for page in 0..MAX_PAGES {
+        let raw = api.call_paged(
+            Endpoint::GetCreatorVideos,
+            platform,
+            handle,
+            cursor.as_deref(),
+        )?;
+        credits += raw
+            .body
+            .get("credits_charged")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        all.extend(parse_search_videos(platform, &raw.body));
+        cursor = next_cursor(platform, &raw.body);
+        raws.push(raw.body.to_string());
+
+        // 够了、或者没有下一页了就停
+        if all.len() >= want || cursor.is_none() {
+            return Ok((all, raws, page + 1, credits));
+        }
+    }
+    Ok((all, raws, MAX_PAGES, credits))
+}
+
 pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall) -> ToolOutcome {
     let (ep, allowed) = match call.name.as_str() {
         "search_videos" => (Endpoint::SearchVideos, &SEARCHABLE_PLATFORMS[..]),
@@ -305,6 +366,31 @@ pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
         Err(e) => return ToolOutcome::err(&call.id, e),
     };
 
+    // get_creator_videos 带 max_videos 时走翻页那条路
+    if ep == Endpoint::GetCreatorVideos
+        && let Some(want) = call
+            .args
+            .get("max_videos")
+            .and_then(serde_json::Value::as_i64)
+    {
+        let want = want.max(1) as usize;
+        return match paged_creator_videos(api, platform, &arg, want) {
+            Ok((vids, raws, pages, credits)) => ToolOutcome {
+                result: ToolResult {
+                    call_id: call.id.clone(),
+                    content: render_videos(&vids),
+                    is_error: false,
+                },
+                endpoint: Some(format!("get_creator_videos ×{pages} 页")),
+                raw_json: Some(format!("[{}]", raws.join(","))),
+                credits_charged: Some(credits),
+                // ★ 翻了几页就是几次调用。不如实报，max_tool_calls 又变谎话。
+                external_calls: pages,
+            },
+            Err(e) => ToolOutcome::err(&call.id, format!("调用失败：{e}")),
+        };
+    }
+
     let raw = match api.call(ep, platform, &arg) {
         Ok(r) => r,
         // SC 失败不中止循环，把原因原样给模型
@@ -334,6 +420,7 @@ pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
             .and_then(serde_json::Value::as_i64),
         endpoint: Some(raw.endpoint),
         raw_json: Some(raw.body.to_string()),
+        external_calls: 1,
     }
 }
 
@@ -356,10 +443,14 @@ fn fetch_video(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
     };
 
     let cached = store.find_by_native(parsed.platform, &parsed.native_id);
+    // 命中缓存 = 一个端点都没打；没命中 = 打了几个，从 artifacts 数
+    // （详情/文字稿/评论各一份，转录失败重试也会多一份记录）
+    let mut hit_endpoints = 0usize;
     let sv = match cached {
         Ok(Some(sv)) => sv,
         Ok(None) => match api.fetch_video(&parsed, &url) {
             Ok(fetched) => {
+                hit_endpoints = fetched.artifacts.len();
                 if let Err(e) = store.save(&fetched) {
                     return ToolOutcome::err(&call.id, format!("抓到了但写库失败：{e}"));
                 }
@@ -383,9 +474,11 @@ fn fetch_video(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
             is_error: false,
         },
         endpoint: Some("fetch_video".into()),
-        // 第一版那条链路打三个端点，扣费数在 artifacts 表里；
-        // 命中缓存时是 0。这里不重复统计，留 None 表示「不在这张表里算」。
         credits_charged: None,
+        // ★ 第一版那条链路打**三个**端点（详情/文字稿/评论），转录失败还会
+        //   重试一次。原来这里固定算 1 次，成本闸门一直少算。
+        //   命中缓存则一个都没打，是 0。
+        external_calls: hit_endpoints,
         // 原始响应已经在 artifacts 表里（挂在 video_id 上，跨会话长期有效），
         // 不用在 items 里再存一份。
         raw_json: None,
@@ -1086,5 +1179,214 @@ mod tests {
         );
         assert!(out.result.is_error);
         assert_eq!(out.credits_charged, Some(0));
+    }
+
+    // -----------------------------------------------------------------
+    // 外部调用记账：一次工具调用可能内部打多个端点
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_single_endpoint_tool_reports_one_external_call() {
+        let api = FakeVideoApi::default();
+        let out = execute(
+            &api,
+            &mut store(),
+            &call("search_videos", json!({"platform":"youtube","query":"x"})),
+        );
+        assert_eq!(out.external_calls, 1);
+    }
+
+    #[test]
+    fn a_rejected_call_reports_zero_external_calls() {
+        // 打网络之前就拒掉的，不该占预算
+        let api = FakeVideoApi::default();
+        let out = execute(
+            &api,
+            &mut store(),
+            &call("search_videos", json!({"platform":"instagram","query":"x"})),
+        );
+        assert!(out.result.is_error);
+        assert_eq!(out.external_calls, 0);
+    }
+
+    #[test]
+    fn fetch_video_reports_the_three_endpoints_it_actually_hits() {
+        // 它内部打详情 + 文字稿 + 评论三个端点（转录失败还会重试一次）。
+        // 原来在预算里只算 1 次，成本闸门一直少算。
+        let api = FakeVideoApi {
+            transcript: Some("内容".into()),
+            ..Default::default()
+        };
+        let out = execute(
+            &api,
+            &mut store(),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
+        assert!(out.external_calls >= 3, "实际报了 {}", out.external_calls);
+    }
+
+    #[test]
+    fn a_cache_hit_reports_zero_external_calls() {
+        let api = FakeVideoApi {
+            transcript: Some("内容".into()),
+            ..Default::default()
+        };
+        let mut st = store();
+        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        let second = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        assert_eq!(second.external_calls, 0, "命中缓存不该占预算");
+    }
+
+    // -----------------------------------------------------------------
+    // get_creator_videos 的翻页
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn get_creator_videos_takes_an_optional_max_videos() {
+        let d = def("get_creator_videos");
+        let p = &d.params["properties"]["max_videos"];
+        assert_eq!(p["type"], "integer");
+        let req: Vec<&str> = d.params["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!req.contains(&"max_videos"), "可选，不填就给一页");
+    }
+
+    #[test]
+    fn the_tools_still_do_not_expose_raw_cursors() {
+        // YouTube 的 continuationToken 实测 **1500+ 字符**（约 750 token）。
+        // 让模型抄这个既贵又必错。三家的游标名字和类型还全不一样
+        // （continuationToken / max_cursor 数字 / paging_info.max_id base64）。
+        // 所以只给「我要多少条」，代码内部翻页。
+        for t in tool_defs() {
+            let props = t.params["properties"].as_object().unwrap();
+            for leaked in [
+                "cursor",
+                "continuationToken",
+                "max_cursor",
+                "max_id",
+                "page",
+            ] {
+                assert!(
+                    !props.contains_key(leaked),
+                    "{} 泄漏了游标参数 {leaked}",
+                    t.name
+                );
+            }
+        }
+    }
+
+    /// 假 SC：每页返回 2 条，游标一直有，用来数翻了几页。
+    #[derive(Default)]
+    struct PagingApi {
+        pages: RefCell<usize>,
+    }
+
+    impl DiscoveryApi for PagingApi {
+        fn call(&self, _: Endpoint, _: Platform, _: &str) -> Result<RawResponse> {
+            let n = {
+                let mut p = self.pages.borrow_mut();
+                *p += 1;
+                *p
+            };
+            Ok(RawResponse {
+                endpoint: "/fake".into(),
+                body: json!({
+                    "videos": [
+                        {"id": format!("v{n}a"), "title": "t", "channel": {"handle": "h"}},
+                        {"id": format!("v{n}b"), "title": "t", "channel": {"handle": "h"}}
+                    ],
+                    "continuationToken": "tok"
+                }),
+            })
+        }
+        fn fetch_video(&self, _: &ParsedUrl, _: &str) -> Result<FetchedVideo> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn without_max_videos_only_one_page_is_fetched() {
+        let api = PagingApi::default();
+        let out = execute(
+            &api,
+            &mut store(),
+            &call(
+                "get_creator_videos",
+                json!({"platform":"youtube","handle":"x"}),
+            ),
+        );
+        assert_eq!(*api.pages.borrow(), 1, "不填就只拿一页");
+        assert_eq!(out.external_calls, 1);
+    }
+
+    #[test]
+    fn max_videos_pages_until_it_has_enough() {
+        // 每页 2 条，要 5 条 → 该翻 3 页
+        let api = PagingApi::default();
+        let out = execute(
+            &api,
+            &mut store(),
+            &call(
+                "get_creator_videos",
+                json!({"platform":"youtube","handle":"x","max_videos":5}),
+            ),
+        );
+        assert_eq!(*api.pages.borrow(), 3, "实际翻了 {} 页", api.pages.borrow());
+        assert!(
+            out.result.content.contains("6 条"),
+            "6 条都要给: {}",
+            out.result.content
+        );
+    }
+
+    #[test]
+    fn paging_counts_every_page_against_the_budget() {
+        // 翻页是偷偷花钱的地方。三页就是三次 SC 调用、三个 credit，
+        // 必须如实报出来，否则 max_tool_calls 又变成谎话。
+        let api = PagingApi::default();
+        let out = execute(
+            &api,
+            &mut store(),
+            &call(
+                "get_creator_videos",
+                json!({"platform":"youtube","handle":"x","max_videos":5}),
+            ),
+        );
+        assert_eq!(out.external_calls, 3);
+    }
+
+    #[test]
+    fn paging_is_hard_capped_so_a_big_number_cannot_run_away() {
+        // 模型可能填 max_videos: 10000。翻页上限必须在代码里，
+        // 不能指望它填个合理的数。
+        let api = PagingApi::default();
+        execute(
+            &api,
+            &mut store(),
+            &call(
+                "get_creator_videos",
+                json!({"platform":"youtube","handle":"x","max_videos":10000}),
+            ),
+        );
+        assert!(
+            *api.pages.borrow() <= MAX_PAGES,
+            "翻了 {} 页",
+            api.pages.borrow()
+        );
+    }
+
+    #[test]
+    fn only_get_creator_videos_supports_paging() {
+        // search_videos 不给翻页：换关键词再搜效果不差，而且今天实跑里
+        // 模型自己就在这么做（搜了「科普」「科学 实验」「物理 科普」三轮）。
+        assert!(
+            def("search_videos").params["properties"]
+                .get("max_videos")
+                .is_none()
+        );
     }
 }

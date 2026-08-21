@@ -228,6 +228,17 @@ fn first_number(s: &str) -> Option<i64> {
 pub trait DiscoveryApi {
     fn call(&self, ep: Endpoint, p: Platform, arg: &str) -> Result<RawResponse>;
 
+    /// 带游标的版本，用于翻页。默认实现忽略游标（假实现不用都覆盖）。
+    fn call_paged(
+        &self,
+        ep: Endpoint,
+        p: Platform,
+        arg: &str,
+        _cursor: Option<&str>,
+    ) -> Result<RawResponse> {
+        self.call(ep, p, arg)
+    }
+
     /// 抓一条视频的完整内容。走的是第一版那条链路（三个端点 + 转录失败重试），
     /// 和上面四个发现类端点不是一回事，所以单独一个方法。
     fn fetch_video(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo>;
@@ -245,6 +256,47 @@ pub enum Endpoint {
 pub struct RawResponse {
     pub endpoint: String,
     pub body: serde_json::Value,
+}
+
+/// 从一页响应里取出「下一页的游标」。
+///
+/// 三家的机制完全不同（2026-08-21 实测，都验证过第 2 页与第 1 页 0 重叠）：
+///
+/// | 平台 | 参数名 | 游标在哪 | 还有下一页 |
+/// |---|---|---|---|
+/// | YouTube | `continuationToken` | 顶层同名字段（**1500+ 字符**的不透明串） | 有这个字段就有 |
+/// | TikTok | `max_cursor` | 顶层 `max_cursor`（数字） | `has_more == 1` |
+/// | Instagram | `max_id` | `paging_info.max_id`（base64） | `paging_info.more_available` |
+///
+/// Instagram 有个坑：传 `page` / `cursor` / `after` 都**静默返回同一页**
+/// （实测重叠 12/12），只有 `max_id` 才真翻页。
+pub fn next_cursor(p: Platform, body: &Value) -> Option<String> {
+    match p {
+        Platform::YouTube => pick_str(body, &["continuationToken"]),
+        Platform::TikTok => {
+            // has_more 是 0/1，不是 bool
+            if pick_i64(body, &["has_more"]) == Some(1) {
+                pick_str(body, &["max_cursor"])
+            } else {
+                None
+            }
+        }
+        Platform::Instagram => body
+            .pointer("/paging_info/more_available")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then(|| pick_str(body, &["paging_info.max_id"]))
+            .flatten(),
+    }
+}
+
+/// 翻页参数叫什么。和 `next_cursor` 配对使用。
+fn cursor_param(p: Platform) -> &'static str {
+    match p {
+        Platform::YouTube => "continuationToken",
+        Platform::TikTok => "max_cursor",
+        Platform::Instagram => "max_id",
+    }
 }
 
 /// 一次 SC 调用要打的路径和参数。
@@ -320,6 +372,29 @@ pub fn route(ep: Endpoint, p: Platform, arg: &str) -> Option<Route> {
 }
 
 impl DiscoveryApi for crate::ingest::scrapecreators::ScrapeCreators {
+    fn call_paged(
+        &self,
+        ep: Endpoint,
+        p: Platform,
+        arg: &str,
+        cursor: Option<&str>,
+    ) -> Result<RawResponse> {
+        let Some(mut rt) = route(ep, p, arg) else {
+            return Err(crate::error::ClipKnowError::Fetch {
+                platform: p.as_str().into(),
+                message: format!("{} 上没有可用的 {ep:?} 端点（SC 侧当前不支持）", p.as_str()),
+            });
+        };
+        if let Some(c) = cursor {
+            rt.params.push((cursor_param(p), c.to_string()));
+        }
+        let body = self.get_with(rt.path, &rt.params)?;
+        Ok(RawResponse {
+            endpoint: rt.path.to_string(),
+            body,
+        })
+    }
+
     fn fetch_video(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo> {
         self.fetch(parsed, raw_url)
     }

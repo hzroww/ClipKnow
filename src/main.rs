@@ -217,7 +217,7 @@ fn cmd_find(
     let mut session_id = if continue_ {
         match store.latest_session()? {
             Some(s) => {
-                let n = store.load_history(&s.id)?.len();
+                let n = store.count_history(&s.id)?;
                 println!(
                     "· 接着聊：{}（{n} 条历史）",
                     s.title.as_deref().unwrap_or("(无标题)")
@@ -344,8 +344,10 @@ fn one_turn(
         TurnOutcome::ModelError(ref e) => println!("\n模型调用失败: {e}"),
     }
 
-    // 快满时提前提醒，别等撞墙
-    let used = est_history_tokens(store, session_id)?;
+    // 快满时提前提醒，别等撞墙。
+    // 用 run_turn 报回的**真实** prompt_tokens——原来这里自己 load_history
+    // 一遍、用一套过时的估算公式（chars*10/19，runner 早就改成按字符类型算了）。
+    let used = res.context_tokens;
     if used * 10 > cfg.context_budget_tokens * 9 {
         eprintln!(
             "\n(提示：会话历史已用约 {used} / {} token，接近上限，建议 /new 开新会话)",
@@ -365,14 +367,6 @@ fn one_turn(
             .cost_usd(res.input_tokens, res.cached_input_tokens, res.output_tokens)
     );
     Ok(())
-}
-
-fn est_history_tokens(store: &SqliteStore, session_id: &str) -> Result<usize> {
-    Ok(store
-        .load_history(session_id)?
-        .iter()
-        .map(|i| i.payload.to_string().chars().count() * 10 / 19)
-        .sum())
 }
 
 fn truncate_chars(s: &str, n: usize) -> String {

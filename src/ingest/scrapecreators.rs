@@ -19,6 +19,13 @@ use crate::error::{ClipKnowError, Result};
 use crate::ingest::url::{ParsedUrl, Platform};
 
 const BASE_URL: &str = "https://api.scrapecreators.com";
+
+/// 内部信号：这个错误值得原样重试一次。
+///
+/// 用消息前缀传递而不是多定义一个错误类型，是因为它只在 `get_with` 和
+/// `get_once` 之间活一瞬间。**上抛之前必须摘掉**，否则会漏进给模型看的
+/// 错误信息里——那是给人和模型读的，不该出现内部标记。
+const RETRY_MARK: &str = "__retry__";
 /// 抓多少条评论就够了。评论主要给模型当「观众怎么看」的证据，不需要全量。
 const COMMENT_LIMIT: usize = 20;
 
@@ -166,9 +173,53 @@ impl ScrapeCreators {
         self.get_with(path, &[("url", url_param.to_string())])
     }
 
+    /// 这个失败值不值得原样重试一次。
+    ///
+    /// 只有「完全相同的请求第二次就能成」的情况才算。2026-08-21 撞到一次真实样本：
+    /// Instagram 翻页返回 `HTTP 500 Failed to connect to the server`，
+    /// `credits_charged: 0`，重试三次全部成功——SC 自己连不上上游。
+    ///
+    /// **其它类型一律不重试**，交给模型改：参数错了它会补、平台不支持它会换、
+    /// 搜不到它会换关键词。那比无脑重试聪明，而且代码重试对这些类型
+    /// 一百次都是同样的失败。
+    fn is_transient(status: u16, body: &str) -> bool {
+        match status {
+            // 网关/限流：典型的一过性
+            429 | 502 | 503 | 504 => true,
+            // 500 要看内容。SC 明确说「连不上服务器」才重试；
+            // 上游真挂了那种稳定失败的 500 重试是白花时间。
+            500 => {
+                let b = body.to_ascii_lowercase();
+                b.contains("failed to connect") || b.contains("connect")
+            }
+            _ => false,
+        }
+    }
+
     /// 任意查询参数的版本。发现类端点用的参数名各不相同
     /// （query / handle / type / sortBy…），不能只支持 `url`。
     pub(crate) fn get_with(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
+        match self.get_once(path, params) {
+            Err(ClipKnowError::Fetch { message, .. }) if message.starts_with(RETRY_MARK) => {
+                // 一过性失败：原样再打一次。只重试一次——两次都连不上
+                // 就是真有问题，不该在这里耗着。
+                eprintln!("  ! {path} 连接失败，重试一次 ...");
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                self.get_once(path, params).map_err(|e| match e {
+                    // 第二次还是失败：把标记摘掉再往上抛，
+                    // 否则内部信号会漏进给模型看的错误信息里
+                    ClipKnowError::Fetch { platform, message } => ClipKnowError::Fetch {
+                        platform,
+                        message: message.trim_start_matches(RETRY_MARK).to_string(),
+                    },
+                    other => other,
+                })
+            }
+            other => other,
+        }
+    }
+
+    fn get_once(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
         let resp = self
             .http
             .get(format!("{BASE_URL}{path}"))
@@ -180,9 +231,16 @@ impl ScrapeCreators {
         let body: Value = resp.json()?;
 
         if !status.is_success() {
+            let detail = truncate(&body.to_string(), 200);
+            // 用前缀给 get_with 传信号，避免多定义一个错误类型
+            let prefix = if Self::is_transient(status.as_u16(), &detail) {
+                RETRY_MARK
+            } else {
+                ""
+            };
             return Err(ClipKnowError::Fetch {
                 platform: path.to_string(),
-                message: format!("HTTP {status}: {}", truncate(&body.to_string(), 200)),
+                message: format!("{prefix}HTTP {status}: {detail}"),
             });
         }
         // SC 即使 HTTP 200 也可能返回 success:false
@@ -743,5 +801,60 @@ mod tests {
     #[test]
     fn missing_comments_field_yields_empty_not_panic() {
         assert!(extract_comments(&json!({}), "v", Platform::YouTube).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // 错误分类
+    //
+    // 2026-08-21 实测：175 次调用里 SC 一次没失败过，但翻页验证时撞到一次
+    //   HTTP 500 "Failed to connect to the server"（SC 自己连不上上游），
+    //   而且 credits_charged: 0（不扣费）。重试三次全部成功。
+    // 这是**唯一**值得代码重试的一类：完全相同的请求第二次就能成。
+    // 其它类型交给模型自己改（换参数、换平台、换关键词），那比无脑重试聪明。
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_connect_failure_is_marked_retryable() {
+        assert!(ScrapeCreators::is_transient(
+            500,
+            "Failed to connect to the server"
+        ));
+        assert!(ScrapeCreators::is_transient(502, "bad gateway"));
+        assert!(ScrapeCreators::is_transient(503, "service unavailable"));
+        assert!(ScrapeCreators::is_transient(504, "gateway timeout"));
+        assert!(ScrapeCreators::is_transient(429, "too many requests"));
+    }
+
+    #[test]
+    fn a_permanent_condition_is_not_retryable() {
+        // 这些重试一百次都一样：搜不到就是搜不到、key 错了就是错了、
+        // 参数不对得让模型改。
+        assert!(!ScrapeCreators::is_transient(404, "not_found"));
+        assert!(!ScrapeCreators::is_transient(400, "missing_parameter"));
+        assert!(!ScrapeCreators::is_transient(401, "unauthorized"));
+        assert!(!ScrapeCreators::is_transient(403, "forbidden"));
+    }
+
+    #[test]
+    fn a_500_that_is_not_a_connect_error_is_not_retried() {
+        // 上游真的挂了和「连不上」不一样。只认明确说了连接问题的那种，
+        // 免得对着一个稳定失败的 500 白重试。
+        assert!(!ScrapeCreators::is_transient(
+            500,
+            "internal error: null pointer"
+        ));
+    }
+
+    #[test]
+    fn the_internal_retry_marker_never_leaks_into_a_user_facing_message() {
+        // RETRY_MARK 只在 get_with / get_once 之间活一瞬间。
+        // 漏出去的话，模型和用户会看到 "__retry__HTTP 500: ..." 这种东西。
+        assert!(RETRY_MARK.starts_with("__"), "标记要一眼看得出是内部的");
+        let leaked = format!("{RETRY_MARK}HTTP 500: boom");
+        assert_eq!(
+            leaked.trim_start_matches(RETRY_MARK),
+            "HTTP 500: boom",
+            "摘除逻辑要能把它干净地去掉"
+        );
     }
 }

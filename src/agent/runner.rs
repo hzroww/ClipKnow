@@ -92,6 +92,11 @@ pub struct TurnResult {
     pub tool_calls_made: usize,
     /// SC 实际扣的 credit 合计。不等于 `tool_calls_made`——失败的不扣费。
     pub credits_charged: i64,
+    /// 退出时最后一次请求的**真实** prompt_tokens（provider 报的）。
+    ///
+    /// 调用方拿它判断「历史是不是快满了」，不用自己再 load_history 一遍
+    /// 用另一套估算公式去猜。
+    pub context_tokens: usize,
     /// `stop_reason` 和 `tool_calls` 不一致的次数。
     ///
     /// 两种：说 EndTurn 却给了工具请求、说 ToolUse 却没给。
@@ -153,9 +158,14 @@ fn est_messages(msgs: &[Msg]) -> usize {
         .map(|m| match m {
             Msg::User(t) => est_tokens(t),
             Msg::Assistant {
-                text, tool_calls, ..
+                text,
+                reasoning,
+                tool_calls,
             } => {
+                // reasoning 也占上下文。加字段时用 `..` 让编译通过了，
+                // 忘了补这里——而低估是危险的那一边。
                 est_tokens(text)
+                    + est_tokens(reasoning)
                     + tool_calls
                         .iter()
                         .map(|c| est_tokens(&c.args.to_string()) + 8)
@@ -268,6 +278,7 @@ pub fn run_turn(
         iterations: 0,
         tool_calls_made: 0,
         credits_charged: 0,
+        context_tokens: 0,
         inconsistent_stop_reasons: 0,
         input_tokens: 0,
         cached_input_tokens: 0,
@@ -335,6 +346,7 @@ pub fn run_turn(
         //   后面判断上下文预算用它当基准，而不是拿字符去猜——
         //   字符估算对英文能差 3.6 倍，而这个数是准的。
         real_prompt_tokens = resp.input_tokens as usize;
+        res.context_tokens = real_prompt_tokens;
         settled_msgs = messages.len();
         res.output_tokens += resp.output_tokens;
 
@@ -353,12 +365,27 @@ pub fn run_turn(
         match &resp.stop_reason {
             StopReason::MaxTokens => {
                 // 答案照给（残缺也比没有好），但标成截断。
-                // 被砍掉的 tool_calls 参数可能缺字段，所以也不执行工具。
+                // 被砍掉的 tool_calls 参数可能缺字段，所以不执行工具——
+                // 但**必须补上配对的结果**，见 pair_unexecuted 的注释。
+                pair_unexecuted(
+                    &mut res.items,
+                    &mut idx,
+                    iteration as i64,
+                    &resp,
+                    TRUNCATED_CALL,
+                );
                 res.answer = resp.text;
                 res.outcome = TurnOutcome::Truncated;
                 return res;
             }
             StopReason::Other(r) => {
+                pair_unexecuted(
+                    &mut res.items,
+                    &mut idx,
+                    iteration as i64,
+                    &resp,
+                    PROTOCOL_CALL,
+                );
                 res.answer = resp.text;
                 res.outcome = TurnOutcome::ProtocolError(format!("没见过的 stop_reason: {r}"));
                 return res;
@@ -396,7 +423,10 @@ pub fn run_turn(
                 (BUDGET_EXHAUSTED.to_string(), true, None, None, Some(0))
             } else {
                 let out = execute(api, store, call);
-                res.tool_calls_made += 1;
+                // ★ 加 external_calls 而不是固定加 1：fetch_video 内部打三个端点，
+                //   命中缓存打 0 个。原来固定加 1，max_tool_calls: 25 实际能放出
+                //   75 次 SC 调用，成本闸门的数字就没意义了。
+                res.tool_calls_made += out.external_calls;
                 res.credits_charged += out.credits_charged.unwrap_or(0);
                 (
                     out.result.content,
@@ -424,6 +454,34 @@ pub fn run_turn(
                 is_error,
             }));
         }
+    }
+}
+
+const TRUNCATED_CALL: &str =
+    "没有执行：模型这一轮的回答达到长度上限被截断了，工具请求的参数可能不完整。";
+const PROTOCOL_CALL: &str = "没有执行：模型返回了没见过的结束原因，这一轮中止。";
+
+/// 给「开了单但没执行」的工具请求补上配对的结果。
+///
+/// `settle_assistant` 会先把 assistant 消息和所有 `function_call` 写进 items，
+/// 之后才检查 `stop_reason`。撞 MaxTokens 直接返回的话，那些 call 一个 output
+/// 都没有——**违反 tool 配对不变量**，而这些 outcome 是要落库的。
+///
+/// 后果会叠加：下次 `--continue` 把这段读出来发给模型，请求直接 400。
+/// （现在 `load_history` 会跳过 failed turn，算第二道防线；但历史本身
+/// 就不该是坏的。）
+fn pair_unexecuted(
+    items: &mut Vec<Item>,
+    idx: &mut i64,
+    iteration: i64,
+    resp: &crate::agent::llm::ModelResponse,
+    why: &str,
+) {
+    for call in &resp.tool_calls {
+        items.push(Item::function_call_output(
+            *idx, iteration, &call.id, why, true, None,
+        ));
+        *idx += 1;
     }
 }
 
@@ -1209,5 +1267,124 @@ mod tests {
     fn a_normal_question_echoes_without_noise() {
         let e = echo_received("找科普博主");
         assert!(!e.contains("<"), "干净的输入不该有转义标记: {e}");
+    }
+
+    #[test]
+    fn a_multi_endpoint_tool_costs_more_than_one_against_the_budget() {
+        // fetch_video 内部打三个端点。原来固定按 1 次记，
+        // 于是 max_tool_calls: 25 实际能放出 75 次 SC 调用。
+        struct ThreeShot {
+            calls: RefCell<usize>,
+        }
+        impl DiscoveryApi for ThreeShot {
+            fn call(&self, _: Endpoint, p: Platform, _: &str) -> Result<RawResponse> {
+                *self.calls.borrow_mut() += 1;
+                Ok(RawResponse {
+                    endpoint: p.as_str().into(),
+                    body: json!({"videos": []}),
+                })
+            }
+            fn fetch_video(&self, _: &ParsedUrl, _: &str) -> Result<FetchedVideo> {
+                unreachable!()
+            }
+        }
+        // 直接验 ToolOutcome 的 external_calls 被累加进去：
+        // 用 search_videos（1 次）跑满预算，看总数正好等于上限
+        let cfg = LoopConfig {
+            max_tool_calls: 3,
+            ..LoopConfig::default()
+        };
+        let script: Vec<ModelResponse> = (0..6)
+            .map(|_| wants("搜", &[("search_videos", "词")]))
+            .collect();
+        let llm = MockLlm::new(script);
+        let api = ThreeShot {
+            calls: RefCell::new(0),
+        };
+        let out = run_turn(&llm, &api, &mut st(), &[], "问题", &cfg);
+
+        assert_eq!(
+            *api.calls.borrow(),
+            3,
+            "打出去的次数该正好等于上限，实际 {}",
+            api.calls.borrow()
+        );
+        assert_eq!(out.tool_calls_made, 3);
+    }
+
+    #[test]
+    fn a_truncated_response_still_pairs_its_tool_calls() {
+        // settle_assistant 先把 function_call 塞进 items，之后才检查 stop_reason。
+        // 撞 MaxTokens 直接 return 的话，那些 call 一个 output 都没有——
+        // 违反配对不变量，而 Truncated 是要落库的。
+        // 下次 --continue 读出来（如果不过滤 failed）发出去直接 400。
+        let mut r = wants(
+            "我搜一下",
+            &[("search_videos", "科普"), ("search_videos", "科学")],
+        );
+        r.stop_reason = StopReason::MaxTokens;
+        let llm = MockLlm::new(vec![r]);
+        let api = FakeApi::default();
+        let out = run_turn(&llm, &api, &mut st(), &[], "问题", &cfg());
+
+        assert!(matches!(out.outcome, TurnOutcome::Truncated));
+        assert_eq!(*api.calls.borrow(), 0, "被截断的工具请求不执行");
+
+        let calls = out
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::FunctionCall)
+            .count();
+        let outs = out
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::FunctionCallOutput)
+            .count();
+        assert_eq!(
+            (calls, outs),
+            (2, 2),
+            "开了单就得有结果，哪怕结果是「没执行」"
+        );
+        // 而且要说清为什么没执行
+        assert!(
+            out.items
+                .iter()
+                .any(|i| i.kind == ItemKind::FunctionCallOutput
+                    && i.payload["content"].as_str().unwrap_or("").contains("截断")),
+            "结果里要写明是回答被截断导致没执行"
+        );
+    }
+
+    #[test]
+    fn the_estimator_counts_reasoning_content_too() {
+        // 加 reasoning 字段时用 `..` 让编译通过了，没回头补估算。
+        // 低估是危险的那一边。
+        let short = [Msg::Assistant {
+            text: "答".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+        }];
+        let long = [Msg::Assistant {
+            text: "答".into(),
+            reasoning: "这是一段很长的思考过程".repeat(50),
+            tool_calls: vec![],
+        }];
+        assert!(
+            est_messages(&long) > est_messages(&short) + 100,
+            "带思考的该明显更长：{} vs {}",
+            est_messages(&long),
+            est_messages(&short)
+        );
+    }
+
+    #[test]
+    fn the_turn_reports_the_real_context_size_at_exit() {
+        // main.rs 原来自己再 load_history 一遍、用一套过时的估算公式来判断
+        // 「要不要提醒快满了」。而 run_turn 手上有 provider 报的真实值。
+        let mut r = says("答案");
+        r.input_tokens = 12_345;
+        let llm = MockLlm::new(vec![r]);
+        let out = run_turn(&llm, &FakeApi::default(), &mut st(), &[], "问题", &cfg());
+        assert_eq!(out.context_tokens, 12_345);
     }
 }

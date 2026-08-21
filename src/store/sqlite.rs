@@ -413,11 +413,18 @@ impl SqliteStore {
     ///
     /// **刻意不取 `raw_json`**：这个查询每轮循环都要跑一次，
     /// 而单条 SC 原始响应能有 2MB，带上就是每轮白读一遍再扔掉。
+    ///
+    /// **只取 `status='done'` 的 turn。** 失败的 turn 不进下一次提问的上下文：
+    ///   - 贵：一次撞迭代上限的 turn 可能攒了几万 token
+    ///   - 误导：模型看到「我上次试了这堆方向都没成」，可能重走死路
+    ///   - 危险：截断的 turn 里可能有没配对的 function_call，发出去直接 400
+    ///
+    /// 但它们还在库里，`list_turns` / `get_raw_json` 照样查得到。
     pub fn load_history(&self, session_id: &str) -> Result<Vec<Item>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.idx, i.item_type, i.iteration, i.call_id, i.payload_json
              FROM items i JOIN turns t ON t.id = i.turn_id
-             WHERE t.session_id = ?1
+             WHERE t.session_id = ?1 AND t.status = 'done'
              ORDER BY t.seq, i.idx",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
@@ -434,6 +441,20 @@ impl SqliteStore {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 历史有多少条。口径和 `load_history` 一致（只数 done 的）。
+    ///
+    /// `--continue` 时只想打印个条数，为此把几万字符的 payload 读出来再数一遍
+    /// 是浪费。
+    pub fn count_history(&self, session_id: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM items i JOIN turns t ON t.id = i.turn_id
+             WHERE t.session_id = ?1 AND t.status = 'done'",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// 单独取某次工具调用的原始响应。调试和补解析用，永不进上下文。
@@ -607,6 +628,89 @@ mod tests {
 
         let back = st.load_history(&sid).unwrap();
         assert_eq!(back[0].payload["reasoning"], "思考：先搜关键词");
+    }
+
+    #[test]
+    fn load_history_skips_failed_turns() {
+        // 失败的 turn 不该进下一次提问的上下文：
+        //   贵 —— 一次撞迭代上限的 turn 可能攒了几万 token
+        //   误导 —— 模型会看到「我上次试了这堆方向都没成」，可能重走死路
+        //   危险 —— 截断的 turn 里可能有没配对的 function_call，发出去直接 400
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "成功那次")])
+            .unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Failed("超过迭代上限".into()),
+            &[
+                user_item(1, "失败那次"),
+                call_item(2, 1, "orphan", "search_videos"),
+            ],
+        )
+        .unwrap();
+        st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "又一次成功")])
+            .unwrap();
+
+        let h = st.load_history(&sid).unwrap();
+        assert_eq!(h.len(), 2, "只该有两条 done 的");
+        assert_eq!(h[0].payload["text"], "成功那次");
+        assert_eq!(h[1].payload["text"], "又一次成功");
+    }
+
+    #[test]
+    fn a_failed_turn_is_still_inspectable_even_though_history_skips_it() {
+        // 不进上下文 ≠ 删掉。调试时还要能查。
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        let tid = st
+            .save_turn(
+                &sid,
+                "m",
+                TurnStatus::Failed("崩了".into()),
+                &[out_item(1, 1, "c1", "内容", r#"{"raw":true}"#)],
+            )
+            .unwrap();
+
+        assert!(st.load_history(&sid).unwrap().is_empty(), "不进上下文");
+        assert_eq!(st.list_turns(&sid).unwrap().len(), 1, "但列得出来");
+        assert!(
+            st.get_raw_json(&tid, "c1").unwrap().is_some(),
+            "原始响应还在"
+        );
+    }
+
+    #[test]
+    fn count_history_does_not_load_the_payloads() {
+        // --continue 时只想打印「有几条历史」，为了一个数字把几万字符读出来
+        // 再数一遍是浪费。
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Done,
+            &[user_item(1, "a"), Item::assistant_message(2, 1, "b")],
+        )
+        .unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Failed("x".into()),
+            &[user_item(1, "c")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            st.count_history(&sid).unwrap(),
+            2,
+            "和 load_history 的口径一致"
+        );
+        assert_eq!(
+            st.count_history(&sid).unwrap(),
+            st.load_history(&sid).unwrap().len()
+        );
     }
 
     #[test]

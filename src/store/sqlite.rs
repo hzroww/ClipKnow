@@ -6,6 +6,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use crate::agent::compaction::{History, TurnItems};
 use crate::content::model::{
     Artifact, ArtifactKind, Comment, FetchStatus, FetchedVideo, Item, ItemKind, Session,
     Transcript, Turn, TurnStatus, Video, new_id, now_ts,
@@ -37,6 +38,7 @@ impl SqliteStore {
         conn.execute_batch(include_str!("../../migrations/001_init.sql"))?;
         migrate_drop_video_raw_json(&conn)?;
         conn.execute_batch(include_str!("../../migrations/002_agent_loop.sql"))?;
+        migrate_add_turn_summary(&conn)?;
         Ok(Self { conn })
     }
 }
@@ -49,6 +51,35 @@ impl SqliteStore {
 ///
 /// 幂等：列已经不在就直接返回，所以新建的库跑到这里什么都不做。
 /// 搬运用 `INSERT OR IGNORE`，已经有 detail 记录的视频不会被覆盖。
+/// 给 turns 加 summary / summarized_upto 两列。
+///
+/// `ALTER TABLE ADD COLUMN` 在 SQLite 里不支持 IF NOT EXISTS，所以先查 PRAGMA。
+/// 和 001 那批不一样——那些是 CREATE TABLE IF NOT EXISTS，重复跑没事。
+/// 一行 → Item。`off` 是列偏移（分组查询多了一列 seq）。
+fn row_to_item(r: &rusqlite::Row, off: usize) -> rusqlite::Result<Item> {
+    let kind_str: String = r.get(off + 1)?;
+    let payload_str: String = r.get(off + 4)?;
+    Ok(Item {
+        idx: r.get(off)?,
+        // 不认识的类型当普通 assistant 消息处理，不让一条脏数据毁掉整个会话
+        kind: ItemKind::from_db(&kind_str).unwrap_or(ItemKind::AssistantMessage),
+        iteration: r.get(off + 2)?,
+        call_id: r.get(off + 3)?,
+        payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
+        raw_json: None,
+    })
+}
+
+fn migrate_add_turn_summary(conn: &Connection) -> Result<()> {
+    let has: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('turns') WHERE name = 'summary'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch(include_str!("../../migrations/003_compaction.sql"))?;
+    }
+    Ok(())
+}
+
 fn migrate_drop_video_raw_json(conn: &Connection) -> Result<()> {
     let has_col = conn
         .prepare("PRAGMA table_info(videos)")?
@@ -421,26 +452,92 @@ impl SqliteStore {
     ///
     /// 但它们还在库里，`list_turns` / `get_raw_json` 照样查得到。
     pub fn load_history(&self, session_id: &str) -> Result<Vec<Item>> {
+        // 有摘要的话：摘要顶在最前面，它覆盖的 turn 全部跳过
+        let compaction = self.latest_compaction(session_id)?;
+        let floor = compaction.as_ref().map(|(_, u)| *u).unwrap_or(0);
+
         let mut stmt = self.conn.prepare(
             "SELECT i.idx, i.item_type, i.iteration, i.call_id, i.payload_json
              FROM items i JOIN turns t ON t.id = i.turn_id
-             WHERE t.session_id = ?1 AND t.status = 'done'
+             WHERE t.session_id = ?1 AND t.status = 'done' AND t.seq > ?2
              ORDER BY t.seq, i.idx",
         )?;
-        let rows = stmt.query_map(params![session_id], |r| {
-            let kind_str: String = r.get(1)?;
-            let payload_str: String = r.get(4)?;
-            Ok(Item {
-                idx: r.get(0)?,
-                // 不认识的类型当普通 assistant 消息处理，不让一条脏数据毁掉整个会话
-                kind: ItemKind::from_db(&kind_str).unwrap_or(ItemKind::AssistantMessage),
-                iteration: r.get(2)?,
-                call_id: r.get(3)?,
-                payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
-                raw_json: None,
-            })
+        let rows = stmt.query_map(params![session_id, floor], |r| row_to_item(r, 0))?;
+        let mut out: Vec<Item> = Vec::new();
+        if let Some((summary, _)) = compaction {
+            // 摘要以一条 user_message 的形式进上下文。用 user 而不是 assistant，
+            // 是因为它是「运行时提供的材料」，不是模型自己说过的话。
+            out.push(Item::user_message(0, &summary));
+        }
+        out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        Ok(out)
+    }
+
+    /// 记一次压缩：摘要文本 + 它覆盖到哪个 turn.seq（含）。
+    ///
+    /// 挂在**最新那个 turn** 上，所以「始终只有一个摘要」——第二次压缩会写到
+    /// 更新的 turn 上，`load_history` 只认最新的那条，旧的自然失效。
+    /// 不是「摘要A + 摘要B」叠加。
+    ///
+    /// **不动 items。** 摘要只影响读出来给模型的历史，存档一个字不改：
+    /// 这样压缩可回退（清空两列就恢复原状），也不破坏存档的忠实性。
+    pub fn save_compaction(&mut self, session_id: &str, summary: &str, upto: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE turns SET summary = ?2, summarized_upto = ?3
+             WHERE id = (SELECT id FROM turns WHERE session_id = ?1
+                         ORDER BY seq DESC LIMIT 1)",
+            params![session_id, summary, upto],
+        )?;
+        Ok(())
+    }
+
+    /// 最新的摘要：(摘要文本, 覆盖到哪个 seq)。
+    fn latest_compaction(&self, session_id: &str) -> Result<Option<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT summary, summarized_upto FROM turns
+             WHERE session_id = ?1 AND summary IS NOT NULL
+             ORDER BY seq DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        Ok(match rows.next()? {
+            Some(r) => Some((r.get(0)?, r.get(1)?)),
+            None => None,
+        })
+    }
+
+    /// 按 turn 分组的历史，给切点选择用。已过滤失败的 turn。
+    ///
+    /// 被摘要覆盖的 turn 不读原文，**但摘要本身要一起带出去**——只跳过不带回，
+    /// 压缩就成了「把旧 turn 直接删掉」。
+    pub fn load_turns_with_items(&self, session_id: &str) -> Result<History> {
+        let compaction = self.latest_compaction(session_id)?;
+        let floor = compaction.as_ref().map(|(_, u)| *u).unwrap_or(0);
+        let mut stmt = self.conn.prepare(
+            "SELECT t.seq, i.idx, i.item_type, i.iteration, i.call_id, i.payload_json
+             FROM items i JOIN turns t ON t.id = i.turn_id
+             WHERE t.session_id = ?1 AND t.status = 'done' AND t.seq > ?2
+             ORDER BY t.seq, i.idx",
+        )?;
+        let rows = stmt.query_map(params![session_id, floor], |r| {
+            let seq: i64 = r.get(0)?;
+            Ok((seq, row_to_item(r, 1)?))
         })?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let mut turns: Vec<TurnItems> = Vec::new();
+        for row in rows {
+            let (seq, item) = row?;
+            match turns.last_mut() {
+                Some(t) if t.seq == seq => t.items.push(item),
+                _ => turns.push(TurnItems {
+                    seq,
+                    items: vec![item],
+                }),
+            }
+        }
+        Ok(History {
+            summary: compaction.as_ref().map(|(s, _)| s.clone()),
+            summary_upto: floor,
+            turns,
+        })
     }
 
     /// 历史有多少条。口径和 `load_history` 一致（只数 done 的）。
@@ -457,7 +554,8 @@ impl SqliteStore {
         Ok(n as usize)
     }
 
-    /// 单独取某次工具调用的原始响应。调试和补解析用，永不进上下文。
+    /// 单独取某次工具调用的原始响应。
+    ///调试和补解析用，永不进上下文。
     ///
     /// **按 turn 定位，不是按 session**：`call_id` 是模型生成的，实测 `call_00_`
     /// 这个前缀每一轮都从 0 重新开始，只有后缀是随机的。我们只能假设它在一轮
@@ -711,6 +809,145 @@ mod tests {
             st.count_history(&sid).unwrap(),
             st.load_history(&sid).unwrap().len()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 上下文压缩
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_summary_replaces_the_turns_it_covers_when_loading_history() {
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        for i in 1..=4 {
+            st.save_turn(
+                &sid,
+                "m",
+                TurnStatus::Done,
+                &[user_item(1, &format!("第{i}问"))],
+            )
+            .unwrap();
+        }
+        // 摘要覆盖前两个 turn
+        st.save_compaction(&sid, "这是摘要", 2).unwrap();
+
+        let h = st.load_history(&sid).unwrap();
+        assert_eq!(h.len(), 3, "摘要一条 + 后两个 turn 各一条");
+        assert!(
+            h[0].payload["text"].as_str().unwrap().contains("这是摘要"),
+            "摘要该排在最前面: {:?}",
+            h[0].payload
+        );
+        assert_eq!(h[1].payload["text"], "第3问");
+        assert_eq!(h[2].payload["text"], "第4问");
+    }
+
+    #[test]
+    fn compaction_does_not_touch_the_original_items() {
+        // 压缩只影响「读出来给模型的历史」，存档一个字不改。
+        // 这样它是可回退的，也不破坏存档的忠实性。
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "原始内容")])
+            .unwrap();
+        st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "第二问")])
+            .unwrap();
+        st.save_compaction(&sid, "摘要", 1).unwrap();
+
+        let n: i64 = st
+            .conn
+            .query_row("SELECT count(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "items 行数不变");
+        let raw: String = st
+            .conn
+            .query_row(
+                "SELECT payload_json FROM items ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw.contains("原始内容"), "原始条目还在: {raw}");
+    }
+
+    #[test]
+    fn a_second_compaction_replaces_the_first_instead_of_stacking() {
+        // 始终只有一个摘要，它往前推进。不是「摘要A + 摘要B」堆起来。
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        for i in 1..=5 {
+            st.save_turn(
+                &sid,
+                "m",
+                TurnStatus::Done,
+                &[user_item(1, &format!("第{i}问"))],
+            )
+            .unwrap();
+        }
+        st.save_compaction(&sid, "第一次摘要", 2).unwrap();
+        st.save_compaction(&sid, "第二次摘要", 4).unwrap();
+
+        let h = st.load_history(&sid).unwrap();
+        assert_eq!(h.len(), 2, "新摘要一条 + 第5问");
+        let s = h[0].payload["text"].as_str().unwrap();
+        assert!(s.contains("第二次摘要"));
+        assert!(!s.contains("第一次摘要"), "旧摘要该被替换掉，不是叠加");
+    }
+
+    #[test]
+    fn turns_grouped_for_the_splitter_skip_failed_ones_and_apply_the_summary() {
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "一")])
+            .unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Failed("崩".into()),
+            &[user_item(1, "二")],
+        )
+        .unwrap();
+        st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "三")])
+            .unwrap();
+
+        let g = st.load_turns_with_items(&sid).unwrap();
+        assert_eq!(g.turns.len(), 2, "失败的不算");
+        assert_eq!(g.turns[0].seq, 1);
+        assert_eq!(g.turns[1].seq, 3);
+    }
+
+    #[test]
+    fn grouped_history_carries_the_summary_along_with_the_turns() {
+        // 摘要跟 turn 一起读出来。只跳过被覆盖的 turn、不把摘要带回去，
+        // 压缩就成了「把旧 turn 直接删掉」——库里存着，上下文里没有。
+        let mut st = mem();
+        let sid = st.create_session(None).unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Done,
+            &[Item::user_message(1, "第一问")],
+        )
+        .unwrap();
+        st.save_turn(
+            &sid,
+            "m",
+            TurnStatus::Done,
+            &[Item::user_message(1, "第二问")],
+        )
+        .unwrap();
+        st.save_compaction(&sid, "[历史摘要] 覆盖第 1 次提问", 1)
+            .unwrap();
+
+        let h = st.load_turns_with_items(&sid).unwrap();
+        assert_eq!(h.summary.as_deref(), Some("[历史摘要] 覆盖第 1 次提问"));
+        assert_eq!(h.summary_upto, 1);
+        assert_eq!(h.turns.len(), 1, "被覆盖的 turn 不读原文");
+        assert_eq!(h.turns[0].seq, 2);
+
+        // 拍平后摘要在最前面
+        let items = h.to_items();
+        assert!(items[0].payload.to_string().contains("历史摘要"));
     }
 
     #[test]

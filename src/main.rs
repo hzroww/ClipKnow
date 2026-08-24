@@ -292,7 +292,10 @@ fn one_turn(
     session_id: &str,
     question: &str,
 ) -> Result<()> {
-    let history = store.load_history(session_id)?;
+    // 按 turn 分组传进去：压缩要按 turn 边界切，扁平的条目列表没有这个信息。
+    // 这个查询已经过滤了失败的 turn，也已跳过被摘要覆盖的部分。
+    let history = store.load_turns_with_items(session_id)?;
+    let is_first_turn = history.is_empty();
     let res = run_turn(llm, api, store, &history, question, cfg);
 
     let status = match &res.outcome {
@@ -308,8 +311,13 @@ fn one_turn(
     // 上下文闸门是在发请求之前拦下的，这一轮什么都没发生，不必落库
     if !matches!(res.outcome, TurnOutcome::ContextBudget { .. }) {
         store.save_turn(session_id, llm.model_name(), status, &res.items)?;
+        // 压缩也在终态落库。摘要必须在 save_turn 之后写——它挂在最新那个
+        // turn 上，而那个 turn 是 save_turn 刚建的。
+        if let Some((text, upto)) = &res.pending_summary {
+            store.save_compaction(session_id, text, *upto)?;
+        }
         // 第一次提问顺手拿它当标题，`clipknow sessions` 才认得出是哪次
-        if history.is_empty() {
+        if is_first_turn {
             store.set_session_title(session_id, &truncate_chars(question, 40))?;
         }
     }

@@ -63,6 +63,47 @@ pub fn to_messages(items: &[Item]) -> Vec<Msg> {
     out
 }
 
+/// 把条目渲染成给摘要模型看的纯文本记录。
+///
+/// **不做逐条截断。** 参照的实现把工具输出砍到 500 字符，那是被它自己的
+/// 256K 窗口逼的；我们阈值 40 万、目标 15 万，前缀约 25 万 token，
+/// 而窗口是 1M，放得下。砍了只会让摘要模型看不到候选名单的全貌——
+/// 它就总结不出「我核实过这几个人」。
+pub fn to_transcript(items: &[Item]) -> String {
+    let mut out = String::new();
+    for it in items {
+        match it.kind {
+            ItemKind::UserMessage => {
+                out.push_str(&format!("【用户】{}\n", str_field(it, "text")));
+            }
+            ItemKind::AssistantMessage => {
+                let r = str_field(it, "reasoning");
+                if !r.is_empty() {
+                    out.push_str(&format!("【助手思考】{r}\n"));
+                }
+                let t = str_field(it, "text");
+                if !t.is_empty() {
+                    out.push_str(&format!("【助手】{t}\n"));
+                }
+            }
+            ItemKind::FunctionCall => {
+                out.push_str(&format!(
+                    "【调用工具】{} {}\n",
+                    str_field(it, "name"),
+                    it.payload
+                        .get("args")
+                        .map(|a| a.to_string())
+                        .unwrap_or_default()
+                ));
+            }
+            ItemKind::FunctionCallOutput => {
+                out.push_str(&format!("【工具结果】{}\n", str_field(it, "content")));
+            }
+        }
+    }
+    out
+}
+
 fn str_field(it: &Item, key: &str) -> String {
     it.payload
         .get(key)

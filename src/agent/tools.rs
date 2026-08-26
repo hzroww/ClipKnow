@@ -111,7 +111,10 @@ pub fn tool_defs() -> Vec<ToolDef> {
             description: "把一条视频看完：元数据 + 文字稿 + 高赞评论 + **画面内容**。\
                 要说清某条视频讲了什么就用它——标题和 hashtag 经常完全没有信息量\
                 （实测有的视频标题就是 `#Science #earth`，一个字的内容都没有）。\
-                比上面几个慢，也贵一些。"
+                \n⚠️ 成本：**一次调用要打 3 个外部端点**（详情/文字稿/评论），\
+                是上面几个搜索工具的 3 倍；第一次看某条视频还会额外做一次画面分析。\
+                同一条视频再调不花钱（走缓存）。所以先用搜索缩到 2–3 个候选，\
+                再对候选调这个，不要挨个都调。"
                 .into(),
             params: schema(
                 json!({
@@ -144,8 +147,36 @@ fn dur(v: Option<i64>) -> String {
 /// TikTok 的 `share_url` 后面挂着 `_r` / `u_code` / `share_item_id` 等 6 个
 /// 跟踪参数，150+ 字符里 100+ 是垃圾。30 条就是 3000+ 字符的纯浪费，
 /// 而且模型可能把这些参数当成有意义的信息。
-fn clean_url(u: &str) -> &str {
-    u.split('?').next().unwrap_or(u)
+/// 去掉链接里的追踪参数，但**保住 YouTube 的 video id**。
+///
+/// ⚠️ 原来是无脑 `u.split('?').next()`。TikTok 的 `share_url` 带一串
+/// `?_r=1&u_code=…&preview_pb=0` 追踪参数，砍掉是对的；但 **YouTube 的
+/// video id 就在 query 里**（`?v=UZvJzKNJ3dY`），砍掉就只剩
+/// `https://www.youtube.com/watch`。
+///
+/// 2026-08-26 实测的后果：一次会话里 20 条 YouTube 搜索结果的链接全是同一个
+/// `https://www.youtube.com/watch`，模型没有可用链接，于是**编了一个**
+/// （`?v=UNKNOWN_espn_0`），SC 返回 404。那一轮 9 次搜索里 6 次是 YouTube，
+/// 结果全部作废，预算全烧在 TikTok 上。
+fn clean_url(platform: Platform, u: &str) -> String {
+    match platform {
+        // 只保留 v 参数，别的（si= t= pp= 之类）都是追踪或播放位置
+        Platform::YouTube => match extract_query_value(u, "v") {
+            Some(id) => format!("https://www.youtube.com/watch?v={id}"),
+            // 不是 /watch?v= 形式（比如 /shorts/xxx），原样留着
+            None => u.split('?').next().unwrap_or(u).to_string(),
+        },
+        // TikTok / Instagram 的 ID 在路径里，query 全是追踪参数
+        Platform::TikTok | Platform::Instagram => u.split('?').next().unwrap_or(u).to_string(),
+    }
+}
+
+fn extract_query_value(u: &str, key: &str) -> Option<String> {
+    let q = u.split_once('?')?.1;
+    q.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key && !v.is_empty()).then(|| v.to_string())
+    })
 }
 
 fn date(v: Option<i64>) -> String {
@@ -175,7 +206,7 @@ pub fn render_videos(items: &[VideoSummary]) -> String {
             num(v.comment_count),
             dur(v.duration_sec),
             date(v.published_at),
-            clean_url(&v.url),
+            clean_url(v.platform, &v.url),
         ));
         // TikTok 没有独立标题，title 和 description 都取自 desc——
         // 一样时只输出一次。实测 TikTok 给模型的文本曾是 YouTube 的 2.5 倍，
@@ -605,7 +636,10 @@ fn look_at_video(
         return VisualOutcome::unavailable("未配置视觉模型（设置 DASHSCOPE_API_KEY 后可用）");
     };
     if ctx.vision_budget_left == 0 {
-        return VisualOutcome::unavailable("本次提问的视频分析预算已用尽");
+        return VisualOutcome::unavailable(
+            "本次提问的视频分析预算已用尽——后续 fetch_video 只能拿到文字稿和评论，\
+             不会再有画面内容。要看画面请让用户换一次提问。",
+        );
     }
     if parsed.platform == crate::ingest::url::Platform::YouTube {
         // 不是解析失败，是这条路根本不存在：SC 的 YouTube 端点只给
@@ -2235,5 +2269,94 @@ mod tests {
         );
         assert_eq!(out.vision_calls, 0);
         assert!(v.seen.borrow().is_empty(), "上传没成，不该走到分析");
+    }
+    // -----------------------------------------------------------------
+    // 链接清理（2026-08-26 实测撞出来的 bug）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_youtube_link_keeps_its_video_id() {
+        // ★ 回归测试。原来无脑砍 query，而 YouTube 的 video id 就在 ?v= 里。
+        //   实测后果：一次会话里 20 条 YouTube 搜索结果的链接全是同一个
+        //   https://www.youtube.com/watch，模型没链接可用于是编了一个
+        //   ?v=UNKNOWN_espn_0，SC 返回 404。
+        let u = "https://www.youtube.com/watch?v=UZvJzKNJ3dY&si=abc&t=42";
+        assert_eq!(
+            clean_url(Platform::YouTube, u),
+            "https://www.youtube.com/watch?v=UZvJzKNJ3dY",
+            "要保住 v，扔掉 si/t 这些追踪和播放位置参数"
+        );
+    }
+
+    #[test]
+    fn a_youtube_link_without_a_v_param_is_left_alone() {
+        // /shorts/xxx 这种形式 ID 在路径里
+        let u = "https://www.youtube.com/shorts/abc123?feature=share";
+        assert_eq!(
+            clean_url(Platform::YouTube, u),
+            "https://www.youtube.com/shorts/abc123"
+        );
+    }
+
+    #[test]
+    fn tiktok_and_instagram_links_get_their_tracking_params_stripped() {
+        // 它们的 ID 在路径里，query 全是追踪参数——实测 TikTok 的 share_url
+        // 带 ?_r=1&u_code=…&preview_pb=0&sharer_language=en，一页 30 条能白占
+        // 上千 token
+        assert_eq!(
+            clean_url(
+                Platform::TikTok,
+                "https://www.tiktok.com/@x/video/7633663452426325278?_r=1&u_code=f0hl341d14hed9"
+            ),
+            "https://www.tiktok.com/@x/video/7633663452426325278"
+        );
+        assert_eq!(
+            clean_url(
+                Platform::Instagram,
+                "https://www.instagram.com/reel/DcRdqZ6gwBa/?igsh=x"
+            ),
+            "https://www.instagram.com/reel/DcRdqZ6gwBa/"
+        );
+    }
+
+    #[test]
+    fn rendered_youtube_results_carry_usable_links() {
+        // 端到端：渲染出来的东西模型必须能直接拿去调 fetch_video
+        let v = VideoSummary {
+            platform: Platform::YouTube,
+            native_id: "UZvJzKNJ3dY".into(),
+            url: "https://www.youtube.com/watch?v=UZvJzKNJ3dY&si=tracking".into(),
+            title: Some("标题".into()),
+            description: None,
+            channel_name: Some("频道".into()),
+            channel_handle: Some("ch".into()),
+            channel_id: Some("UC1".into()),
+            view_count: Some(1),
+            like_count: None,
+            comment_count: None,
+            duration_sec: Some(60),
+            published_at: None,
+        };
+        let out = render_videos(&[v]);
+        assert!(
+            out.contains("?v=UZvJzKNJ3dY"),
+            "模型必须拿到能用的链接: {out}"
+        );
+        assert!(!out.contains("si=tracking"), "追踪参数不该占 token");
+    }
+
+    #[test]
+    fn the_vision_exhausted_message_tells_the_model_what_still_works() {
+        // 只说「用尽了」的话，模型不知道去掉 question 还能拿文字
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 0),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        let c = &out.result.content;
+        assert!(c.contains("预算已用尽"), "{c}");
+        assert!(c.contains("文字稿和评论"), "要说清还能拿到什么: {c}");
     }
 }

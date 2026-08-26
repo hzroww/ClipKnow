@@ -78,9 +78,13 @@ impl Default for LoopConfig {
             compaction_threshold: 400_000,
             // 压完的目标。切点选择用它，不是预测摘要输出多大。
             compaction_target_tokens: 150_000,
-            // 每条约 ¥0.07（1702 秒那种约 ¥0.15），一次提问上限约 ¥0.2–0.45。
-            // 发现流程里模型通常看 2–3 个候选，3 条够用。
-            max_video_analyses: 3,
+            // 每条约 ¥0.07（1702 秒那种约 ¥0.15），一次提问上限约 ¥0.35–0.75。
+            //
+            // 从 3 放宽到 5：实测一次「NBA 对某笔交易什么态度」的提问，模型
+            // 拿视频当新闻源读了 7 条不同视频——那是合理需求不是失控，而 3
+            // 条卡住之后它又白花了三次 fetch_video（9 次 SC 端点）只换回没有
+            // 画面的文字。差价三毛钱，不值得为它把正常用法挡住。
+            max_video_analyses: 5,
         }
     }
 }
@@ -236,6 +240,16 @@ const CONVERGENCE_NOTICE: &str = "\
 
 const BUDGET_EXHAUSTED: &str =
     "外部调用预算已用尽，这个工具没有执行。请用已经拿到的信息作答，并说明哪部分没查成。";
+
+/// 带着 `question` 调 `fetch_video` 但视觉额度已耗尽时的回复。
+///
+/// 说清「不带 question 还能拿文字」是关键——不然模型只知道被拒了，
+/// 不知道还有没有别的路。
+const VISION_EXHAUSTED: &str = "\
+本次提问的视频分析预算已用尽，这个工具没有执行（带 question 是要看画面，\
+而画面已经看不了了，执行下去只会白花外部调用）。\
+如果你只需要这条视频的文字稿和评论，去掉 question 再调一次即可。\
+否则请用已经拿到的信息作答，并说明哪部分没看成。";
 
 /// 尝试压缩一次。**失败返回 `None`，绝不向上抛错**——压缩是优化不是必需品，
 /// fail-open 继续用当前上下文。
@@ -543,9 +557,29 @@ pub fn run_turn(
                 real_prompt_tokens + est_messages(&messages[settled_msgs.min(messages.len())..]);
             let over_context = projected >= cfg.context_budget_tokens;
 
+            // ★ 带着具体问题调 fetch_video，但视觉额度已经用尽——这次调用是
+            //   纯浪费：`question` 的语义就是「我要看画面里的某个细节」，
+            //   给它文字稿答不了，而执行下去要花 3 次 SC 调用。
+            //
+            //   实测过这个浪费：一次提问里视觉额度在第 4 轮耗尽，模型又调了
+            //   三次带 question 的 fetch_video，9 次 SC 端点换回三份没有画面
+            //   的材料。所以在**花钱之前**拦住。
+            //
+            //   不带 question 的照常执行——文字稿和评论本身有价值。
+            let vision_left = cfg.max_video_analyses.saturating_sub(res.video_analyses);
+            let pointless_vision_call = call.name == "fetch_video"
+                && vision_left == 0
+                && call
+                    .args
+                    .get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|q| !q.trim().is_empty());
+
             let (content, is_error, raw, endpoint, credits) = if over_calls || over_context {
                 // ★ 预算用尽也**必须**产出配对的结果，不能跳过。
                 (BUDGET_EXHAUSTED.to_string(), true, None, None, Some(0))
+            } else if pointless_vision_call {
+                (VISION_EXHAUSTED.to_string(), true, None, None, Some(0))
             } else {
                 let out = execute(
                     &mut ToolCtx {
@@ -756,6 +790,23 @@ mod tests {
                     args: json!({"platform": "youtube", "query": q}),
                 })
                 .collect(),
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            output_tokens: 5,
+        }
+    }
+
+    /// 自定义 args 的版本。`wants` 固定塞 platform/query，测 fetch_video 用不了。
+    fn wants_raw(text: &str, name: &str, args: serde_json::Value) -> ModelResponse {
+        ModelResponse {
+            text: text.into(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_00_x".into(),
+                name: name.into(),
+                args,
+            }],
             stop_reason: StopReason::ToolUse,
             input_tokens: 10,
             cached_input_tokens: 0,
@@ -2121,5 +2172,95 @@ mod tests {
         );
         assert_eq!(out.video_analyses, 0);
         assert_eq!(out.video_tokens, 0);
+    }
+    #[test]
+    fn a_question_without_vision_budget_is_refused_before_spending_sc_calls() {
+        // ★ 回归测试。实测过这个浪费：视觉额度在第 4 轮耗尽，模型又调了三次
+        //   带 question 的 fetch_video，9 次 SC 端点换回三份没有画面的材料。
+        //   question 的语义就是「我要看画面」，文字稿答不了。
+        struct CountingApi {
+            fetches: RefCell<usize>,
+        }
+        impl DiscoveryApi for CountingApi {
+            fn call(&self, _: Endpoint, p: Platform, _: &str) -> Result<RawResponse> {
+                Ok(RawResponse {
+                    endpoint: format!("/x/{}", p.as_str()),
+                    body: json!({}),
+                })
+            }
+            fn fetch_video(&self, _: &ParsedUrl, _: &str) -> Result<FetchedVideo> {
+                *self.fetches.borrow_mut() += 1;
+                Err(ClipKnowError::Fetch {
+                    platform: "tiktok".into(),
+                    message: "不该走到这里".into(),
+                })
+            }
+        }
+
+        let api = CountingApi {
+            fetches: RefCell::new(0),
+        };
+        let llm = MockLlm::new(vec![
+            wants_raw(
+                "看一下画面",
+                "fetch_video",
+                json!({"url":"https://www.tiktok.com/@x/video/7","question":"画面里有什么"}),
+            ),
+            says("答案"),
+        ]);
+        let cfg = LoopConfig {
+            max_video_analyses: 0, // 一开始就没额度
+            ..LoopConfig::default()
+        };
+        let out = run_turn(&llm, &api, &mut st(), None, &no_hist(), "问题", &cfg);
+
+        assert_eq!(*api.fetches.borrow(), 0, "不该花任何 SC 调用");
+        assert_eq!(out.tool_calls_made, 0);
+        let refused = out
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::FunctionCallOutput)
+            .expect("必须有配对的结果");
+        let txt = refused.payload.to_string();
+        assert!(txt.contains("预算已用尽"), "{txt}");
+        assert!(txt.contains("去掉 question"), "要告诉模型还有什么路: {txt}");
+    }
+
+    #[test]
+    fn a_fetch_without_a_question_still_runs_when_vision_budget_is_gone() {
+        // 文字稿和评论本身有价值，不能因为看不了画面就整个拒掉
+        let llm = MockLlm::new(vec![
+            wants(
+                "抓一下",
+                &[(
+                    "fetch_video",
+                    r#"{"url":"https://www.tiktok.com/@x/video/7"}"#,
+                )],
+            ),
+            says("答案"),
+        ]);
+        let cfg = LoopConfig {
+            max_video_analyses: 0,
+            ..LoopConfig::default()
+        };
+        let out = run_turn(
+            &llm,
+            &FakeApi::default(),
+            &mut st(),
+            None,
+            &no_hist(),
+            "问题",
+            &cfg,
+        );
+        // FakeApi 的 fetch_video 会 panic，所以走到这里说明真的执行了工具
+        // ——用 outcome 不是 ProtocolError 来间接确认没被提前拒掉
+        assert!(!matches!(out.outcome, TurnOutcome::ProtocolError(_)));
+    }
+
+    #[test]
+    fn the_video_budget_leaves_room_for_reading_several_videos_as_sources() {
+        // 实测一次「NBA 对某笔交易什么态度」的提问，模型拿视频当新闻源读了
+        // 7 条不同视频。3 条太紧，放宽到 5。
+        assert!(LoopConfig::default().max_video_analyses >= 5);
     }
 }

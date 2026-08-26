@@ -735,9 +735,35 @@ fn look_at_video(
                     size_bytes: Some(s.size_bytes),
                     fresh: true,
                 },
-                // 视频太大 / 下载超时 / 上传失败，原因原样带给模型：
-                // 「太大」它会换一条视频，「超时」它可能重试，处置不同。
-                Err(e) => return VisualOutcome::unavailable(format!("{e}")),
+                // 视频太大 / 下载超时 / 上传失败。
+                //
+                // ★ 确定性的失败要记住。「太大」是确定性的——同一条视频永远
+                //   都太大。不记的话每次都可能白下载一遍再扔掉（没有
+                //   Content-Length 的 chunked 响应就是这样，实打实拉满上限）。
+                //
+                //   可重试的（超时、上传 5xx）不记：这时上传还没成功，没有
+                //   引用可省，记一行反而要处理「既不是档案也不是拒绝」的
+                //   第三种状态。
+                Err(e) => {
+                    let reason = format!("{e}");
+                    if crate::agent::vision::is_permanent_failure(&e) {
+                        let row = crate::content::dossier::StoredDossier {
+                            dossier_json: String::new(),
+                            model: vision.model_name().to_string(),
+                            fps: 0.0,
+                            question: None,
+                            video_tokens: None,
+                            created_at: crate::content::model::now_ts(),
+                            provider: Some(provider.to_string()),
+                            // 上传没成功，没有引用可记
+                            staged_ref: None,
+                            staged_expires_at: None,
+                            blocked_reason: Some(reason.clone()),
+                        };
+                        let _ = ctx.store.save_dossier(vid, &row);
+                    }
+                    return VisualOutcome::unavailable(reason);
+                }
             }
         }
     };
@@ -2566,5 +2592,53 @@ mod tests {
             .count_for_test("SELECT count(*) FROM transcripts")
             .unwrap();
         assert_eq!(n, 1);
+    }
+    #[test]
+    fn a_video_too_large_to_download_is_remembered() {
+        // ★「太大」是确定性失败——同一条视频永远都太大。不记的话每次都可能
+        //   白下载一遍再扔掉（chunked 响应没有 Content-Length 时，会实打实
+        //   拉到上限才发现）。
+        let api = tt_api();
+        let mut st = store();
+        let v =
+            MockVision::stage_failing("视频 600.0MB，超过 512MB 下载上限（这条视频太大，换一条）");
+
+        let first = execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(first.result.content.contains("600.0MB"));
+        assert_eq!(*v.staged.borrow(), 1, "第一次要试一下");
+
+        let second = execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(*v.staged.borrow(), 1, "第二次不该再试下载");
+        assert!(
+            second.result.content.contains("600.0MB"),
+            "原因照样告诉模型"
+        );
+    }
+
+    #[test]
+    fn a_transient_stage_failure_is_not_remembered() {
+        // 上传超时这类下次可能就成了。记住会让这条视频的画面永远看不了。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::stage_failing("下载超时");
+        execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        let v2 = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v2, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(*v2.staged.borrow(), 1, "该重试");
+        assert_eq!(out.vision_calls, 1);
+        assert!(out.result.content.contains("讲大脑可塑性"));
     }
 }

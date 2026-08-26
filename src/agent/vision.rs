@@ -234,7 +234,8 @@ const UPLOAD_POLICY_URL: &str =
 ///
 /// **不按文件大小估。** 实测上传耗时和大小不成正比——2.6MB 用了 15.4 秒，
 /// 52.1MB 只用了 8.7 秒，瓶颈在 OSS 端不在带宽。所以给一个固定的宽裕值。
-const UPLOAD_TIMEOUT_SECS: u64 = 400;
+/// 和下载上限（512MB）配套放宽。
+const UPLOAD_TIMEOUT_SECS: u64 = 600;
 
 impl<F: VideoFetcher> QwenVisionClient<F> {
     fn get_policy(&self) -> Result<UploadPolicy> {

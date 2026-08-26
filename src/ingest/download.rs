@@ -20,15 +20,33 @@ use std::time::Duration;
 
 use crate::error::{ClipKnowError, Result};
 
-/// 下载上限。实测样本里最大的一条 TikTok 是 58MB，留一倍余量。
+/// 下载上限。
 ///
-/// 必须有上限：直链是从平台响应里解出来的，一个 2GB 的长视频会把内存
-/// 吃光、把请求体撑爆。超限时返回明确错误，让模型知道这条视频太大，
-/// 而不是让进程 OOM。
-pub const MAX_VIDEO_BYTES: usize = 100 * 1024 * 1024;
+/// **这是我们自己设的，不是上游的限制。** 上游给的余量大得多：
+///   - 上传服务实测报回 `max_file_size_mb = 1024`（1GB）
+///   - 视觉模型自己的上限是 2GB / 1 小时
+///
+/// 卡在 512MB 的理由是**内存**：视频整个进 `Vec<u8>`，再交给 multipart 表单，
+/// 而阻塞式 multipart 会把整个请求体在内存里拼好再发——峰值大约是文件的两倍。
+/// 512MB 意味着最坏约 1GB 峰值，笔记本吃得下。
+///
+/// 现实里够用：实测那批 7–10 分钟的 TikTok 科普长视频是 46–90MB；TikTok 上限
+/// 30 分钟，按同样码率也就 300MB 上下。Instagram Reels 上限 3 分钟，更小。
+///
+/// 早先设的是 100MB，理由是「实测样本最大 58MB，留一倍余量」和「防止内存被
+/// 吃光」。后者当时成立——那一版走 base64 内联，峰值是文件的 2.3 倍；改成
+/// 直传字节之后宽松了很多。
+pub const MAX_VIDEO_BYTES: usize = 512 * 1024 * 1024;
 
-/// 下载超时。实测速度约 1–2 MB/s，100MB 需要 50–100 秒，给到 180 秒。
-pub const DOWNLOAD_TIMEOUT_SECS: u64 = 180;
+/// 下载超时。
+///
+/// **实际上这个数比大小上限更能决定「多大的视频能成」。** 实测速度 1–2 MB/s，
+/// 600 秒能拉 600MB–1.2GB。所以两个数字是绑在一起的：单独提大小上限没意义，
+/// 下载会先超时。
+///
+/// 两种失败给模型的信息不同：「超过上限」是这条视频永远不行，「下载超时」
+/// 可能只是网络慢——所以错误消息要分开写。
+pub const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 
 /// 下载器。抽成 trait 只为了测试能塞假实现——真实现只有一个。
 pub trait VideoFetcher {
@@ -107,7 +125,7 @@ fn too_big(actual: usize, limit: usize) -> ClipKnowError {
     ClipKnowError::Fetch {
         platform: "video-cdn".into(),
         message: format!(
-            "视频 {:.1}MB，超过 {}MB 下载上限",
+            "视频 {:.1}MB，超过 {}MB 下载上限（这条视频太大，换一条）",
             actual as f64 / 1_048_576.0,
             limit / 1_048_576
         ),
@@ -122,14 +140,15 @@ mod tests {
     fn the_limit_message_names_both_numbers() {
         // 给模型看的错误必须能行动：说清「多大」和「上限多少」，
         // 它才知道这是视频太大而不是网络问题，也就不会重试。
-        let e = too_big(340 * 1_048_576, MAX_VIDEO_BYTES).to_string();
-        assert!(e.contains("340.0MB"), "要说实际大小: {e}");
-        assert!(e.contains("100MB"), "要说上限: {e}");
+        let e = too_big(600 * 1_048_576, MAX_VIDEO_BYTES).to_string();
+        assert!(e.contains("600.0MB"), "要说实际大小: {e}");
+        assert!(e.contains("512MB"), "要说上限: {e}");
+        assert!(e.contains("换一条"), "要给一句能行动的话: {e}");
     }
 
-    /// 实测样本最大 58MB（TikTok 科普类长视频）。上限贴着样本设会在遇到
-    /// 稍长的视频时立刻失效，所以留一倍余量。编译期钉住。
-    const _: () = assert!(MAX_VIDEO_BYTES >= 90 * 1_048_576);
+    /// 实测样本最大 58MB（TikTok 科普类长视频），而 TikTok 上限 30 分钟、
+    /// 按同样码率约 300MB。上限要能覆盖到那儿。编译期钉住。
+    const _: () = assert!(MAX_VIDEO_BYTES >= 300 * 1_048_576);
 
     /// 测试用的假下载器：按 URL 返回预设字节或预设错误。
     pub struct FakeFetcher {

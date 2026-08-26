@@ -695,12 +695,21 @@ fn look_at_video(
             let direct = match fresh_play_addr(ctx, vid, parsed) {
                 Some(u) => u,
                 None => {
-                    // 直链没有或过期了，重抓一次元数据换新地址
-                    match ctx.api.fetch_video(parsed, page_url) {
-                        Ok(fetched) => {
-                            *external_calls += fetched.artifacts.len();
-                            if ctx.store.save(&fetched).is_err() {
-                                return VisualOutcome::unavailable("重抓元数据后写库失败");
+                    // 直链没有或过期了，换一个新的。
+                    //
+                    // ★ 只打**详情端点**，不是三个都打。直链只在详情响应里，
+                    //   文字稿和评论已经在库里——重抓它们是三分之二的浪费，
+                    //   还会把库里那份覆盖掉。实测只打 /v2/tiktok/video
+                    //   一次调用扣 1 credit，直链和过期时间都在。
+                    match ctx.api.fetch_detail(parsed, page_url) {
+                        Ok(raw) => {
+                            *external_calls += 1;
+                            if ctx
+                                .store
+                                .replace_detail_artifact(vid, &raw.body.to_string())
+                                .is_err()
+                            {
+                                return VisualOutcome::unavailable("换新直链后写库失败");
                             }
                             match fresh_play_addr(ctx, vid, parsed) {
                                 Some(u) => u,
@@ -712,7 +721,7 @@ fn look_at_video(
                             }
                         }
                         Err(e) => {
-                            return VisualOutcome::unavailable(format!("重抓元数据失败：{e}"));
+                            return VisualOutcome::unavailable(format!("换新直链失败：{e}"));
                         }
                     }
                 }
@@ -1360,6 +1369,8 @@ mod tests {
     #[derive(Default)]
     struct FakeVideoApi {
         fetches: RefCell<usize>,
+        /// 只打详情端点的次数。和 fetches 分开数，才能验「换直链只花 1 次」。
+        details: RefCell<usize>,
         transcript: Option<String>,
         fail: bool,
         /// detail artifact 里的视频直链还有多久过期。None = 响应里根本没有直链。
@@ -1380,6 +1391,14 @@ mod tests {
     }
 
     impl DiscoveryApi for FakeVideoApi {
+        fn fetch_detail(&self, _: &ParsedUrl, _: &str) -> Result<RawResponse> {
+            *self.details.borrow_mut() += 1;
+            Ok(RawResponse {
+                endpoint: "/fake/detail".into(),
+                body: serde_json::from_str(&self.detail_json()).unwrap(),
+            })
+        }
+
         fn call(&self, _: Endpoint, p: Platform, _: &str) -> Result<RawResponse> {
             Ok(RawResponse {
                 endpoint: format!("/x/{}", p.as_str()),
@@ -2134,8 +2153,10 @@ mod tests {
             &call("fetch_video", json!({"url": TT_URL})),
         );
 
-        // 抓两次：第一次拿文字材料，第二次为换新直链
-        assert_eq!(*api.fetches.borrow(), 2, "该重抓一次换新地址");
+        // 全量抓一次（拿文字材料），换直链**只打详情端点一次**——
+        // 不是又打三个。直链只在详情响应里，文字稿和评论已经在库里了。
+        assert_eq!(*api.fetches.borrow(), 1, "全量只该抓一次");
+        assert_eq!(*api.details.borrow(), 1, "换直链该只打详情端点");
         // 假 API 每次都返回同样过期的地址，所以最终还是分析不了——
         // 但重点是它**试过了**而且没有拿死链去下载
         assert_eq!(out.vision_calls, 0);
@@ -2495,5 +2516,55 @@ mod tests {
             out.result.content.contains("=== 画面 ==="),
             "画面段不能省略"
         );
+    }
+    #[test]
+    fn refreshing_a_dead_play_addr_costs_one_call_not_three() {
+        // ★ 回归测试。原来这条路借的是 fetch_video 这把大锤——它内部打详情 +
+        //   文字稿 + 评论三个端点，而只有详情里有直链。三分之二浪费，而且
+        //   新抓的文字稿和评论还会把库里那份覆盖掉。
+        //
+        //   这不是 SC 的限制：三个端点本来就独立，实测只打 /v2/tiktok/video
+        //   一次调用扣 1 credit，直链和过期时间都在。
+        let api = FakeVideoApi {
+            transcript: Some("原来的字幕".into()),
+            play_addr_valid_for: Some(-100), // 直链已过期
+            ..Default::default()
+        };
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        // 一次全量（拿文字材料）+ 一次只打详情（换直链）
+        assert_eq!(*api.fetches.borrow(), 1);
+        assert_eq!(*api.details.borrow(), 1);
+        // 总外部调用 = 3（全量）+ 1（详情）= 4，不是 3 + 3 = 6
+        assert_eq!(out.external_calls, 4, "换直链只该多花 1 次");
+    }
+
+    #[test]
+    fn refreshing_the_play_addr_does_not_clobber_the_stored_transcript() {
+        // 走 save() 的话会用新抓的文字稿覆盖库里那份。内容一样，但那是次
+        // 白花的写入，而且要多打两个端点才能拿到用来覆盖的数据。
+        let api = FakeVideoApi {
+            transcript: Some("原来的字幕".into()),
+            play_addr_valid_for: Some(-100),
+            ..Default::default()
+        };
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(out.result.content.contains("原来的字幕"), "文字稿要还在");
+
+        // transcripts 表只该有一行，没被重写过
+        let n = st
+            .count_for_test("SELECT count(*) FROM transcripts")
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

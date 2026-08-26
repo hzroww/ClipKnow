@@ -242,6 +242,33 @@ pub trait DiscoveryApi {
     /// 抓一条视频的完整内容。走的是第一版那条链路（三个端点 + 转录失败重试），
     /// 和上面四个发现类端点不是一回事，所以单独一个方法。
     fn fetch_video(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo>;
+
+    /// **只打详情端点**，拿一份新的原始响应。
+    ///
+    /// 用在「视频直链过期了，要换一个」这一条路上。直链只存在于详情响应里
+    /// （TikTok 的 `aweme_detail.video.play_addr`、IG 的
+    /// `data.xdt_shortcode_media.video_url`），而文字稿和评论已经在库里了
+    /// ——重抓它们是纯浪费，**三分之二的调用**，还会把库里那份覆盖掉。
+    ///
+    /// 这不是 SC 的限制：三个端点本来就是独立的，实测只打
+    /// `/v2/tiktok/video` 一次调用扣 1 credit，直链和过期时间都在。
+    /// 是我们原来只有 `fetch_video` 这一把大锤。
+    ///
+    /// 默认实现退回 `fetch_video`，这样测试里的假实现不用都改——但真实现
+    /// 必须覆盖它，否则就白省了。
+    fn fetch_detail(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<RawResponse> {
+        let f = self.fetch_video(parsed, raw_url)?;
+        let raw = f
+            .artifacts
+            .iter()
+            .find(|a| matches!(a.kind, crate::content::model::ArtifactKind::Detail))
+            .and_then(|a| a.raw_json.clone())
+            .unwrap_or_else(|| "{}".into());
+        Ok(RawResponse {
+            endpoint: "detail(fallback)".into(),
+            body: serde_json::from_str(&raw).unwrap_or(Value::Null),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +424,15 @@ impl DiscoveryApi for crate::ingest::scrapecreators::ScrapeCreators {
 
     fn fetch_video(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<FetchedVideo> {
         self.fetch(parsed, raw_url)
+    }
+
+    fn fetch_detail(&self, parsed: &ParsedUrl, raw_url: &str) -> Result<RawResponse> {
+        let path = crate::ingest::scrapecreators::detail_endpoint_for(parsed.platform);
+        let body = self.get_with(path, &[("url", raw_url.to_string())])?;
+        Ok(RawResponse {
+            endpoint: path.to_string(),
+            body,
+        })
     }
 
     fn call(&self, ep: Endpoint, p: Platform, arg: &str) -> Result<RawResponse> {

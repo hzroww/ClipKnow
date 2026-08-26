@@ -262,6 +262,11 @@ impl ScrapeCreators {
 // 端点映射
 // ---------------------------------------------------------------------------
 
+/// 详情端点的路径。给 `DiscoveryApi::fetch_detail` 用——它只打这一个。
+pub(crate) fn detail_endpoint_for(p: Platform) -> &'static str {
+    detail_endpoint(p)
+}
+
 fn detail_endpoint(p: Platform) -> &'static str {
     match p {
         Platform::YouTube => "/v1/youtube/video",

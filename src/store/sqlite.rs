@@ -577,6 +577,21 @@ impl SqliteStore {
         Ok(self.conn.query_row(sql, [], |r| r.get(0))?)
     }
 
+    /// 只替换 `artifacts` 里 `kind='detail'` 那一行。
+    ///
+    /// 用在「视频直链过期了，换一个」这条路上：直链只在详情响应里，而文字稿
+    /// 和评论已经在库里。走 `save()` 的话会把它们一起覆盖——内容一样，但那是
+    /// 次白花的写入，而且要多打两个端点才能拿到用来覆盖的数据。
+    pub fn replace_detail_artifact(&mut self, video_id: &str, raw_json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO artifacts
+               (video_id, kind, status, raw_json, error, fetched_at)
+             VALUES (?1, 'detail', 'ok', ?2, NULL, ?3)",
+            params![video_id, raw_json, now_ts()],
+        )?;
+        Ok(())
+    }
+
     /// 这个视频的画面是不是被永久性拒了，以及原因。
     ///
     /// 命中它就直接把原因返回给模型——零下载零上传零分析。起因是一条政治

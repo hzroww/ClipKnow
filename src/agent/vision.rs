@@ -131,9 +131,26 @@ const FPS_MIN_TARGETED: f32 = 0.5;
 
 /// 时长未知时的兜底 fps。
 ///
-/// TikTok 的 `video.duration` 一直都有（毫秒），走到这里说明数据异常。
-/// 取 0.5 是折中：对短视频够用，对长视频不至于把 token 烧穿。
+/// 只在**连文件大小都不知道**时才用得上（`estimate_secs_from_size` 拿不到
+/// 输入）。取 0.5 而不是 1.0，是因为时长未知时宁可少花钱。
 const FPS_UNKNOWN_DURATION: f32 = 0.5;
+
+/// 按文件大小反推时长的假设码率（bit/s）。
+///
+/// 实测六条视频的码率跨度 738 kbps – 3.1 Mbps（4 倍）。取偏低的 800 kbps
+/// 是**刻意的**：低码率假设会把时长算高，于是 fps 算低、花钱少。反过来
+/// （高码率假设 → 时长算低 → fps 算高）会在遇到长视频时把 token 烧穿。
+///
+/// 为什么需要它：Instagram 的单视频端点 `/v1/instagram/post` 返回的
+/// `video_duration` 实测是 `null`，整个平台都拿不到时长。没有这个反推，
+/// IG 视频一律走兜底的 0.5——一条 9 秒的视频只抽 4 帧。
+const ASSUMED_BITRATE_BPS: f64 = 800_000.0;
+
+/// 文件大小 → 估算时长（秒）。只在真实时长缺失时当替补。
+pub fn estimate_secs_from_size(size_bytes: usize) -> i64 {
+    let secs = size_bytes as f64 * 8.0 / ASSUMED_BITRATE_BPS;
+    secs.round().max(1.0) as i64
+}
 
 pub fn pick_fps(duration_sec: Option<i64>, has_question: bool) -> f32 {
     let lo = if has_question {
@@ -526,6 +543,39 @@ mod tests {
         let targeted = pick_fps(Some(391), true);
         assert!(targeted > general, "{targeted} 应该高于 {general}");
         assert!(targeted >= 0.5);
+    }
+
+    #[test]
+    fn a_size_based_duration_estimate_lands_in_the_right_ballpark() {
+        // 实测六条视频的（大小, 真实秒数）。假设 800 kbps 是刻意偏低的：
+        // 估高时长 → fps 算低 → 少花钱。所以只要求「不低估」和「不离谱」。
+        for (mb, real) in [
+            (0.83, 9.0),
+            (2.6, 14.7),
+            (6.0, 15.5),
+            (16.8, 96.3),
+            (46.2, 391.0),
+            (52.1, 487.4),
+        ] {
+            let est = estimate_secs_from_size((mb * 1_048_576.0) as usize) as f64;
+            assert!(
+                est >= real * 0.7,
+                "{mb}MB 估成 {est}s，真实 {real}s —— 低估太多会让 fps 偏高、烧 token"
+            );
+            assert!(
+                est <= real * 6.0,
+                "{mb}MB 估成 {est}s，真实 {real}s —— 高得离谱"
+            );
+        }
+    }
+
+    #[test]
+    fn the_estimate_keeps_a_long_unknown_duration_video_from_burning_tokens() {
+        // 没有这个反推时，一条 28 分钟的视频按兜底 fps 0.5 会抽 850 帧
+        // （约 25 万 token）。用大小反推之后帧数回到上界内。
+        let secs = estimate_secs_from_size(58 * 1_048_576);
+        let frames = pick_fps(Some(secs), false) * secs as f32;
+        assert!(frames <= TARGET_FRAMES * 1.1, "算出 {frames} 帧");
     }
 
     #[test]

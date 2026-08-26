@@ -441,10 +441,29 @@ pub fn parse_play_addr(platform: Platform, raw_json: &str) -> Option<String> {
                 .or_else(|| first_url(d.pointer("/video/bit_rate/0/play_addr/url_list")))
         }
         Platform::Instagram => {
-            let m = v.get("media").unwrap_or(&v);
-            m.pointer("/video_versions/0/url")
+            // ⚠️ **两个端点两种完全不同的结构**，都得认：
+            //   /v1/instagram/post（单视频，fetch_video 走这个）是 GraphQL 壳
+            //       data.xdt_shortcode_media.video_url
+            //   /v1/instagram/user/reels（列表）是
+            //       items[].media.video_versions[0].url
+            //
+            // 这不是猜的——只认后者时实测报「响应里没有视频直链」，
+            // 而 fetch_video 恰好走的是前者。IG 的 profile 端点也有同样的
+            // 双形态问题（见本文件上方的注释）。
+            v.pointer("/data/xdt_shortcode_media/video_url")
                 .and_then(Value::as_str)
                 .map(str::to_string)
+                .or_else(|| {
+                    let m = v.get("media").unwrap_or(&v);
+                    m.pointer("/video_versions/0/url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    v.pointer("/items/0/media/video_versions/0/url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
         }
         // SC 的 YouTube 端点不给 mp4。要做 YouTube 得走别的路
         // （yt-dlp，或者换一家能直接吃 YouTube 链接的视觉模型）。
@@ -904,13 +923,26 @@ mod tests {
     }
 
     #[test]
-    fn an_instagram_play_addr_is_found_with_or_without_the_media_wrapper() {
-        // 实测这个端点返回过两种外壳
+    fn an_instagram_play_addr_is_found_in_all_three_response_shapes() {
+        // ⚠️ 回归测试。同一个平台，不同端点结构完全不同：
+        //   单视频端点 /v1/instagram/post 是 GraphQL 壳——漏掉它时实测
+        //   fetch_video 报「响应里没有视频直链」，画面永远分析不了。
+        let graphql = r#"{"data":{"xdt_shortcode_media":{"video_url":"https://x.cdninstagram.com/g?oe=6A8F354E"}}}"#;
         let wrapped =
             r#"{"media":{"video_versions":[{"url":"https://x.cdninstagram.com/a?oe=6A8F354E"}]}}"#;
+        let list = r#"{"items":[{"media":{"video_versions":[{"url":"https://x.cdninstagram.com/l?oe=6A8F354E"}]}}]}"#;
         let bare = r#"{"video_versions":[{"url":"https://x.cdninstagram.com/b?oe=6A8F354E"}]}"#;
-        assert!(parse_play_addr(Platform::Instagram, wrapped).is_some());
-        assert!(parse_play_addr(Platform::Instagram, bare).is_some());
+        for (name, raw) in [
+            ("graphql", graphql),
+            ("wrapped", wrapped),
+            ("list", list),
+            ("bare", bare),
+        ] {
+            assert!(
+                parse_play_addr(Platform::Instagram, raw).is_some(),
+                "{name} 这种结构没认出来"
+            );
+        }
     }
 
     #[test]

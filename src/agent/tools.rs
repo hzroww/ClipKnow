@@ -647,6 +647,7 @@ fn look_at_video(
         Some(r) => StagedRef {
             reference: r,
             expires_at: None, // 复用的，过期时间不用重写
+            size_bytes: None, // 复用时没下载，不知道大小
             fresh: false,
         },
         // ③ 没有可用引用：拿 CDN 直链 → 下载 + 上传
@@ -680,6 +681,9 @@ fn look_at_video(
                 Ok(s) => StagedRef {
                     reference: s.reference,
                     expires_at: Some(s.expires_at),
+                    // Instagram 的单视频端点实测不给 video_duration，
+                    // 拿文件大小反推一个，别让整个平台都走兜底 fps。
+                    size_bytes: Some(s.size_bytes),
                     fresh: true,
                 },
                 // 视频太大 / 下载超时 / 上传失败，原因原样带给模型：
@@ -689,7 +693,14 @@ fn look_at_video(
         }
     };
 
-    match vision.analyze(&staged.reference, duration, question) {
+    // 真实时长优先；缺失时用文件大小反推（IG 的单视频端点不给时长）
+    let duration_for_fps = duration.or_else(|| {
+        staged
+            .size_bytes
+            .map(crate::agent::vision::estimate_secs_from_size)
+    });
+
+    match vision.analyze(&staged.reference, duration_for_fps, question) {
         Ok(r) => {
             let stored = crate::content::dossier::StoredDossier {
                 dossier_json: r.text.clone(),
@@ -727,6 +738,8 @@ fn look_at_video(
 /// 拿到手的上传引用，以及它是这次新传的还是复用的。
 struct StagedRef {
     reference: String,
+    /// 这次实际下载/上传的字节数。真实时长缺失时用它反推。
+    size_bytes: Option<usize>,
     /// 只有新传的才带过期时间。复用时是 `None`——原来那一行还记着，
     /// 重写会把它的寿命错误地续上。
     expires_at: Option<i64>,

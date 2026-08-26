@@ -9,10 +9,11 @@ rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 dotenvy = "0.15.7"
-reqwest = { version = "0.13.4", features = ["blocking", "json", "query"] }
+reqwest = { version = "0.13.4", features = ["blocking", "json", "multipart", "query"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustyline = "18.0.1"
 serde = { version = "1.0.229", features = ["derive"] }

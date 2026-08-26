@@ -11,7 +11,9 @@
 use serde_json::json;
 
 use crate::agent::llm::{ToolCall, ToolDef, ToolResult};
-use crate::content::evidence::{build_evidence_with_limit, format_date, neutralize};
+use crate::content::evidence::{
+    MATERIAL_CLOSE, build_evidence_with_limit, format_date, neutralize,
+};
 use crate::content::model::{Creator, VideoSummary};
 use crate::error::Result;
 use crate::ingest::discovery::{
@@ -106,12 +108,15 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "fetch_video".into(),
-            description: "抓一条视频的完整内容：元数据 + 文字稿 + 高赞评论。\
-                只在需要深入了解某一条视频时用，比上面几个贵。"
+            description: "把一条视频看完：元数据 + 文字稿 + 高赞评论 + **画面内容**。\
+                要说清某条视频讲了什么就用它——标题和 hashtag 经常完全没有信息量\
+                （实测有的视频标题就是 `#Science #earth`，一个字的内容都没有）。\
+                比上面几个慢，也贵一些。"
                 .into(),
             params: schema(
                 json!({
-                    "url": {"type": "string", "description": "视频链接（YouTube / TikTok / Instagram）"}
+                    "url": {"type": "string", "description": "视频链接（YouTube / TikTok / Instagram）"},
+                    "question": {"type": "string", "description": "想在画面里确认的具体问题。不填就生成通用档案；填了会以更高帧率重看一遍，只在通用档案确实没覆盖时才用"}
                 }),
                 &["url"],
             ),
@@ -221,6 +226,14 @@ pub struct ToolOutcome {
     /// （转录失败还会重试一次）；命中缓存则是 0；翻页会更多。
     /// 循环拿这个数记预算——原来固定加 1，成本闸门一直少算。
     pub external_calls: usize,
+    /// 这次工具执行调了几次**视觉模型**。
+    ///
+    /// 必须和 `external_calls` 分开数：一次视频分析在视觉模型那边是
+    /// 2 万 token 起（实测 391 秒视频 23,168，1702 秒的 50,513），远超
+    /// 任何搜索结果，而它不是 SC 调用，`max_tool_calls` 数不到它。
+    pub vision_calls: usize,
+    /// 视觉模型报回的真实 video token 数，用来打印成本。
+    pub video_tokens: u32,
 }
 
 impl ToolOutcome {
@@ -238,6 +251,8 @@ impl ToolOutcome {
             // 在打网络之前拒掉的，明确是 0 而不是「不知道」
             credits_charged: Some(0),
             external_calls: 0,
+            vision_calls: 0,
+            video_tokens: 0,
         }
     }
 }
@@ -328,13 +343,56 @@ fn paged_creator_videos(
     Ok((all, raws, MAX_PAGES, credits))
 }
 
-pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall) -> ToolOutcome {
+/// 附在档案后面的历史问答条数上限。
+///
+/// 这一段**每轮迭代都要重发**，所以必须有上限。数字取自参照实现里实际
+/// 在跑的那三个（`MAX_CONTEXT_EXCHANGES = 6`、单条 1200 字符）。
+pub const MAX_DOSSIER_EXCHANGES: usize = 6;
+pub const MAX_EXCHANGE_CHARS: usize = 1_200;
+
+/// 工具执行需要的一切外部依赖。
+///
+/// 从三个散参数改成一个结构，是因为这是第三个依赖，而且还会有第四个。
+pub struct ToolCtx<'a> {
+    pub api: &'a dyn DiscoveryApi,
+    pub store: &'a mut SqliteStore,
+    /// 没配 `DASHSCOPE_API_KEY` 时是 `None` —— **不是错误**。
+    /// 那时 `fetch_video` 降级成只给文字材料并明写「未配置视觉模型」，
+    /// 所以别人 clone 下来只配 SC + DeepSeek 也能跑。
+    pub vision: Option<&'a dyn crate::agent::vision::VisionClient>,
+    /// 本次提问还剩几次视频分析额度。第四道闸门，由循环维护。
+    pub vision_budget_left: usize,
+}
+
+impl<'a> ToolCtx<'a> {
+    /// 测试和不需要视觉能力的调用点用这个。
+    pub fn text_only(api: &'a dyn DiscoveryApi, store: &'a mut SqliteStore) -> Self {
+        ToolCtx {
+            api,
+            store,
+            vision: None,
+            vision_budget_left: 0,
+        }
+    }
+}
+
+/// 按字符数截断（不是字节——中文一个字三字节，按字节切会切出乱码）。
+fn truncate(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…（共 {n} 字，已截断）")
+}
+
+pub fn execute(ctx: &mut ToolCtx<'_>, call: &ToolCall) -> ToolOutcome {
     let (ep, allowed) = match call.name.as_str() {
         "search_videos" => (Endpoint::SearchVideos, &SEARCHABLE_PLATFORMS[..]),
         "search_creators" => (Endpoint::SearchCreators, &ALL_PLATFORMS[..]),
         "get_creator" => (Endpoint::GetCreator, &ALL_PLATFORMS[..]),
         "get_creator_videos" => (Endpoint::GetCreatorVideos, &ALL_PLATFORMS[..]),
-        "fetch_video" => return fetch_video(api, store, call),
+        "fetch_video" => return fetch_video(ctx, call),
         other => {
             return ToolOutcome::err(
                 &call.id,
@@ -374,7 +432,7 @@ pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
             .and_then(serde_json::Value::as_i64)
     {
         let want = want.max(1) as usize;
-        return match paged_creator_videos(api, platform, &arg, want) {
+        return match paged_creator_videos(ctx.api, platform, &arg, want) {
             Ok((vids, raws, pages, credits)) => ToolOutcome {
                 result: ToolResult {
                     call_id: call.id.clone(),
@@ -386,12 +444,14 @@ pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
                 credits_charged: Some(credits),
                 // ★ 翻了几页就是几次调用。不如实报，max_tool_calls 又变谎话。
                 external_calls: pages,
+                vision_calls: 0,
+                video_tokens: 0,
             },
             Err(e) => ToolOutcome::err(&call.id, format!("调用失败：{e}")),
         };
     }
 
-    let raw = match api.call(ep, platform, &arg) {
+    let raw = match ctx.api.call(ep, platform, &arg) {
         Ok(r) => r,
         // SC 失败不中止循环，把原因原样给模型
         Err(e) => return ToolOutcome::err(&call.id, format!("调用失败：{e}")),
@@ -421,17 +481,26 @@ pub fn execute(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
         endpoint: Some(raw.endpoint),
         raw_json: Some(raw.body.to_string()),
         external_calls: 1,
+        vision_calls: 0,
+        video_tokens: 0,
     }
 }
 
-/// 抓一条视频的完整内容。接的是第一版那条链路。
+/// 把一条视频看完：文字材料 + 画面档案。
 ///
 /// 和四个发现类工具的两点不同：
-///   1. **走缓存**。同一条抓过就不重抓——模型在一次会话里对同一条视频调两次
-///      很常见（先搜到、后深挖），第二次不该花钱。
+///   1. **走缓存**。文字资料和视觉档案各自独立缓存——模型在一次会话里对
+///      同一条视频调两次很常见（先搜到、后深挖），第二次不该花钱。
 ///   2. **立刻落库**，不等终态。视频资料是独立的资料库、不是会话状态，
 ///      循环跑一半崩了，已抓到的留着是纯赚，也不破坏任何不变量。
-fn fetch_video(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall) -> ToolOutcome {
+///
+/// **为什么画面不是单独一个工具。** 试过分成 `fetch_video`（便宜）和
+/// `analyze_video`（贵）两个，问题是系统提示词里写着「每次工具调用都花钱，
+/// 分层查」——一个被标成「贵得多」的工具，模型几乎不会主动调，结果就是
+/// 系统性地给出只看标题的片面回答。而那是**设计造成的**，不是模型的问题。
+/// 会调 `fetch_video` 这个动作本身就表示「我要深入了解这一条」，那时候
+/// 不看画面才奇怪。
+fn fetch_video(ctx: &mut ToolCtx<'_>, call: &ToolCall) -> ToolOutcome {
     let url = match need_str(&call.args, "url") {
         Ok(u) => u,
         Err(e) => return ToolOutcome::err(&call.id, e),
@@ -441,20 +510,27 @@ fn fetch_video(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
         Ok(p) => p,
         Err(e) => return ToolOutcome::err(&call.id, format!("这个链接用不了：{e}")),
     };
+    let question = call
+        .args
+        .get("question")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|q| !q.is_empty());
 
-    let cached = store.find_by_native(parsed.platform, &parsed.native_id);
+    // ── 文字部分 ──────────────────────────────────────────
+    let cached = ctx.store.find_by_native(parsed.platform, &parsed.native_id);
     // 命中缓存 = 一个端点都没打；没命中 = 打了几个，从 artifacts 数
     // （详情/文字稿/评论各一份，转录失败重试也会多一份记录）
-    let mut hit_endpoints = 0usize;
+    let mut external_calls = 0usize;
     let sv = match cached {
         Ok(Some(sv)) => sv,
-        Ok(None) => match api.fetch_video(&parsed, &url) {
+        Ok(None) => match ctx.api.fetch_video(&parsed, &url) {
             Ok(fetched) => {
-                hit_endpoints = fetched.artifacts.len();
-                if let Err(e) = store.save(&fetched) {
+                external_calls += fetched.artifacts.len();
+                if let Err(e) = ctx.store.save(&fetched) {
                     return ToolOutcome::err(&call.id, format!("抓到了但写库失败：{e}"));
                 }
-                match store.find_by_native(parsed.platform, &parsed.native_id) {
+                match ctx.store.find_by_native(parsed.platform, &parsed.native_id) {
                     Ok(Some(sv)) => sv,
                     _ => return ToolOutcome::err(&call.id, "刚写进去却读不出来"),
                 }
@@ -464,13 +540,18 @@ fn fetch_video(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
         Err(e) => return ToolOutcome::err(&call.id, format!("查库失败：{e}")),
     };
 
+    // build_evidence 自带 <video-material> 包裹和标签中和，
+    // 而且每一段都有 [状态：...] 显式标注——截断/没有文字稿都明说，
+    // 不让模型靠「没看见标记」反推。
+    let text = build_evidence_with_limit(&sv, LOOP_TRANSCRIPT_LIMIT_CHARS);
+
+    // ── 画面部分 ──────────────────────────────────────────
+    let vis = look_at_video(ctx, &sv, &parsed, &url, question, &mut external_calls);
+
     ToolOutcome {
         result: ToolResult {
             call_id: call.id.clone(),
-            // build_evidence 自带 <video-material> 包裹和标签中和，
-            // 而且每一段都有 [状态：...] 显式标注——截断/没有文字稿都明说，
-            // 不让模型靠「没看见标记」反推。
-            content: build_evidence_with_limit(&sv, LOOP_TRANSCRIPT_LIMIT_CHARS),
+            content: splice_visual_section(&text, &vis.section),
             is_error: false,
         },
         endpoint: Some("fetch_video".into()),
@@ -478,10 +559,244 @@ fn fetch_video(api: &dyn DiscoveryApi, store: &mut SqliteStore, call: &ToolCall)
         // ★ 第一版那条链路打**三个**端点（详情/文字稿/评论），转录失败还会
         //   重试一次。原来这里固定算 1 次，成本闸门一直少算。
         //   命中缓存则一个都没打，是 0。
-        external_calls: hit_endpoints,
+        external_calls,
+        vision_calls: vis.calls,
+        video_tokens: vis.video_tokens,
         // 原始响应已经在 artifacts 表里（挂在 video_id 上，跨会话长期有效），
         // 不用在 items 里再存一份。
         raw_json: None,
+    }
+}
+
+/// 视觉部分的产出。
+struct VisualOutcome {
+    /// 要插进材料里的那一段，**永远非空**——没做成也要写明原因。
+    section: String,
+    calls: usize,
+    video_tokens: u32,
+}
+
+impl VisualOutcome {
+    fn unavailable(reason: impl AsRef<str>) -> Self {
+        VisualOutcome {
+            section: crate::content::dossier::render_unavailable(reason.as_ref()),
+            calls: 0,
+            video_tokens: 0,
+        }
+    }
+}
+
+/// 看画面。**任何失败都降级成一段说明，绝不让整个工具失败**——
+/// 文字材料是有效的，为看不了画面丢掉它不值得。
+///
+/// 三层复用，从便宜到贵：
+///   ① 有通用档案且没带问题     → 零下载零上传零分析
+///   ② 有还活着的上传引用       → 零下载零上传（实测 2–11 秒）
+///   ③ 都没有                   → 下载 + 上传 + 分析（实测 15–46 秒）
+fn look_at_video(
+    ctx: &mut ToolCtx<'_>,
+    sv: &crate::store::StoredVideo,
+    parsed: &crate::ingest::url::ParsedUrl,
+    page_url: &str,
+    question: Option<&str>,
+    external_calls: &mut usize,
+) -> VisualOutcome {
+    let Some(vision) = ctx.vision else {
+        return VisualOutcome::unavailable("未配置视觉模型（设置 DASHSCOPE_API_KEY 后可用）");
+    };
+    if ctx.vision_budget_left == 0 {
+        return VisualOutcome::unavailable("本次提问的视频分析预算已用尽");
+    }
+    if parsed.platform == crate::ingest::url::Platform::YouTube {
+        // 不是解析失败，是这条路根本不存在：SC 的 YouTube 端点只给
+        // watch 页地址和封面图，没有 mp4 直链。
+        return VisualOutcome::unavailable("YouTube 暂不支持画面分析（拿不到视频直链）");
+    }
+
+    let vid = &sv.video.id;
+    let duration = sv.video.duration_sec;
+    let provider = vision.provider();
+
+    // ① 通用档案有缓存就直接用，零调用。带问题时必须重看——旧档案答不了
+    //    一个它没被问过的问题。
+    //
+    //    ★ 这一步**不看上传引用死没死**。档案是永久的，上传引用过期只影响
+    //      「能不能追问」。混淆这两件事会导致每 48 小时白白重新分析一遍。
+    if question.is_none()
+        && let Ok(Some(d)) = ctx.store.latest_general_dossier(vid)
+    {
+        let mut section = d.render(duration, true);
+        append_past_answers(ctx, vid, &mut section);
+        return VisualOutcome {
+            section,
+            calls: 0,
+            video_tokens: 0,
+        };
+    }
+
+    // ② 还活着的上传引用能复用就复用。留 10 分钟余量：拿到引用之后还要
+    //    做一次分析，卡着过期线开始会白失败一次。
+    let now = crate::content::model::now_ts();
+    let live = ctx
+        .store
+        .live_staged_ref(vid, provider, now + STAGE_MARGIN_SECS)
+        .ok()
+        .flatten();
+
+    let staged = match live {
+        Some(r) => StagedRef {
+            reference: r,
+            expires_at: None, // 复用的，过期时间不用重写
+            fresh: false,
+        },
+        // ③ 没有可用引用：拿 CDN 直链 → 下载 + 上传
+        None => {
+            let direct = match fresh_play_addr(ctx, vid, parsed) {
+                Some(u) => u,
+                None => {
+                    // 直链没有或过期了，重抓一次元数据换新地址
+                    match ctx.api.fetch_video(parsed, page_url) {
+                        Ok(fetched) => {
+                            *external_calls += fetched.artifacts.len();
+                            if ctx.store.save(&fetched).is_err() {
+                                return VisualOutcome::unavailable("重抓元数据后写库失败");
+                            }
+                            match fresh_play_addr(ctx, vid, parsed) {
+                                Some(u) => u,
+                                None => {
+                                    return VisualOutcome::unavailable(
+                                        "这个平台的响应里没有视频直链",
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return VisualOutcome::unavailable(format!("重抓元数据失败：{e}"));
+                        }
+                    }
+                }
+            };
+            match vision.stage(&direct) {
+                Ok(s) => StagedRef {
+                    reference: s.reference,
+                    expires_at: Some(s.expires_at),
+                    fresh: true,
+                },
+                // 视频太大 / 下载超时 / 上传失败，原因原样带给模型：
+                // 「太大」它会换一条视频，「超时」它可能重试，处置不同。
+                Err(e) => return VisualOutcome::unavailable(format!("{e}")),
+            }
+        }
+    };
+
+    match vision.analyze(&staged.reference, duration, question) {
+        Ok(r) => {
+            let stored = crate::content::dossier::StoredDossier {
+                dossier_json: r.text.clone(),
+                model: vision.model_name().to_string(),
+                fps: r.fps,
+                question: question.map(str::to_string),
+                video_tokens: Some(r.usage.video_tokens as i64),
+                created_at: crate::content::model::now_ts(),
+                provider: Some(provider.to_string()),
+                staged_ref: Some(staged.reference.clone()),
+                // 复用的引用不重写过期时间——原来那一行还在，
+                // 重写会把它的寿命错误地续上。
+                staged_expires_at: staged.expires_at,
+            };
+            // 落库失败不影响这一轮的答案——档案已经拿到了
+            let _ = ctx.store.save_dossier(vid, &stored);
+
+            let mut section = match question {
+                Some(q) => render_answer(q, &r.text, r.fps),
+                None => stored.render(duration, false),
+            };
+            if question.is_none() {
+                append_past_answers(ctx, vid, &mut section);
+            }
+            VisualOutcome {
+                section,
+                calls: 1,
+                video_tokens: r.usage.video_tokens,
+            }
+        }
+        Err(e) => VisualOutcome::unavailable(format!("{e}")),
+    }
+}
+
+/// 拿到手的上传引用，以及它是这次新传的还是复用的。
+struct StagedRef {
+    reference: String,
+    /// 只有新传的才带过期时间。复用时是 `None`——原来那一行还记着，
+    /// 重写会把它的寿命错误地续上。
+    expires_at: Option<i64>,
+    #[allow(dead_code)]
+    fresh: bool,
+}
+
+/// 判上传引用可用时留的余量。拿到引用之后还要做一次分析（实测 2–11 秒），
+/// 卡着过期线开始会白失败一次。
+const STAGE_MARGIN_SECS: i64 = 600;
+
+/// 从 artifacts 里翻出还没过期的视频直链。
+fn fresh_play_addr(
+    ctx: &ToolCtx<'_>,
+    video_id: &str,
+    parsed: &crate::ingest::url::ParsedUrl,
+) -> Option<String> {
+    use crate::ingest::discovery::{parse_play_addr, url_still_valid};
+    let now = crate::content::model::now_ts();
+    let arts = ctx.store.get_artifacts(video_id).ok()?;
+    arts.iter()
+        .filter_map(|a| a.raw_json.as_deref())
+        .filter_map(|raw| parse_play_addr(parsed.platform, raw))
+        .find(|u| url_still_valid(u, now))
+}
+
+/// 带问题看的结果单独渲染——它不是档案，是一个问题的答案。
+fn render_answer(question: &str, answer: &str, fps: f32) -> String {
+    format!(
+        "[状态：已针对具体问题重看 —— fps {fps}]\n问：{}\n答：{}\n",
+        question.trim(),
+        answer.trim()
+    )
+}
+
+/// 把这个视频历史上问过的画面细节附在档案后面。
+///
+/// 目的是**省钱**：模型看见「这个问过了」就不会为同一个细节再花一次
+/// 分析的钱。因为不存视频，每次带问题重看都要重新下载 + 重新编码，
+/// 成本约等于一次完整分析。
+fn append_past_answers(ctx: &ToolCtx<'_>, video_id: &str, section: &mut String) {
+    let Ok(past) = ctx
+        .store
+        .recent_dossier_answers(video_id, MAX_DOSSIER_EXCHANGES)
+    else {
+        return;
+    };
+    if past.is_empty() {
+        return;
+    }
+    section.push_str("--- 之前针对画面问过的（无需重复分析）---\n");
+    for (q, a) in past {
+        section.push_str(&format!(
+            "问：{}\n答：{}\n",
+            truncate(&q, MAX_EXCHANGE_CHARS),
+            truncate(&a, MAX_EXCHANGE_CHARS)
+        ));
+    }
+}
+
+/// 把画面段插进 `</video-material>` 之前。
+///
+/// 必须在包裹里面：段落内容来自视觉模型对**公开平台内容**的描述，
+/// 和文字稿、评论一样是不可信数据。
+fn splice_visual_section(material: &str, visual: &str) -> String {
+    let head = format!("\n=== 画面 ===\n{visual}");
+    match material.rfind(MATERIAL_CLOSE) {
+        Some(i) => format!("{}{}{}", &material[..i], head, &material[i..]),
+        // 没有闭合标签（理论上不会发生）时也不能丢掉画面
+        None => format!("{material}{head}"),
     }
 }
 
@@ -782,8 +1097,7 @@ mod tests {
     fn dispatches_search_videos_to_the_right_endpoint_and_platform() {
         let api = FakeApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call(
                 "search_videos",
                 json!({"platform":"youtube","query":"科普"}),
@@ -802,8 +1116,7 @@ mod tests {
         // 模型偶尔会编工具名。要让它看到错误自己改，而不是崩掉整个循环。
         let api = FakeApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("search_the_web", json!({"q":"x"})),
         );
 
@@ -816,8 +1129,7 @@ mod tests {
     fn missing_required_arg_tells_the_model_which_one() {
         let api = FakeApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("search_videos", json!({"platform":"youtube"})),
         );
 
@@ -836,8 +1148,7 @@ mod tests {
         // 要在打网络之前拒掉，并说清能用哪些 —— 白花一次调用是钱。
         let api = FakeApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call(
                 "search_videos",
                 json!({"platform":"instagram","query":"科普"}),
@@ -862,8 +1173,7 @@ mod tests {
             ..Default::default()
         };
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("get_creator", json!({"platform":"tiktok","handle":"x"})),
         );
 
@@ -877,8 +1187,7 @@ mod tests {
         // 模型很可能把 "@yykp" 原样传进来（它在渲染结果里见过 @）
         let api = FakeApi::default();
         execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call(
                 "get_creator",
                 json!({"platform":"youtube","handle":"@yykp"}),
@@ -891,8 +1200,7 @@ mod tests {
     fn wrong_arg_type_is_reported_instead_of_silently_coerced() {
         let api = FakeApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("search_videos", json!({"platform":"youtube","query":123})),
         );
         assert!(
@@ -968,6 +1276,7 @@ mod tests {
     use crate::ingest::url::ParsedUrl;
 
     const YT_URL: &str = "https://www.youtube.com/watch?v=rCJX4pPz1_A";
+    const TT_URL: &str = "https://www.tiktok.com/@unipopsci/video/7673502248126663954";
 
     /// 假 SC：记录抓了几次，返回一条带文字稿的视频。
     #[derive(Default)]
@@ -975,6 +1284,21 @@ mod tests {
         fetches: RefCell<usize>,
         transcript: Option<String>,
         fail: bool,
+        /// detail artifact 里的视频直链还有多久过期。None = 响应里根本没有直链。
+        /// 过期戳要动态算：`url_still_valid` 拿它和当前时间比。
+        play_addr_valid_for: Option<i64>,
+    }
+
+    impl FakeVideoApi {
+        fn detail_json(&self) -> String {
+            match self.play_addr_valid_for {
+                Some(secs) => format!(
+                    r#"{{"aweme_detail":{{"video":{{"play_addr":{{"url_list":["https://v45.tiktokcdn-eu.com/hash/{:x}/video/tos/x/y/"]}}}}}}}}"#,
+                    now_ts() + secs
+                ),
+                None => "{}".into(),
+            }
+        }
     }
 
     impl DiscoveryApi for FakeVideoApi {
@@ -1023,7 +1347,7 @@ mod tests {
                 // 免得一次失败的抓取把上次抓到的文字稿冲掉。
                 // 真实抓取一定会产出这三份，假数据也得照着来。
                 artifacts: vec![
-                    Artifact::ok(ArtifactKind::Detail, "{}".into()),
+                    Artifact::ok(ArtifactKind::Detail, self.detail_json()),
                     match &self.transcript {
                         Some(_) => Artifact::ok(ArtifactKind::Transcript, "{}".into()),
                         None => Artifact::unavailable(ArtifactKind::Transcript, "{}".into()),
@@ -1045,7 +1369,10 @@ mod tests {
             ..Default::default()
         };
         let mut st = store();
-        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        let out = execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
 
         assert!(!out.result.is_error, "实际: {}", out.result.content);
         assert!(out.result.content.contains("寄生虫"), "文字稿要给模型");
@@ -1061,7 +1388,10 @@ mod tests {
             ..Default::default()
         };
         let mut st = store();
-        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
 
         assert_eq!(st.list_videos(10).unwrap().len(), 1, "该落库");
     }
@@ -1073,8 +1403,14 @@ mod tests {
             ..Default::default()
         };
         let mut st = store();
-        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
-        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
+        execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
 
         assert_eq!(*api.fetches.borrow(), 1, "第二次该命中缓存，不再打 SC");
     }
@@ -1088,7 +1424,10 @@ mod tests {
             ..Default::default()
         };
         let mut st = store();
-        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        let out = execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
 
         let n = out.result.content.chars().count();
         // 仍然设上限，但理由从「怕撑爆上下文」变成「控成本」：
@@ -1108,7 +1447,10 @@ mod tests {
         // 能明说的状态别让模型猜 —— 第一版那次幻觉的教训
         let api = FakeVideoApi::default();
         let mut st = store();
-        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        let out = execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
         assert!(
             out.result.content.contains("没有文字稿"),
             "实际: {}",
@@ -1121,8 +1463,7 @@ mod tests {
         let api = FakeVideoApi::default();
         let mut st = store();
         let out = execute(
-            &api,
-            &mut st,
+            &mut ToolCtx::text_only(&api, &mut st),
             &call("fetch_video", json!({"url": "https://example.com/x"})),
         );
 
@@ -1137,7 +1478,10 @@ mod tests {
             ..Default::default()
         };
         let mut st = store();
-        let out = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        let out = execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
 
         assert!(out.result.is_error);
         assert_eq!(out.result.call_id, "call_0", "失败也必须配对");
@@ -1161,8 +1505,7 @@ mod tests {
             }
         }
         let out = execute(
-            &Charging,
-            &mut store(),
+            &mut ToolCtx::text_only(&Charging, &mut store()),
             &call("search_videos", json!({"platform":"youtube","query":"x"})),
         );
         assert_eq!(out.credits_charged, Some(1));
@@ -1173,8 +1516,7 @@ mod tests {
         // 在打网络之前拒掉的，明确是 0 —— None 会让统计把它当「不知道」
         let api = FakeVideoApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("search_videos", json!({"platform":"instagram","query":"x"})),
         );
         assert!(out.result.is_error);
@@ -1189,8 +1531,7 @@ mod tests {
     fn a_single_endpoint_tool_reports_one_external_call() {
         let api = FakeVideoApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("search_videos", json!({"platform":"youtube","query":"x"})),
         );
         assert_eq!(out.external_calls, 1);
@@ -1201,8 +1542,7 @@ mod tests {
         // 打网络之前就拒掉的，不该占预算
         let api = FakeVideoApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("search_videos", json!({"platform":"instagram","query":"x"})),
         );
         assert!(out.result.is_error);
@@ -1218,8 +1558,7 @@ mod tests {
             ..Default::default()
         };
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call("fetch_video", json!({"url": YT_URL})),
         );
         assert!(out.external_calls >= 3, "实际报了 {}", out.external_calls);
@@ -1232,8 +1571,14 @@ mod tests {
             ..Default::default()
         };
         let mut st = store();
-        execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
-        let second = execute(&api, &mut st, &call("fetch_video", json!({"url": YT_URL})));
+        execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
+        let second = execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
         assert_eq!(second.external_calls, 0, "命中缓存不该占预算");
     }
 
@@ -1312,8 +1657,7 @@ mod tests {
     fn without_max_videos_only_one_page_is_fetched() {
         let api = PagingApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call(
                 "get_creator_videos",
                 json!({"platform":"youtube","handle":"x"}),
@@ -1328,8 +1672,7 @@ mod tests {
         // 每页 2 条，要 5 条 → 该翻 3 页
         let api = PagingApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call(
                 "get_creator_videos",
                 json!({"platform":"youtube","handle":"x","max_videos":5}),
@@ -1349,8 +1692,7 @@ mod tests {
         // 必须如实报出来，否则 max_tool_calls 又变成谎话。
         let api = PagingApi::default();
         let out = execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call(
                 "get_creator_videos",
                 json!({"platform":"youtube","handle":"x","max_videos":5}),
@@ -1365,8 +1707,7 @@ mod tests {
         // 不能指望它填个合理的数。
         let api = PagingApi::default();
         execute(
-            &api,
-            &mut store(),
+            &mut ToolCtx::text_only(&api, &mut store()),
             &call(
                 "get_creator_videos",
                 json!({"platform":"youtube","handle":"x","max_videos":10000}),
@@ -1388,5 +1729,498 @@ mod tests {
                 .get("max_videos")
                 .is_none()
         );
+    }
+    // -----------------------------------------------------------------
+    // 画面分析（第三版）
+    // -----------------------------------------------------------------
+
+    struct MockVision {
+        seen: RefCell<Vec<(String, Option<String>)>>,
+        staged: RefCell<usize>,
+        reply: String,
+        fail: Option<String>,
+        stage_fail: Option<String>,
+    }
+
+    impl MockVision {
+        fn ok(reply: &str) -> Self {
+            MockVision {
+                seen: RefCell::new(Vec::new()),
+                staged: RefCell::new(0),
+                reply: reply.into(),
+                fail: None,
+                stage_fail: None,
+            }
+        }
+        fn failing(msg: &str) -> Self {
+            MockVision {
+                seen: RefCell::new(Vec::new()),
+                staged: RefCell::new(0),
+                reply: String::new(),
+                fail: Some(msg.into()),
+                stage_fail: None,
+            }
+        }
+        /// 上传就失败（视频太大、下载超时这类）
+        fn stage_failing(msg: &str) -> Self {
+            MockVision {
+                seen: RefCell::new(Vec::new()),
+                staged: RefCell::new(0),
+                reply: String::new(),
+                fail: None,
+                stage_fail: Some(msg.into()),
+            }
+        }
+    }
+
+    impl crate::agent::vision::VisionClient for MockVision {
+        fn stage(&self, source_url: &str) -> Result<crate::agent::vision::StagedVideo> {
+            *self.staged.borrow_mut() += 1;
+            if let Some(m) = &self.stage_fail {
+                return Err(ClipKnowError::Fetch {
+                    platform: "video-stage".into(),
+                    message: m.clone(),
+                });
+            }
+            assert!(
+                source_url.starts_with("http"),
+                "stage 收到的必须是 CDN 直链，不是 {source_url}"
+            );
+            Ok(crate::agent::vision::StagedVideo {
+                reference: format!("oss://staged/{}", self.staged.borrow()),
+                expires_at: crate::content::model::now_ts() + crate::agent::vision::STAGE_TTL_SECS,
+                size_bytes: 1024,
+            })
+        }
+
+        fn provider(&self) -> &str {
+            "mock"
+        }
+
+        fn analyze(
+            &self,
+            url: &str,
+            _duration: Option<i64>,
+            question: Option<&str>,
+        ) -> Result<crate::agent::vision::VisionResult> {
+            assert!(
+                url.starts_with("oss://"),
+                "analyze 收到的必须是已 stage 的引用，不是 {url}"
+            );
+            self.seen
+                .borrow_mut()
+                .push((url.into(), question.map(str::to_string)));
+            if let Some(m) = &self.fail {
+                return Err(ClipKnowError::Fetch {
+                    platform: "video-cdn".into(),
+                    message: m.clone(),
+                });
+            }
+            Ok(crate::agent::vision::VisionResult {
+                text: self.reply.clone(),
+                usage: crate::agent::vision::VisionUsage {
+                    video_tokens: 23_168,
+                    text_tokens: 24,
+                    output_tokens: 138,
+                },
+                fps: 0.2,
+            })
+        }
+        fn model_name(&self) -> &str {
+            "mock-vision"
+        }
+        fn pricing(&self) -> crate::agent::vision::VisionPricing {
+            crate::agent::vision::VisionPricing {
+                input_per_mtok_cny: 3.0,
+                output_per_mtok_cny: 9.0,
+            }
+        }
+    }
+
+    const DOSSIER: &str = r#"{"version":1,"summary":"讲大脑可塑性",
+        "timeline":[{"start_sec":0,"end_sec":35,"what":"讲者出场"}],
+        "visible_text":["Neuroplasticity"],"limitations":["白板小字看不清"]}"#;
+
+    fn tt_api() -> FakeVideoApi {
+        FakeVideoApi {
+            transcript: Some("字幕内容".into()),
+            play_addr_valid_for: Some(3600),
+            ..Default::default()
+        }
+    }
+
+    fn with_vision<'a>(
+        api: &'a dyn DiscoveryApi,
+        st: &'a mut SqliteStore,
+        v: &'a dyn crate::agent::vision::VisionClient,
+        budget: usize,
+    ) -> ToolCtx<'a> {
+        ToolCtx {
+            api,
+            store: st,
+            vision: Some(v),
+            vision_budget_left: budget,
+        }
+    }
+
+    #[test]
+    fn the_visual_section_is_always_present_even_without_a_vision_client() {
+        // 材料对某件事沉默时，模型只能靠「我没看见」反推——实测它在文字稿的
+        // 截断标记上就这么翻过车，把推测说成了材料里的标注。
+        let api = tt_api();
+        let mut st = store();
+        let out = execute(
+            &mut ToolCtx::text_only(&api, &mut st),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(
+            out.result.content.contains("=== 画面 ==="),
+            "画面段不能省略"
+        );
+        assert!(
+            out.result.content.contains("未配置视觉模型"),
+            "要说清为什么没有"
+        );
+        assert_eq!(out.vision_calls, 0);
+    }
+
+    #[test]
+    fn a_successful_analysis_adds_a_fourth_section_inside_the_material_tags() {
+        // 画面段必须在 </video-material> 里面：它是视觉模型对**公开平台内容**
+        // 的描述，和文字稿、评论一样是不可信数据。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        assert!(!out.result.is_error);
+        let c = &out.result.content;
+        assert!(c.contains("=== 画面 ==="), "{c}");
+        assert!(c.contains("讲大脑可塑性"), "档案内容要进材料");
+        let vis_at = c.find("=== 画面 ===").unwrap();
+        let close_at = c.rfind(MATERIAL_CLOSE).unwrap();
+        assert!(vis_at < close_at, "画面段必须在闭合标签之前");
+        assert_eq!(out.vision_calls, 1);
+        assert_eq!(out.video_tokens, 23_168);
+    }
+
+    #[test]
+    fn a_failed_analysis_degrades_instead_of_failing_the_whole_tool() {
+        // 文字材料是有效的，为看不了画面把它一起丢掉不值得
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::failing("视频 340.0MB，超过 100MB 下载上限");
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        assert!(!out.result.is_error, "整个工具不该失败");
+        assert!(out.result.content.contains("字幕内容"), "文字材料要照给");
+        assert!(out.result.content.contains("340.0MB"), "原因要原样带给模型");
+        assert_eq!(out.vision_calls, 0, "失败不算一次分析");
+    }
+
+    #[test]
+    fn the_second_call_reuses_the_stored_dossier_without_paying_again() {
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let c = call("fetch_video", json!({"url": TT_URL}));
+
+        let first = execute(&mut with_vision(&api, &mut st, &v, 3), &c);
+        assert_eq!(first.vision_calls, 1);
+
+        let second = execute(&mut with_vision(&api, &mut st, &v, 3), &c);
+        assert_eq!(second.vision_calls, 0, "第二次不该再花钱");
+        assert!(second.result.content.contains("讲大脑可塑性"), "档案还要给");
+        assert!(second.result.content.contains("复用"), "要标明是旧档案");
+        assert_eq!(v.seen.borrow().len(), 1, "视觉模型只该被调一次");
+    }
+
+    #[test]
+    fn a_question_forces_a_fresh_look_and_is_rendered_as_a_qa() {
+        // 旧档案答不了一个它没被问过的问题
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok("看不清，字号太小且有反光。");
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "白板右下角写的什么？"}),
+            ),
+        );
+
+        assert_eq!(out.vision_calls, 1, "带问题必须重看，不能吃缓存");
+        assert_eq!(
+            v.seen.borrow()[1].1.as_deref(),
+            Some("白板右下角写的什么？")
+        );
+        assert!(
+            out.result.content.contains("问：白板右下角"),
+            "{}",
+            out.result.content
+        );
+        assert!(out.result.content.contains("答：看不清"));
+    }
+
+    #[test]
+    fn past_answers_are_attached_so_the_model_stops_paying_for_the_same_detail() {
+        // 因为不存视频，每次带问题重看都要重新下载+重新编码 ≈ 一次完整分析。
+        // 把问过的附在档案后面，模型见过就不会再问一遍。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok("深蓝色针织衫。");
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "讲者穿什么颜色？"}),
+            ),
+        );
+
+        let v2 = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v2, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        let c = &out.result.content;
+        assert!(c.contains("之前针对画面问过的"), "{c}");
+        assert!(c.contains("讲者穿什么颜色？"), "{c}");
+        assert!(c.contains("深蓝色针织衫"), "{c}");
+    }
+
+    #[test]
+    fn the_fourth_gate_stops_analysis_but_still_returns_the_text() {
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 0),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        assert_eq!(out.vision_calls, 0);
+        assert!(
+            out.result.content.contains("预算已用尽"),
+            "{}",
+            out.result.content
+        );
+        assert!(out.result.content.contains("字幕内容"), "文字材料照给");
+        assert!(v.seen.borrow().is_empty(), "闸门要在花钱之前拦住");
+    }
+
+    #[test]
+    fn youtube_says_why_it_cannot_be_analysed_rather_than_silently_skipping() {
+        // 不是解析失败，是这条路根本不存在：SC 的 YouTube 端点不给 mp4 直链
+        let api = FakeVideoApi {
+            transcript: Some("字幕".into()),
+            ..Default::default()
+        };
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": YT_URL})),
+        );
+
+        assert!(
+            out.result.content.contains("YouTube 暂不支持"),
+            "{}",
+            out.result.content
+        );
+        assert!(v.seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_expired_play_addr_triggers_one_refetch_rather_than_a_dead_download() {
+        // 直链过期了还拿去下载，等来的是一次 2 分钟超时（实测）。
+        // 重抓一次元数据换新地址便宜得多。
+        let api = FakeVideoApi {
+            transcript: Some("字幕".into()),
+            play_addr_valid_for: Some(-100), // 已过期
+            ..Default::default()
+        };
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        // 抓两次：第一次拿文字材料，第二次为换新直链
+        assert_eq!(*api.fetches.borrow(), 2, "该重抓一次换新地址");
+        // 假 API 每次都返回同样过期的地址，所以最终还是分析不了——
+        // 但重点是它**试过了**而且没有拿死链去下载
+        assert_eq!(out.vision_calls, 0);
+        assert!(!out.result.is_error);
+    }
+
+    #[test]
+    fn a_dossier_the_model_did_not_format_is_still_shown_not_discarded() {
+        // 分析已经花过钱了，丢弃等于白花
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok("画面里有一只猫在跳，没有按 JSON 输出。");
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        assert!(out.result.content.contains("画面里有一只猫在跳"));
+        assert!(
+            out.result.content.contains("未按格式"),
+            "要标明不是结构化档案"
+        );
+        assert_eq!(out.vision_calls, 1, "仍然算一次分析——钱花了");
+    }
+    // -----------------------------------------------------------------
+    // 上传引用的复用（第三版）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_follow_up_question_reuses_the_upload_instead_of_downloading_again() {
+        // 实测代价差一个数量级：新传一次是下载 46MB + 上传 = 35 秒，
+        // 复用只剩分析的 2–11 秒。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(*v.staged.borrow(), 1, "第一次要上传");
+
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "白板写了什么？"}),
+            ),
+        );
+        assert_eq!(*v.staged.borrow(), 1, "追问不该重新上传");
+        assert_eq!(out.vision_calls, 1, "但分析要真做");
+        assert_eq!(v.seen.borrow()[1].0, "oss://staged/1", "该复用同一个引用");
+    }
+
+    #[test]
+    fn an_expired_upload_does_not_invalidate_the_dossier() {
+        // ★ 回归测试。参照实现把「上传过期」当成了「档案过期」，
+        //   结果每 48 小时白白重新分析一遍。
+        //   档案永久有效；上传引用过期只影响「能不能带问题追问」。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        // 把上传引用改成已过期
+        st.exec_for_test("UPDATE video_dossiers SET staged_expires_at = 1")
+            .unwrap();
+
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(out.vision_calls, 0, "档案该照用，不许重新分析");
+        assert_eq!(*v.staged.borrow(), 1, "更不该重新上传");
+        assert!(out.result.content.contains("讲大脑可塑性"));
+    }
+
+    #[test]
+    fn an_expired_upload_forces_a_restage_only_when_a_question_needs_it() {
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        st.exec_for_test("UPDATE video_dossiers SET staged_expires_at = 1")
+            .unwrap();
+
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "问个细节"}),
+            ),
+        );
+        assert_eq!(*v.staged.borrow(), 2, "引用死了，追问就得重新上传");
+    }
+
+    #[test]
+    fn switching_vision_provider_does_not_reuse_the_old_upload() {
+        // oss:// 引用只对百炼有意义。换成别家视觉模型后必须重新 stage。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        // 冒充换了一家：把落库的 provider 改掉
+        st.exec_for_test("UPDATE video_dossiers SET provider = 'someone-else'")
+            .unwrap();
+
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL, "question": "细节"})),
+        );
+        assert_eq!(*v.staged.borrow(), 2, "别家的引用不能复用");
+    }
+
+    #[test]
+    fn reusing_an_upload_does_not_extend_its_lifetime() {
+        // 复用时重写过期时间，会让一个快死的引用被无限续命，
+        // 结果某次分析卡在真过期上白失败。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::ok(DOSSIER);
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL, "question": "细节"})),
+        );
+
+        let n = st
+            .count_for_test(
+                "SELECT count(*) FROM video_dossiers WHERE staged_expires_at IS NOT NULL",
+            )
+            .unwrap();
+        assert_eq!(n, 1, "只有新传的那一行该带过期时间，复用的不写");
+    }
+
+    #[test]
+    fn a_stage_failure_degrades_with_the_reason_and_costs_no_analysis() {
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::stage_failing("视频 340.0MB，超过上传上限 1024MB");
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        assert!(!out.result.is_error, "文字材料仍然有效");
+        assert!(
+            out.result.content.contains("340.0MB"),
+            "{}",
+            out.result.content
+        );
+        assert_eq!(out.vision_calls, 0);
+        assert!(v.seen.borrow().is_empty(), "上传没成，不该走到分析");
     }
 }

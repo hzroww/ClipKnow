@@ -70,6 +70,9 @@ pub const DISCOVERY_SYSTEM_PROMPT: &str = "\
   换几个近义词再搜一轮，合并统计后再挑候选。
 - **粉丝数和搜索频次都会骗你。** 必须用 get_creator_videos 翻开候选人最近发的
   内容，确认他真的在做这件事，再决定推不推荐。
+- **要说清某一条视频讲了什么，必须用 fetch_video。** 标题和 hashtag 经常完全
+  没有信息量——实测有的视频标题就是「#Science #earth」，一个字的内容都没有。
+  fetch_video 会把文字稿、评论和**画面内容**一起给你。
 - genre 字段只是弱信号，真科普博主可能挂着 People & Blogs。
 - 算更新频率用 publishDate，不要用 publishedTime（后者是从「1个月前」这种模糊
   文本反推的，可能差半个月，还会是 null）。

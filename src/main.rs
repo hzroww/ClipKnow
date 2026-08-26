@@ -24,6 +24,7 @@ use rustyline::error::ReadlineError;
 
 use clipknow::agent::llm::{LlmClient, ModelRequest, Msg, Provider, StopReason, build_client};
 use clipknow::agent::runner::{LoopConfig, TurnOutcome, echo_received, run_turn};
+use clipknow::agent::vision::{VisionClient, build_vision_client};
 use clipknow::content::evidence::{
     QUESTION_CLOSE, QUESTION_OPEN, SINGLE_VIDEO_SYSTEM_PROMPT, build_evidence, format_date,
     format_duration,
@@ -212,6 +213,10 @@ fn cmd_find(
 ) -> Result<()> {
     let llm = build_client(provider)?;
     let api = ScrapeCreators::from_env()?;
+    // 没配 DASHSCOPE_API_KEY 就是 None——不是错误。那时 fetch_video 降级成
+    // 只给文字材料并在结果里明写「未配置视觉模型」。
+    let vision = build_vision_client();
+    let vision_ref = vision.as_deref();
     let cfg = LoopConfig::default();
 
     let mut session_id = if continue_ {
@@ -236,7 +241,7 @@ fn cmd_find(
     // 一次性模式
     if let Some(q) = question {
         println!("{}", echo_received(&q));
-        return one_turn(store, &*llm, &api, &cfg, &session_id, &q).map(|_| ());
+        return one_turn(store, &*llm, &api, vision_ref, &cfg, &session_id, &q).map(|_| ());
     }
 
     // 交互模式。
@@ -248,8 +253,9 @@ fn cmd_find(
     // rustyline 在 raw 模式下自己解析转义序列，不认识的直接丢掉。
     // 顺带白得方向键调历史、Ctrl-C 只清当前行而不是杀进程。
     println!(
-        "· {} · 输入问题回车；↑ 调历史；/new 开新会话，/quit 退出",
-        llm.model_name()
+        "· {} · 画面 {} · 输入问题回车；↑ 调历史；/new 开新会话，/quit 退出",
+        llm.model_name(),
+        vision_ref.map_or("未启用", |v| v.model_name())
     );
     let mut rl =
         DefaultEditor::new().map_err(|e| ClipKnowError::Llm(format!("初始化输入失败: {e}")))?;
@@ -277,7 +283,7 @@ fn cmd_find(
         //   在发请求、花钱之前先让你看见程序实际拿到了什么。
         println!("{}", echo_received(q));
         // 单次提问失败不该把你踢出交互
-        if let Err(e) = one_turn(store, &*llm, &api, &cfg, &session_id, q) {
+        if let Err(e) = one_turn(store, &*llm, &api, vision_ref, &cfg, &session_id, q) {
             eprintln!("错误: {e}");
         }
     }
@@ -288,6 +294,7 @@ fn one_turn(
     store: &mut SqliteStore,
     llm: &dyn LlmClient,
     api: &ScrapeCreators,
+    vision: Option<&dyn VisionClient>,
     cfg: &LoopConfig,
     session_id: &str,
     question: &str,
@@ -296,7 +303,7 @@ fn one_turn(
     // 这个查询已经过滤了失败的 turn，也已跳过被摘要覆盖的部分。
     let history = store.load_turns_with_items(session_id)?;
     let is_first_turn = history.is_empty();
-    let res = run_turn(llm, api, store, &history, question, cfg);
+    let res = run_turn(llm, api, store, vision, &history, question, cfg);
 
     let status = match &res.outcome {
         TurnOutcome::Done => TurnStatus::Done,
@@ -363,8 +370,20 @@ fn one_turn(
         );
     }
 
+    // 视觉分析的账单在千问那边（人民币计价），和主模型的美元账分开写——
+    // 混在一个数字里既不准也看不出钱花在哪。
+    let vis_note = if res.video_analyses > 0 {
+        format!(
+            " · 画面 {} 条 / {} token（约 ¥{:.3}）",
+            res.video_analyses,
+            res.video_tokens,
+            f64::from(res.video_tokens) / 1_000_000.0 * 3.0
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "\n— {} 轮 · {} 次工具调用（扣 {} credit）· 输入 {}（其中 {} 命中缓存）/ 输出 {} token · 约 ${:.4}",
+        "\n— {} 轮 · {} 次工具调用（扣 {} credit）{vis_note} · 输入 {}（其中 {} 命中缓存）/ 输出 {} token · 约 ${:.4}",
         res.iterations,
         res.tool_calls_made,
         res.credits_charged,

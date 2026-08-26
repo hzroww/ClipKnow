@@ -5,5 +5,6 @@
 //! SC 挂了或者要换供应商，只改这个目录，store 和 llm 一行不动。
 
 pub mod discovery;
+pub mod download;
 pub mod scrapecreators;
 pub mod url;

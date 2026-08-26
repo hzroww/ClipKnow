@@ -414,6 +414,104 @@ impl DiscoveryApi for crate::ingest::scrapecreators::ScrapeCreators {
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+// 视频直链：从原始响应里挖出 CDN 地址，并判断它过期没有
+// ────────────────────────────────────────────────────────────────
+
+/// 从**单视频端点**的原始响应里取出可下载的 mp4 直链。
+///
+/// 为什么不用发现型工具给模型的那个 `url`：那是**页面地址**
+/// （`www.tiktok.com/@x/video/123`），实测直接喂给视觉模型会被拒——
+/// 千问报 `Invalid video file`（它拿到的是 812KB 的 HTML）。视觉模型要的是
+/// 一个 GET 就能拿到 `video/mp4` 字节的地址。
+///
+/// 三个平台的位置各不相同，而且**都不在同一层**：
+///   TikTok    `aweme_detail.video.play_addr.url_list[0]`
+///   Instagram `media.video_versions[0].url` （也可能没有 media 外壳）
+///   YouTube   **没有**。SC 只给 watch 页地址和封面图。
+pub fn parse_play_addr(platform: Platform, raw_json: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(raw_json).ok()?;
+    match platform {
+        Platform::TikTok => {
+            let d = v.get("aweme_detail").unwrap_or(&v);
+            // 优先 play_addr；缺了就退到 download_addr / bit_rate 里的那份。
+            // 实测三者指向同一个 CDN，但字段可能缺失。
+            first_url(d.pointer("/video/play_addr/url_list"))
+                .or_else(|| first_url(d.pointer("/video/download_addr/url_list")))
+                .or_else(|| first_url(d.pointer("/video/bit_rate/0/play_addr/url_list")))
+        }
+        Platform::Instagram => {
+            let m = v.get("media").unwrap_or(&v);
+            m.pointer("/video_versions/0/url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        // SC 的 YouTube 端点不给 mp4。要做 YouTube 得走别的路
+        // （yt-dlp，或者换一家能直接吃 YouTube 链接的视觉模型）。
+        Platform::YouTube => None,
+    }
+}
+
+fn first_url(v: Option<&Value>) -> Option<String> {
+    v?.as_array()?
+        .iter()
+        .find_map(Value::as_str)
+        .map(str::to_string)
+}
+
+/// 直链什么时候过期（Unix 秒）。
+///
+/// **两个平台把过期戳放在完全不同的位置**，这是那种不写测试就会在某天
+/// 悄悄失效的东西：
+///   TikTok    URL 路径的第二段，8 位十六进制
+///             `v15m.tiktokcdn-eu.com/<hash>/6a8e89ad/video/tos/...`
+///   Instagram 查询参数 `oe=`，同样是十六进制
+///             `...?oh=00_AQF...&oe=6A85C856`
+///
+/// 实测有效期：TikTok 约 24 小时，Instagram 约 35 小时。取不到就返回 None，
+/// 调用方当「不确定」处理——重抓一次元数据比用一个死链好。
+pub fn url_expires_at(url: &str) -> Option<i64> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+
+    // Instagram：查询参数
+    if let Some(oe) = parsed
+        .query_pairs()
+        .find(|(k, _)| k.eq_ignore_ascii_case("oe"))
+        .map(|(_, v)| v.to_string())
+        && let Some(t) = parse_hex_ts(&oe)
+    {
+        return Some(t);
+    }
+
+    // TikTok：路径里任意一段 8 位十六进制，且落在合理的时间范围内。
+    // 不写死「第二段」是因为路径结构会变，而「像时间戳的十六进制」这个
+    // 特征更稳。
+    parsed
+        .path_segments()?
+        .filter(|s| s.len() == 8)
+        .find_map(parse_hex_ts)
+}
+
+/// 8 位十六进制 → Unix 秒。范围检查是为了不把随机 hash 当成时间戳：
+/// 2020-09 到 2033-05 之间才算。
+fn parse_hex_ts(s: &str) -> Option<i64> {
+    let t = i64::from_str_radix(s.trim(), 16).ok()?;
+    (1_600_000_000..2_000_000_000).contains(&t).then_some(t)
+}
+
+/// 这个直链还能用吗。
+///
+/// `now` 传进来而不是内部取，是为了测试能钉住时间。留 5 分钟余量：
+/// 拿到地址之后还要下载几十 MB，卡着过期线开始下载会中途失败。
+pub fn url_still_valid(url: &str, now: i64) -> bool {
+    match url_expires_at(url) {
+        Some(exp) => exp > now + 300,
+        // 取不到过期戳时当**不可用**，宁可多花一次 SC 调用重抓。
+        // 反过来（当可用）会拿一个死链去下载，白等一次超时。
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +836,94 @@ mod tests {
         // includeExtras=true 是拿到 likeCountInt / commentCountInt 的唯一途径
         let v = r(Endpoint::SearchVideos, Platform::YouTube);
         assert_eq!(param(&v, "includeExtras").as_deref(), Some("true"));
+    }
+    // -----------------------------------------------------------------
+    // 视频直链与过期判断
+    // -----------------------------------------------------------------
+
+    /// 2026-08-25 实测的真实 TikTok 直链（已过期，仅作形状用）。
+    const TT_URL: &str = "https://v15m.tiktokcdn-eu.com/e23e39b54d79ce8271cc18f6ca71f7da/6a8e89ad/video/tos/alisg/tos-alisg-pve-0037c001/oU51VlEbMA98RIsFwIiBMYqBzfDm4vbiACA1jE/";
+    /// 实测的真实 Instagram 直链（过期戳在 query 里，位置和 TikTok 完全不同）。
+    const IG_URL: &str = "https://scontent-iad3-2.cdninstagram.com/o1/v/t2/f2/m86/AQP-x?_nc_cat=105&oh=00_AQFSrT94&oe=6A8F354E";
+
+    #[test]
+    fn a_tiktok_expiry_is_read_from_the_path() {
+        assert_eq!(url_expires_at(TT_URL), Some(0x6a8e_89ad));
+    }
+
+    #[test]
+    fn an_instagram_expiry_is_read_from_the_query_string() {
+        // 两个平台位置不同，是这一对函数最容易悄悄失效的地方
+        assert_eq!(url_expires_at(IG_URL), Some(0x6A8F_354E));
+    }
+
+    #[test]
+    fn a_random_eight_char_path_segment_is_not_mistaken_for_a_timestamp() {
+        // 路径里到处都是 8 位十六进制的 hash。没有范围检查就会把
+        // 第一个 hash 当过期时间，然后要么永远重抓、要么永远用死链。
+        let u = "https://cdn.example.com/deadbeef/video/tos/x/y/";
+        assert_eq!(url_expires_at(u), None);
+    }
+
+    #[test]
+    fn a_url_without_any_expiry_marker_is_treated_as_unusable() {
+        // 当「可用」的话会拿死链去下载，白等一次超时（实测 2 分钟）。
+        // 宁可多花一次 SC 调用重抓元数据。
+        assert!(!url_still_valid(
+            "https://cdn.example.com/a/b.mp4",
+            1_787_000_000
+        ));
+    }
+
+    #[test]
+    fn the_validity_check_leaves_a_margin_for_the_download_itself() {
+        let exp = 0x6a8e_89ad_i64;
+        // 还差 10 分钟过期：够下载
+        assert!(url_still_valid(TT_URL, exp - 600));
+        // 还差 1 分钟：不够，几十 MB 下不完
+        assert!(!url_still_valid(TT_URL, exp - 60));
+        // 已过期
+        assert!(!url_still_valid(TT_URL, exp + 1));
+    }
+
+    #[test]
+    fn a_tiktok_play_addr_is_found_in_the_single_video_response() {
+        // 真实响应的外壳是 aweme_detail
+        let raw = r#"{"aweme_detail":{"video":{"play_addr":{"url_list":[
+            "https://v19.tiktokcdn-us.com/h/6a8e89ad/video/tos/x/"]}}}}"#;
+        let got = parse_play_addr(Platform::TikTok, raw).unwrap();
+        assert!(got.contains("tiktokcdn-us"));
+    }
+
+    #[test]
+    fn a_tiktok_response_falls_back_to_download_addr_when_play_addr_is_missing() {
+        // 三个字段实测指向同一个 CDN，但都可能缺失
+        let raw = r#"{"aweme_detail":{"video":{"download_addr":{"url_list":[
+            "https://v19.tiktokcdn-us.com/h/6a8e89ad/video/tos/y/"]}}}}"#;
+        assert!(parse_play_addr(Platform::TikTok, raw).is_some());
+    }
+
+    #[test]
+    fn an_instagram_play_addr_is_found_with_or_without_the_media_wrapper() {
+        // 实测这个端点返回过两种外壳
+        let wrapped =
+            r#"{"media":{"video_versions":[{"url":"https://x.cdninstagram.com/a?oe=6A8F354E"}]}}"#;
+        let bare = r#"{"video_versions":[{"url":"https://x.cdninstagram.com/b?oe=6A8F354E"}]}"#;
+        assert!(parse_play_addr(Platform::Instagram, wrapped).is_some());
+        assert!(parse_play_addr(Platform::Instagram, bare).is_some());
+    }
+
+    #[test]
+    fn youtube_has_no_play_addr_at_all() {
+        // SC 的 YouTube 端点只给 watch 页地址和封面图。这不是解析失败，
+        // 是这条路根本不存在——调用方要据此明确告诉模型「YouTube 暂不支持」。
+        let raw = r#"{"id":"abc","url":"https://www.youtube.com/watch?v=abc","thumbnail":"x.jpg"}"#;
+        assert_eq!(parse_play_addr(Platform::YouTube, raw), None);
+    }
+
+    #[test]
+    fn malformed_json_does_not_panic() {
+        assert_eq!(parse_play_addr(Platform::TikTok, "not json"), None);
+        assert_eq!(parse_play_addr(Platform::Instagram, ""), None);
     }
 }

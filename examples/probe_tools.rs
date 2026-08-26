@@ -2,7 +2,7 @@
 //! 这是「单元测试全绿 ≠ 真的能调通」的那一道验证。
 //!   cargo run --example probe_tools
 use clipknow::agent::llm::ToolCall;
-use clipknow::agent::tools::execute;
+use clipknow::agent::tools::{ToolCtx, execute};
 use clipknow::ingest::scrapecreators::ScrapeCreators;
 use clipknow::store::sqlite::SqliteStore;
 use serde_json::json;
@@ -56,7 +56,7 @@ fn main() {
             name: name.into(),
             args: args.clone(),
         };
-        let out = execute(&api, &mut store, &call);
+        let out = execute(&mut ToolCtx::text_only(&api, &mut store), &call);
         println!("═══ {name} {args}");
         println!(
             "    is_error={}  endpoint={:?}  原始 {} 字节",

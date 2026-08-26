@@ -1,6 +1,6 @@
 //! 用真 key 验三家的翻页。
 use clipknow::agent::llm::ToolCall;
-use clipknow::agent::tools::execute;
+use clipknow::agent::tools::{ToolCtx, execute};
 use clipknow::ingest::scrapecreators::ScrapeCreators;
 use clipknow::store::sqlite::SqliteStore;
 use serde_json::json;
@@ -20,8 +20,7 @@ fn main() {
                 args["max_videos"] = json!(w);
             }
             let out = execute(
-                &api,
-                &mut st,
+                &mut ToolCtx::text_only(&api, &mut st),
                 &ToolCall {
                     id: "x".into(),
                     name: "get_creator_videos".into(),

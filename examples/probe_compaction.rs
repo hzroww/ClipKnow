@@ -35,7 +35,7 @@ fn main() {
             },
             history.est_tokens()
         );
-        let res = run_turn(&*llm, &api, &mut st, &history, q, &cfg);
+        let res = run_turn(&*llm, &api, &mut st, None, &history, q, &cfg);
         st.save_turn(&sid, llm.model_name(), TurnStatus::Done, &res.items)
             .unwrap();
         if let Some((text, upto)) = &res.pending_summary {

@@ -7,6 +7,7 @@
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::agent::compaction::{History, TurnItems};
+use crate::content::dossier::StoredDossier;
 use crate::content::model::{
     Artifact, ArtifactKind, Comment, FetchStatus, FetchedVideo, Item, ItemKind, Session,
     Transcript, Turn, TurnStatus, Video, new_id, now_ts,
@@ -39,6 +40,8 @@ impl SqliteStore {
         migrate_drop_video_raw_json(&conn)?;
         conn.execute_batch(include_str!("../../migrations/002_agent_loop.sql"))?;
         migrate_add_turn_summary(&conn)?;
+        conn.execute_batch(include_str!("../../migrations/004_video_dossier.sql"))?;
+        migrate_add_dossier_staging(&conn)?;
         Ok(Self { conn })
     }
 }
@@ -68,6 +71,33 @@ fn row_to_item(r: &rusqlite::Row, off: usize) -> rusqlite::Result<Item> {
         payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
         raw_json: None,
     })
+}
+
+fn row_to_dossier(r: &rusqlite::Row) -> rusqlite::Result<StoredDossier> {
+    Ok(StoredDossier {
+        dossier_json: r.get(0)?,
+        model: r.get(1)?,
+        fps: r.get::<_, f64>(2)? as f32,
+        question: r.get(3)?,
+        video_tokens: r.get(4)?,
+        created_at: r.get(5)?,
+        provider: r.get(6)?,
+        staged_ref: r.get(7)?,
+        staged_expires_at: r.get(8)?,
+    })
+}
+
+/// 给 video_dossiers 加 provider / staged_ref / staged_expires_at 三列。
+///
+/// `ALTER TABLE ADD COLUMN` 在 SQLite 里不支持 IF NOT EXISTS，所以先查 PRAGMA。
+fn migrate_add_dossier_staging(conn: &Connection) -> Result<()> {
+    let has: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('video_dossiers') WHERE name = 'staged_ref'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch(include_str!("../../migrations/005_video_staging.sql"))?;
+    }
+    Ok(())
 }
 
 fn migrate_add_turn_summary(conn: &Connection) -> Result<()> {
@@ -471,6 +501,115 @@ impl SqliteStore {
         }
         out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
         Ok(out)
+    }
+
+    /// 存一份视觉档案。**追加，不覆盖。**
+    ///
+    /// 换模型 / 调 fps 后重新分析时旧档案留着能对比；带问题看的结果更要
+    /// 全部留着——它们会附在档案后面给模型看，省掉重复分析的钱。
+    pub fn save_dossier(&mut self, video_id: &str, d: &StoredDossier) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO video_dossiers
+               (id, video_id, dossier_json, model, fps, question, video_tokens, created_at,
+                provider, staged_ref, staged_expires_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                new_id(),
+                video_id,
+                d.dossier_json,
+                d.model,
+                d.fps as f64,
+                d.question,
+                d.video_tokens,
+                d.created_at,
+                d.provider,
+                d.staged_ref,
+                d.staged_expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 这个视频最新的**通用**档案（`question IS NULL`）。
+    ///
+    /// 带问题看的结果不算——它回答的是一个特定问题，当不了通用档案用。
+    pub fn latest_general_dossier(&self, video_id: &str) -> Result<Option<StoredDossier>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dossier_json, model, fps, question, video_tokens, created_at,
+                    provider, staged_ref, staged_expires_at
+             FROM video_dossiers
+             WHERE video_id = ?1 AND question IS NULL
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![video_id])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(row_to_dossier(r)?),
+            None => None,
+        })
+    }
+
+    /// 测试用的逃生口。
+    ///
+    /// 真实代码里没有「让上传引用提前过期」或「改 provider」这种操作——
+    /// 那是时间和配置的产物。但要测「引用死了之后会怎样」，必须能造出
+    /// 那个状态。`cfg(test)` 保证它不会漏进生产路径。
+    #[cfg(test)]
+    pub(crate) fn exec_for_test(&mut self, sql: &str) -> Result<()> {
+        self.conn.execute(sql, [])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_for_test(&self, sql: &str) -> Result<i64> {
+        Ok(self.conn.query_row(sql, [], |r| r.get(0))?)
+    }
+
+    /// 这个视频还能用的上传引用。
+    ///
+    /// **和档案的复用完全无关。** 这一列过期只意味着「带问题追问要重新
+    /// 下载 + 上传」；通用档案永久有效，不受它影响。参照实现把这两件事
+    /// 混了，导致每 48 小时白白重新分析一遍。
+    ///
+    /// `provider` 参与条件：换视觉模型后，旧的 `oss://` 引用对新模型没意义。
+    /// `now` 传进来而不是内部取，是为了测试能钉住时间；调用方应该传
+    /// `now + 余量`，别卡着过期线开始分析。
+    pub fn live_staged_ref(
+        &self,
+        video_id: &str,
+        provider: &str,
+        now: i64,
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT staged_ref FROM video_dossiers
+             WHERE video_id = ?1 AND provider = ?2
+               AND staged_ref IS NOT NULL AND staged_expires_at > ?3
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![video_id, provider, now])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(r.get(0)?),
+            None => None,
+        })
+    }
+
+    /// 这个视频历史上带问题看过的问答，最近的在前。
+    ///
+    /// 附在档案后面给模型看，它见过就不会为同一个细节再花一次分析的钱。
+    /// 有上限是因为这一段**每轮迭代都要重发**。
+    pub fn recent_dossier_answers(
+        &self,
+        video_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT question, dossier_json FROM video_dossiers
+             WHERE video_id = ?1 AND question IS NOT NULL
+             ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![video_id, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// 记一次压缩：摘要文本 + 它覆盖到哪个 turn.seq（含）。
@@ -1561,5 +1700,131 @@ mod tests {
         let list = s.list_videos(10).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].title.as_deref(), Some("新的"), "最近抓的排前面");
+    }
+    // -----------------------------------------------------------------
+    // 视觉档案（第三版）
+    // -----------------------------------------------------------------
+
+    fn dossier(q: Option<&str>, body: &str) -> StoredDossier {
+        StoredDossier {
+            dossier_json: body.to_string(),
+            model: "qwen3-vl-plus".into(),
+            fps: 0.2,
+            question: q.map(str::to_string),
+            video_tokens: Some(23_168),
+            created_at: now_ts(),
+            provider: Some("qwen".into()),
+            staged_ref: Some("oss://dashscope-instant/x/video.mp4".into()),
+            staged_expires_at: Some(now_ts() + 48 * 3600),
+        }
+    }
+
+    #[test]
+    fn a_dossier_round_trips_with_its_model_and_fps() {
+        // fps 必须存：它是这份档案的分辨率，要写进给模型看的状态行。
+        // model 必须存：换模型后得能认出哪些档案是老的。
+        let mut st = mem();
+        let vid = st.save(&sample("v1", "标题")).unwrap();
+
+        st.save_dossier(&vid, &dossier(None, r#"{"version":1,"summary":"讲实验"}"#))
+            .unwrap();
+
+        let got = st.latest_general_dossier(&vid).unwrap().expect("该有档案");
+        assert_eq!(got.model, "qwen3-vl-plus");
+        assert_eq!(got.fps, 0.2);
+        assert_eq!(got.video_tokens, Some(23_168));
+        assert!(got.question.is_none());
+    }
+
+    #[test]
+    fn saving_a_dossier_appends_instead_of_overwriting() {
+        // 一对多是刻意的：换模型重新分析后，旧档案留着才能判断
+        // 新模型是不是真的更好。
+        let mut st = mem();
+        let vid = st.save(&sample("v2", "标题")).unwrap();
+
+        let mut old = dossier(None, r#"{"version":1,"summary":"旧的"}"#);
+        old.created_at = 1_000;
+        st.save_dossier(&vid, &old).unwrap();
+
+        let mut new = dossier(None, r#"{"version":1,"summary":"新的"}"#);
+        new.model = "qwen3-vl-flash".into();
+        new.created_at = 2_000;
+        st.save_dossier(&vid, &new).unwrap();
+
+        // 读到的是最新那条
+        let got = st.latest_general_dossier(&vid).unwrap().unwrap();
+        assert!(got.dossier_json.contains("新的"));
+        assert_eq!(got.model, "qwen3-vl-flash");
+        // 但旧的还在
+        let n: i64 = st
+            .conn
+            .query_row(
+                "SELECT count(*) FROM video_dossiers WHERE video_id = ?1",
+                params![vid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "旧档案不该被覆盖");
+    }
+
+    #[test]
+    fn a_targeted_answer_is_not_mistaken_for_the_general_dossier() {
+        // 带问题看的结果只回答那一个问题，当不了通用档案用。
+        // 混起来的话，下次要通用档案会命中一个只讲「白板写了什么」的档案。
+        let mut st = mem();
+        let vid = st.save(&sample("v3", "标题")).unwrap();
+
+        st.save_dossier(&vid, &dossier(Some("白板上写的什么？"), "看不清"))
+            .unwrap();
+
+        assert!(
+            st.latest_general_dossier(&vid).unwrap().is_none(),
+            "只有带问题的结果时，通用档案该是空的"
+        );
+    }
+
+    #[test]
+    fn past_answers_come_back_newest_first_and_respect_the_limit() {
+        // 这段要附在档案后面给模型看，而它每轮迭代都要重发，所以必须有上限
+        let mut st = mem();
+        let vid = st.save(&sample("v4", "标题")).unwrap();
+        for i in 0..5 {
+            let mut d = dossier(Some(&format!("问题{i}")), &format!("答案{i}"));
+            d.created_at = 1_000 + i;
+            st.save_dossier(&vid, &d).unwrap();
+        }
+
+        let got = st.recent_dossier_answers(&vid, 3).unwrap();
+        assert_eq!(got.len(), 3, "该受上限约束");
+        assert_eq!(got[0].0, "问题4", "最新的在前");
+        assert_eq!(got[0].1, "答案4");
+    }
+
+    #[test]
+    fn deleting_a_video_takes_its_dossiers_with_it() {
+        let mut st = mem();
+        let vid = st.save(&sample("v5", "标题")).unwrap();
+        st.save_dossier(&vid, &dossier(None, "{}")).unwrap();
+        st.conn
+            .execute("DELETE FROM videos WHERE id = ?1", params![vid])
+            .unwrap();
+        assert!(st.latest_general_dossier(&vid).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_dossier_that_is_not_json_still_renders_as_the_raw_text() {
+        // 模型没按格式输出时不丢弃——分析已经花过钱了
+        let d = dossier(None, "画面里有一只猫在跳。");
+        let r = d.render(Some(30), false);
+        assert!(r.contains("画面里有一只猫在跳。"));
+        assert!(r.contains("未按格式"), "要标明不是结构化档案: {r}");
+    }
+
+    #[test]
+    fn a_reused_dossier_is_marked_as_reused() {
+        let d = dossier(None, r#"{"version":1,"summary":"讲实验"}"#);
+        assert!(d.render(Some(30), true).contains("复用"));
+        assert!(!d.render(Some(30), false).contains("复用"));
     }
 }

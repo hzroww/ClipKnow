@@ -651,6 +651,12 @@ fn look_at_video(
     let duration = sv.video.duration_sec;
     let provider = vision.provider();
 
+    // ★ 这条视频的画面被永久性拒过（内容审查、格式不对、太大）就直接返回
+    //   原因，零下载零上传零分析。不记住的话每次都要重新走一遍再被拒。
+    if let Ok(Some(why)) = ctx.store.blocked_reason(vid, provider) {
+        return VisualOutcome::unavailable(why);
+    }
+
     // ① 通用档案有缓存就直接用，零调用。带问题时必须重看——旧档案答不了
     //    一个它没被问过的问题。
     //
@@ -748,6 +754,7 @@ fn look_at_video(
                 // 复用的引用不重写过期时间——原来那一行还在，
                 // 重写会把它的寿命错误地续上。
                 staged_expires_at: staged.expires_at,
+                blocked_reason: None,
             };
             // 落库失败不影响这一轮的答案——档案已经拿到了
             let _ = ctx.store.save_dossier(vid, &stored);
@@ -765,7 +772,31 @@ fn look_at_video(
                 video_tokens: r.usage.video_tokens,
             }
         }
-        Err(e) => VisualOutcome::unavailable(format!("{e}")),
+        Err(e) => {
+            // 上传已经成功了（走到 analyze 说明文件在服务端），所以两种失败
+            // 都值得记一行——只是记的东西不同：
+            //   永久性（内容审查/格式/太大）→ 记原因，以后直接返回，永不重试
+            //   可重试（限流/超时/5xx）      → 只记上传引用，下次直接拿它重试
+            //                                  analyze，不用重新下载上传
+            let permanent = crate::agent::vision::is_permanent_failure(&e);
+            let reason = format!("{e}");
+            let row = crate::content::dossier::StoredDossier {
+                // ★ 空串标记「这一行不是档案」。读档案的查询过滤 <> ''，
+                //   不然会把一份空档案当成真档案返回。
+                dossier_json: String::new(),
+                model: vision.model_name().to_string(),
+                fps: 0.0,
+                question: None,
+                video_tokens: None,
+                created_at: crate::content::model::now_ts(),
+                provider: Some(provider.to_string()),
+                staged_ref: Some(staged.reference.clone()),
+                staged_expires_at: staged.expires_at,
+                blocked_reason: permanent.then(|| reason.clone()),
+            };
+            let _ = ctx.store.save_dossier(vid, &row);
+            VisualOutcome::unavailable(reason)
+        }
     }
 }
 
@@ -2358,5 +2389,111 @@ mod tests {
         let c = &out.result.content;
         assert!(c.contains("预算已用尽"), "{c}");
         assert!(c.contains("文字稿和评论"), "要说清还能拿到什么: {c}");
+    }
+    // -----------------------------------------------------------------
+    // 失败之后（2026-08-26 一条被内容审查拒掉的视频引出的）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_content_review_rejection_is_remembered_and_never_retried() {
+        // ★ 回归测试。实测那次：一条政治评论视频被视觉模型的内容审查拒了
+        //   （DataInspectionFailed），而原来只在成功时写档案，所以什么都没记住
+        //   ——下次再问同一条视频又是一遍下载 + 上传 + 被拒。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::failing(
+            "视觉模型 HTTP 400: InternalError.Algo.DataInspectionFailed: \
+             Input video data may contain inappropriate content.",
+        );
+        let first = execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(first.result.content.contains("DataInspectionFailed"));
+        assert_eq!(*v.staged.borrow(), 1, "第一次要上传");
+
+        let second = execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(*v.staged.borrow(), 1, "第二次不该重新上传");
+        assert_eq!(
+            v.seen.borrow().len(),
+            1,
+            "更不该再调一次分析（第一次那次不算）"
+        );
+        assert!(
+            second.result.content.contains("inappropriate content"),
+            "原因要照样告诉模型: {}",
+            second.result.content
+        );
+        assert!(!second.result.is_error, "文字材料仍然有效");
+    }
+
+    #[test]
+    fn a_retryable_failure_keeps_the_upload_so_the_retry_is_cheap() {
+        // 上传成功了（走到 analyze 说明文件在服务端），引用留着下次直接重试，
+        // 不用重新下载 46MB 再传一遍。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::failing("视觉模型 HTTP 429 Too Many Requests: throttled");
+        execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(*v.staged.borrow(), 1);
+
+        // 第二次：换一个会成功的视觉客户端，模拟限流过去了
+        let v2 = MockVision::ok(DOSSIER);
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v2, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(*v2.staged.borrow(), 0, "该复用上次的上传，不重新下载上传");
+        assert_eq!(out.vision_calls, 1, "但要真的重试分析");
+        assert!(out.result.content.contains("讲大脑可塑性"));
+    }
+
+    #[test]
+    fn a_failure_row_is_not_mistaken_for_a_dossier() {
+        // 失败那一行 dossier_json 是空串。读档案的查询要过滤掉它，
+        // 不然模型会拿到一份空档案，而且从此永远命中缓存、永远没有画面。
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::failing("视觉模型 HTTP 503 Service Unavailable");
+        execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        let vid: String = st
+            .list_videos(1)
+            .unwrap()
+            .first()
+            .map(|v| v.id.clone())
+            .unwrap();
+        assert!(
+            st.latest_general_dossier(&vid).unwrap().is_none(),
+            "空档案不该被当成档案读出来"
+        );
+    }
+
+    #[test]
+    fn a_permanent_failure_does_not_block_the_text_material() {
+        let api = tt_api();
+        let mut st = store();
+        let v = MockVision::failing(
+            "视觉模型 HTTP 400: InternalError.Algo.DataInspectionFailed: inappropriate content",
+        );
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(!out.result.is_error);
+        assert!(out.result.content.contains("字幕内容"), "文字稿照给");
+        assert!(
+            out.result.content.contains("=== 画面 ==="),
+            "画面段不能省略"
+        );
     }
 }

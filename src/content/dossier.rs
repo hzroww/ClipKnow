@@ -183,6 +183,14 @@ pub struct StoredDossier {
     /// 具体问题追问」——引用死了就得重新下载 + 上传。混淆这两件事会导致
     /// 每 48 小时白白重新分析一遍（参照实现踩过这个坑）。
     pub staged_expires_at: Option<i64>,
+    /// 分析被**永久性**拒了的原因（内容审查、格式不对、太大）。
+    ///
+    /// 有值时 `dossier_json` 是空串——这一行不是档案，是一条「这条视频的画面
+    /// 永远看不了」的记录。读到它就直接把原因返回给模型，零下载零上传零分析。
+    ///
+    /// 可重试的失败（限流/超时）这一列留空，只把 `staged_ref` 记下来，
+    /// 下次直接拿引用重试 analyze。
+    pub blocked_reason: Option<String>,
 }
 
 impl StoredDossier {

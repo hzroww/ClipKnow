@@ -412,6 +412,34 @@ fn truncate_for_msg(s: &str) -> String {
     s.chars().take(200).collect()
 }
 
+/// 这次分析失败是**永久性**的吗——同一条视频重试一百次也是同样结果。
+///
+/// 分类依据是 2026-08-26 实测到的真实错误，以及和 SC 那边 `is_transient()`
+/// 同一个原则：区分「重试没用」和「第二次可能就成」。
+///
+/// **默认判为可重试。** 因为可重试那条路现在会把上传引用留下来，重试只花
+/// 一次 analyze 调用（不用重新下载上传）；而误判成永久会让一条视频的画面
+/// 永远看不了。代价不对称，所以往宽的一边错。
+pub fn is_permanent_failure(err: &ClipKnowError) -> bool {
+    let m = err.to_string();
+    // 内容安全审查。实测原文：
+    //   InternalError.Algo.DataInspectionFailed:
+    //   Input video data may contain inappropriate content.
+    // 政治、暴力这类内容会被拦，而且是确定性的。
+    if m.contains("DataInspectionFailed") || m.contains("inappropriate content") {
+        return true;
+    }
+    // 格式/内容根本不对。实测把网页地址当视频给它时报这个。
+    if m.contains("Invalid video file") {
+        return true;
+    }
+    // 超过服务端的长度上限（base64 那条路撞过 28,000,000 字符）
+    if m.contains("exceeds the maximum allowed") || m.contains("超过") {
+        return true;
+    }
+    false
+}
+
 /// 从 DashScope 的响应里取正文和用量。
 ///
 /// 单独抽出来是为了能用存下来的真实响应离线测——这一层最容易在供应商
@@ -683,5 +711,66 @@ mod tests {
         let c = p.cost_cny(&u);
         // 实测那条 391 秒视频，量级应该是「几分钱人民币」
         assert!((0.05..0.12).contains(&c), "算出 {c} 元");
+    }
+    // -----------------------------------------------------------------
+    // 失败分类
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_content_review_rejection_is_permanent() {
+        // 2026-08-26 实测的真实错误。同一条视频每次都会被同样的审查拦下，
+        // 不记住就会每次重新下载 + 上传 + 被拒。
+        let e = ClipKnowError::Llm(
+            "视觉模型 HTTP 400 Bad Request: <400> InternalError.Algo.DataInspectionFailed: \
+             Input video data may contain inappropriate content."
+                .into(),
+        );
+        assert!(is_permanent_failure(&e));
+    }
+
+    #[test]
+    fn a_size_limit_rejection_is_permanent() {
+        let e = ClipKnowError::Llm(
+            "视觉模型 HTTP 400: String value length (28049408) exceeds the maximum allowed \
+             (28000000)"
+                .into(),
+        );
+        assert!(is_permanent_failure(&e));
+        let e2 = ClipKnowError::Fetch {
+            platform: "video-stage".into(),
+            message: "视频 340.0MB，超过上传上限 1024MB".into(),
+        };
+        assert!(is_permanent_failure(&e2));
+    }
+
+    #[test]
+    fn a_web_page_instead_of_a_video_is_permanent() {
+        // 实测把抖音页面地址给它时报这个
+        let e = ClipKnowError::Llm(
+            "视觉模型 HTTP 400: InternalError.Algo.InvalidParameter: Invalid video file.".into(),
+        );
+        assert!(is_permanent_failure(&e));
+    }
+
+    #[test]
+    fn rate_limits_and_timeouts_are_retryable() {
+        for m in [
+            "视觉模型 HTTP 429 Too Many Requests: throttled",
+            "视觉模型 HTTP 503 Service Unavailable",
+            "视觉模型 HTTP 500: internal error",
+        ] {
+            assert!(
+                !is_permanent_failure(&ClipKnowError::Llm(m.into())),
+                "{m} 该是可重试的"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_failure_defaults_to_retryable() {
+        // 代价不对称：误判成可重试只多花一次 analyze（上传引用留着了）；
+        // 误判成永久会让这条视频的画面永远看不了。
+        let e = ClipKnowError::Llm("视觉模型 HTTP 418 I am a teapot".into());
+        assert!(!is_permanent_failure(&e));
     }
 }

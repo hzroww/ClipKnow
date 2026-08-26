@@ -42,6 +42,7 @@ impl SqliteStore {
         migrate_add_turn_summary(&conn)?;
         conn.execute_batch(include_str!("../../migrations/004_video_dossier.sql"))?;
         migrate_add_dossier_staging(&conn)?;
+        migrate_add_dossier_failure(&conn)?;
         Ok(Self { conn })
     }
 }
@@ -84,6 +85,7 @@ fn row_to_dossier(r: &rusqlite::Row) -> rusqlite::Result<StoredDossier> {
         provider: r.get(6)?,
         staged_ref: r.get(7)?,
         staged_expires_at: r.get(8)?,
+        blocked_reason: r.get(9)?,
     })
 }
 
@@ -96,6 +98,16 @@ fn migrate_add_dossier_staging(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has {
         conn.execute_batch(include_str!("../../migrations/005_video_staging.sql"))?;
+    }
+    Ok(())
+}
+
+fn migrate_add_dossier_failure(conn: &Connection) -> Result<()> {
+    let has: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('video_dossiers') WHERE name = 'blocked_reason'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch(include_str!("../../migrations/006_vision_failure.sql"))?;
     }
     Ok(())
 }
@@ -511,8 +523,8 @@ impl SqliteStore {
         self.conn.execute(
             "INSERT INTO video_dossiers
                (id, video_id, dossier_json, model, fps, question, video_tokens, created_at,
-                provider, staged_ref, staged_expires_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                provider, staged_ref, staged_expires_at, blocked_reason)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 new_id(),
                 video_id,
@@ -524,7 +536,8 @@ impl SqliteStore {
                 d.created_at,
                 d.provider,
                 d.staged_ref,
-                d.staged_expires_at
+                d.staged_expires_at,
+                d.blocked_reason
             ],
         )?;
         Ok(())
@@ -536,9 +549,9 @@ impl SqliteStore {
     pub fn latest_general_dossier(&self, video_id: &str) -> Result<Option<StoredDossier>> {
         let mut stmt = self.conn.prepare(
             "SELECT dossier_json, model, fps, question, video_tokens, created_at,
-                    provider, staged_ref, staged_expires_at
+                    provider, staged_ref, staged_expires_at, blocked_reason
              FROM video_dossiers
-             WHERE video_id = ?1 AND question IS NULL
+             WHERE video_id = ?1 AND question IS NULL AND dossier_json <> ''
              ORDER BY created_at DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![video_id])?;
@@ -562,6 +575,24 @@ impl SqliteStore {
     #[cfg(test)]
     pub(crate) fn count_for_test(&self, sql: &str) -> Result<i64> {
         Ok(self.conn.query_row(sql, [], |r| r.get(0))?)
+    }
+
+    /// 这个视频的画面是不是被永久性拒了，以及原因。
+    ///
+    /// 命中它就直接把原因返回给模型——零下载零上传零分析。起因是一条政治
+    /// 评论视频被内容审查拒了，而那个失败是确定性的：不记住的话每次都要
+    /// 重新下载 + 上传 + 被拒一遍。
+    pub fn blocked_reason(&self, video_id: &str, provider: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blocked_reason FROM video_dossiers
+             WHERE video_id = ?1 AND provider = ?2 AND blocked_reason IS NOT NULL
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![video_id, provider])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(r.get(0)?),
+            None => None,
+        })
     }
 
     /// 这个视频还能用的上传引用。
@@ -603,7 +634,7 @@ impl SqliteStore {
     ) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT question, dossier_json FROM video_dossiers
-             WHERE video_id = ?1 AND question IS NOT NULL
+             WHERE video_id = ?1 AND question IS NOT NULL AND dossier_json <> ''
              ORDER BY created_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![video_id, limit as i64], |r| {
@@ -1716,6 +1747,7 @@ mod tests {
             provider: Some("qwen".into()),
             staged_ref: Some("oss://dashscope-instant/x/video.mp4".into()),
             staged_expires_at: Some(now_ts() + 48 * 3600),
+            blocked_reason: None,
         }
     }
 

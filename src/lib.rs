@@ -9,3 +9,5 @@ pub mod content;
 pub mod error;
 pub mod ingest;
 pub mod store;
+/// Rust ↔ Go 的线格式。见模块文档。
+pub mod wire;

@@ -346,6 +346,74 @@ fn check_request_budget(
 ///
 /// **永远返回 TurnResult，不返回 Err。** 所有失败都表达在 `outcome` 里，
 /// 因为无论怎么失败，`items` 都必须是配对完整的——调用方要拿它落库。
+/// 循环跑到哪一步了。
+///
+/// 存在的唯一理由是**让界面能在 15–60 秒的等待里显示进度**。CLI 用不上
+/// （它本来就一行行打印），但 web 端一个阻塞 60 秒、什么都不显示的请求
+/// 是不能用的。
+///
+/// ⚠️ 这是个**只出不进**的通道：观察者只能看，不能改循环的任何决定。
+/// 签名里没有返回值就是这个意思——加一个 `-> bool` 让它能中止循环，
+/// 就等于把控制流交给了 UI 层，而预算闸门和收敛逻辑才是该管这件事的。
+#[derive(Debug, Clone)]
+pub enum TurnEvent<'a> {
+    /// 压缩发生了。`summary_chars` 是摘要长度，`upto_seq` 是覆盖到哪个 turn。
+    Compacted { summary_chars: usize, upto_seq: i64 },
+    /// 第 n 轮迭代开始（n 从 1 起）。
+    Iteration { n: usize },
+    /// 要调一个工具了，**还没执行**。
+    ToolCall {
+        id: &'a str,
+        name: &'a str,
+        args: &'a serde_json::Value,
+    },
+    /// 工具执行完了。这些数字是**这一次调用**的增量，不是累计值。
+    ToolResult {
+        id: &'a str,
+        name: &'a str,
+        is_error: bool,
+        external_calls: usize,
+        credits: i64,
+        vision_calls: usize,
+        /// 结果正文的前若干字符，给界面显示用。完整内容在库里。
+        preview: &'a str,
+    },
+    /// 拿到最终答案了。
+    ///
+    /// 以后 `LlmClient` 支持流式时，在它**之前**加一串 `Token` 事件即可，
+    /// 这条保持不变——界面按「有 Token 就边收边拼，最后用 Answer 校准」
+    /// 处理，那时前端不用改。
+    Answer { text: &'a str },
+}
+
+/// 观察循环进度。实现者必须是**便宜且不会 panic** 的——它在循环的热路径上。
+pub trait TurnObserver {
+    fn on(&self, ev: &TurnEvent<'_>);
+}
+
+/// 什么都不做。CLI 和所有测试走这个，零开销。
+pub struct NoopObserver;
+impl TurnObserver for NoopObserver {
+    fn on(&self, _: &TurnEvent<'_>) {}
+}
+
+/// 跑一次 turn 要用到的四样外部能力。
+///
+/// 打包成结构体而不是摊成四个参数：加上观察者之后 `run_turn_observed` 是
+/// 8 个参数，clippy 会报（而且确实不好读）。这四个天然是一组「环境」，
+/// `tools.rs` 里的 `ToolCtx` 是同一个模式。
+///
+/// 按值传：里面就四个引用，拷贝成本为零，而按值传能在函数里一次解构出
+/// 四个局部变量，函数体一个字都不用改。
+pub struct TurnDeps<'a> {
+    pub llm: &'a dyn LlmClient,
+    pub api: &'a dyn DiscoveryApi,
+    pub store: &'a mut SqliteStore,
+    /// `None` = 没配视觉模型。**不是错误**，那时 fetch_video 降级成只给文字。
+    pub vision: Option<&'a dyn crate::agent::vision::VisionClient>,
+}
+
+/// 跑一次提问。不关心进度就用这个（CLI、测试）。
 pub fn run_turn(
     llm: &dyn LlmClient,
     api: &dyn DiscoveryApi,
@@ -355,6 +423,36 @@ pub fn run_turn(
     question: &str,
     cfg: &LoopConfig,
 ) -> TurnResult {
+    run_turn_observed(
+        TurnDeps {
+            llm,
+            api,
+            store,
+            vision,
+        },
+        history,
+        question,
+        cfg,
+        &NoopObserver,
+    )
+}
+
+/// 跑一次提问，把每一步推给 `obs`。
+pub fn run_turn_observed(
+    deps: TurnDeps<'_>,
+    history: &History,
+    question: &str,
+    cfg: &LoopConfig,
+    obs: &dyn TurnObserver,
+) -> TurnResult {
+    // 解构成四个局部变量，下面的代码和加观察者之前完全一样。
+    let TurnDeps {
+        llm,
+        api,
+        store,
+        vision,
+    } = deps;
+
     // 两本账。settle() 是唯一同时改它们的地方——分开改的话，
     // 漏更新其中一本会产生很隐蔽的 bug（见 settle 的注释）。
     let mut items: Vec<Item> = Vec::new();
@@ -374,6 +472,12 @@ pub fn run_turn(
     if history.est_tokens() > cfg.compaction_threshold {
         // 失败 fail-open：`try_compact` 内部吞掉错误，返回 None 就照原样跑。
         compacted = try_compact(llm, history, cfg);
+        if let Some((text, upto)) = &compacted {
+            obs.on(&TurnEvent::Compacted {
+                summary_chars: text.chars().count(),
+                upto_seq: *upto,
+            });
+        }
     }
     // 压过就用新摘要 + 保留的 turn，没压就用原样的历史。
     let flat: Vec<Item> = match &compacted {
@@ -453,6 +557,7 @@ pub fn run_turn(
             messages.push(Msg::user(CONVERGENCE_NOTICE));
         }
         res.iterations = iteration;
+        obs.on(&TurnEvent::Iteration { n: iteration });
 
         // ★ 每次发请求之前都查预算，不只在 turn 开始时。
         //   循环里只有这道闸门，没有压缩：本轮自己产生的工具结果压不动——
@@ -546,11 +651,17 @@ pub fn run_turn(
         if resp.tool_calls.is_empty() {
             res.answer = resp.text;
             res.outcome = TurnOutcome::Done;
+            obs.on(&TurnEvent::Answer { text: &res.answer });
             return res;
         }
 
         // ── ExecutingTools：唯一出边是回到 CallingModel ──────
         for call in &resp.tool_calls {
+            obs.on(&TurnEvent::ToolCall {
+                id: &call.id,
+                name: &call.name,
+                args: &call.args,
+            });
             let over_calls = res.tool_calls_made >= cfg.max_tool_calls;
             // 真实基准 + 只估算本轮新追加的那几条
             let projected =
@@ -575,6 +686,9 @@ pub fn run_turn(
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|q| !q.trim().is_empty());
 
+            // 这一次调用的增量，只给观察者用。累计值在 res 里。
+            let mut ext_this = 0usize;
+            let mut vis_this = 0usize;
             let (content, is_error, raw, endpoint, credits) = if over_calls || over_context {
                 // ★ 预算用尽也**必须**产出配对的结果，不能跳过。
                 (BUDGET_EXHAUSTED.to_string(), true, None, None, Some(0))
@@ -599,6 +713,8 @@ pub fn run_turn(
                 res.credits_charged += out.credits_charged.unwrap_or(0);
                 res.video_analyses += out.vision_calls;
                 res.video_tokens += out.video_tokens;
+                ext_this = out.external_calls;
+                vis_this = out.vision_calls;
                 (
                     out.result.content,
                     out.result.is_error,
@@ -607,6 +723,19 @@ pub fn run_turn(
                     out.credits_charged,
                 )
             };
+
+            obs.on(&TurnEvent::ToolResult {
+                id: &call.id,
+                name: &call.name,
+                is_error,
+                external_calls: ext_this,
+                credits: credits.unwrap_or(0),
+                vision_calls: vis_this,
+                preview: &content[..content
+                    .char_indices()
+                    .nth(PREVIEW_CHARS)
+                    .map_or(content.len(), |(i, _)| i)],
+            });
 
             res.items.push(Item::function_call_output_full(
                 idx,
@@ -627,6 +756,10 @@ pub fn run_turn(
         }
     }
 }
+
+/// 推给界面的工具结果预览长度。完整内容在库里，界面要看细节自己去取——
+/// 一份视频材料能有几万字符，全塞进 SSE 是白占带宽。
+const PREVIEW_CHARS: usize = 240;
 
 const TRUNCATED_CALL: &str =
     "没有执行：模型这一轮的回答达到长度上限被截断了，工具请求的参数可能不完整。";

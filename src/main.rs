@@ -23,7 +23,9 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use clipknow::agent::llm::{LlmClient, ModelRequest, Msg, Provider, StopReason, build_client};
-use clipknow::agent::runner::{LoopConfig, TurnOutcome, echo_received, run_turn};
+use clipknow::agent::runner::{
+    LoopConfig, TurnDeps, TurnOutcome, TurnResult, echo_received, run_turn, run_turn_observed,
+};
 use clipknow::agent::vision::{VisionClient, build_vision_client};
 use clipknow::content::evidence::{
     QUESTION_CLOSE, QUESTION_OPEN, SINGLE_VIDEO_SYSTEM_PROMPT, build_evidence, format_date,
@@ -35,6 +37,7 @@ use clipknow::ingest::scrapecreators::ScrapeCreators;
 use clipknow::ingest::url;
 use clipknow::store::sqlite::SqliteStore;
 use clipknow::store::{Store, StoredVideo};
+use clipknow::wire::{NdjsonSink, done_json, error_json, hello_json, usage_json};
 
 #[derive(Parser)]
 #[command(name = "clipknow", about = "分析社媒视频内容", version)]
@@ -84,6 +87,17 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// 跑一次提问，把进度按 NDJSON 打到 stdout。**给 web 服务用的**。
+    ///
+    /// 人要看的话直接用 `find`。这个模式下 stdout 只有 JSON，
+    /// 一行一个事件；日志走 stderr。
+    Turn {
+        /// 接着哪个会话。不给就新建一个，新会话的 id 在 hello 那一行里。
+        #[arg(long)]
+        session: Option<String>,
+        /// 这一轮的问题
+        question: String,
+    },
     /// 列出已抓过的视频
     List {
         #[arg(long, default_value_t = 20)]
@@ -120,6 +134,9 @@ fn run(cli: Cli) -> Result<()> {
             question,
             refresh,
         } => cmd_ask(&mut store, &url, &question, refresh, provider),
+        Command::Turn { session, question } => {
+            cmd_turn_json(&mut store, session, &question, provider)
+        }
         Command::Show { url, raw } => cmd_show(&store, &url, raw),
         Command::Find {
             question,
@@ -305,29 +322,14 @@ fn one_turn(
     let is_first_turn = history.is_empty();
     let res = run_turn(llm, api, store, vision, &history, question, cfg);
 
-    let status = match &res.outcome {
-        TurnOutcome::Done => TurnStatus::Done,
-        TurnOutcome::IterationCap => TurnStatus::Failed("超过迭代上限".into()),
-        // 残缺的答案不能标成成功：下次 --continue 时历史里会带着半句话
-        TurnOutcome::Truncated => TurnStatus::Failed("回答被长度上限截断".into()),
-        TurnOutcome::ProtocolError(e) => TurnStatus::Failed(format!("协议异常: {e}")),
-        TurnOutcome::ContextBudget { .. } => TurnStatus::Failed("上下文预算不足".into()),
-        TurnOutcome::ModelError(e) => TurnStatus::Failed(format!("模型调用失败: {e}")),
-    };
-
-    // 上下文闸门是在发请求之前拦下的，这一轮什么都没发生，不必落库
-    if !matches!(res.outcome, TurnOutcome::ContextBudget { .. }) {
-        store.save_turn(session_id, llm.model_name(), status, &res.items)?;
-        // 压缩也在终态落库。摘要必须在 save_turn 之后写——它挂在最新那个
-        // turn 上，而那个 turn 是 save_turn 刚建的。
-        if let Some((text, upto)) = &res.pending_summary {
-            store.save_compaction(session_id, text, *upto)?;
-        }
-        // 第一次提问顺手拿它当标题，`clipknow sessions` 才认得出是哪次
-        if is_first_turn {
-            store.set_session_title(session_id, &truncate_chars(question, 40))?;
-        }
-    }
+    persist_turn(
+        store,
+        llm.model_name(),
+        session_id,
+        question,
+        is_first_turn,
+        &res,
+    )?;
 
     match res.outcome {
         TurnOutcome::Done => println!("\n{}", res.answer),
@@ -393,6 +395,178 @@ fn one_turn(
         llm.pricing()
             .cost_usd(res.input_tokens, res.cached_input_tokens, res.output_tokens)
     );
+    Ok(())
+}
+
+/// 把一次 turn 的结果落库。
+///
+/// CLI（`one_turn`）和 web 子进程（`cmd_turn_json`）共用**同一份**。两处各写
+/// 一遍必然漂移，而这里的规则都是有不变量的：
+///   - 失败的 turn 也要落库（`load_history` 那边会跳过它，但历史本身要完整）
+///   - 摘要必须在 `save_turn` **之后**写：它挂在最新那个 turn 上，
+///     而那个 turn 是 save_turn 刚建出来的
+///   - 上下文闸门那一轮**什么都不落**：请求根本没发出去，没有任何事发生
+fn persist_turn(
+    store: &mut SqliteStore,
+    model: &str,
+    session_id: &str,
+    question: &str,
+    is_first_turn: bool,
+    res: &TurnResult,
+) -> Result<()> {
+    let status = match &res.outcome {
+        TurnOutcome::Done => TurnStatus::Done,
+        TurnOutcome::IterationCap => TurnStatus::Failed("超过迭代上限".into()),
+        // 残缺的答案不能标成成功：下次 --continue 时历史里会带着半句话
+        TurnOutcome::Truncated => TurnStatus::Failed("回答被长度上限截断".into()),
+        TurnOutcome::ProtocolError(e) => TurnStatus::Failed(format!("协议异常: {e}")),
+        TurnOutcome::ContextBudget { .. } => TurnStatus::Failed("上下文预算不足".into()),
+        TurnOutcome::ModelError(e) => TurnStatus::Failed(format!("模型调用失败: {e}")),
+    };
+
+    if matches!(res.outcome, TurnOutcome::ContextBudget { .. }) {
+        return Ok(());
+    }
+    store.save_turn(session_id, model, status, &res.items)?;
+    if let Some((text, upto)) = &res.pending_summary {
+        store.save_compaction(session_id, text, *upto)?;
+    }
+    // 第一次提问顺手拿它当标题，会话列表才认得出是哪次
+    if is_first_turn {
+        store.set_session_title(session_id, &truncate_chars(question, 40))?;
+    }
+    Ok(())
+}
+
+/// 每种结局该对用户说什么。
+///
+/// 放在 Rust 这边而不是让 Go 或前端各维护一份映射——那样加一个 outcome
+/// 就要改三处，而漏改的表现是界面上一片空白。
+fn outcome_note(res: &TurnResult, cfg: &LoopConfig) -> String {
+    // Done 但历史快满了：提前提醒，别等撞墙。CLI 那边也打这句。
+    if matches!(res.outcome, TurnOutcome::Done) {
+        return if res.context_tokens * 10 > cfg.context_budget_tokens * 9 {
+            format!(
+                "会话历史已用约 {} / {} token，接近上限，建议开新会话。",
+                res.context_tokens, cfg.context_budget_tokens
+            )
+        } else {
+            String::new()
+        };
+    }
+    match &res.outcome {
+        TurnOutcome::Done => unreachable!("上面已经返回了"),
+        TurnOutcome::IterationCap => format!(
+            "跑了 {} 轮还没收敛，已停下。已经查到的都在库里，可以换个更具体的问法。",
+            res.iterations
+        ),
+        TurnOutcome::Truncated => "回答达到长度上限被截断了，上面这段是残缺的。\
+             这一轮已标记为失败，下次不会带上它。换个更聚焦的问法再试。"
+            .into(),
+        TurnOutcome::ProtocolError(e) => format!("模型返回了没见过的结束原因：{e}"),
+        TurnOutcome::ContextBudget { used, limit } => format!(
+            "这个会话的历史太长了（约 {used} / {limit} token）。继续问会被模型拒掉，\
+             请开一个新会话——当前会话已存好，随时能回去。"
+        ),
+        TurnOutcome::ModelError(e) => format!("模型调用失败：{e}"),
+    }
+}
+
+/// `clipknow turn` —— 跑一次提问，进度按 NDJSON 打到 stdout。
+///
+/// **stdout 只有 JSON。** 出错也走 JSON（`{"t":"error"}`），不然 Go 那边
+/// 只能看到一个非零退出码，没法在界面上说清出了什么事。同时照样返回 Err，
+/// 让手敲这条命令时有个非零退出码可看。
+fn cmd_turn_json(
+    store: &mut SqliteStore,
+    session: Option<String>,
+    question: &str,
+    provider: Option<Provider>,
+) -> Result<()> {
+    let sink = NdjsonSink::new(std::io::stdout());
+
+    // 宏：出错时先把错误推出去，再往上抛
+    macro_rules! bail {
+        ($e:expr) => {{
+            let e = $e;
+            sink.emit(&error_json(&e.to_string()));
+            return Err(e);
+        }};
+    }
+
+    let llm = match build_client(provider) {
+        Ok(l) => l,
+        Err(e) => bail!(e),
+    };
+    let api = match ScrapeCreators::from_env() {
+        Ok(a) => a,
+        Err(e) => bail!(e),
+    };
+    let vision = build_vision_client();
+    let vision_ref = vision.as_deref();
+    let cfg = LoopConfig::default();
+
+    // 会话由 Rust 这边建，不由 Go 建——这样**所有写操作都在这个进程里**，
+    // Go 只读。新会话的 id 在 hello 那一行报出去，Go 记下来下次传回。
+    let session_id = match session {
+        Some(id) => {
+            if !store.session_exists(&id)? {
+                bail!(ClipKnowError::BadRequest(format!(
+                    "没有这个会话: {id}（会话由 `turn` 自己创建，id 在 hello 那一行里）"
+                )))
+            }
+            id
+        }
+        None => match store.create_session(None) {
+            Ok(id) => id,
+            Err(e) => bail!(e),
+        },
+    };
+
+    sink.emit(&hello_json(
+        &session_id,
+        llm.model_name(),
+        vision_ref.map(|v| v.model_name()),
+    ));
+
+    let history = match store.load_turns_with_items(&session_id) {
+        Ok(h) => h,
+        Err(e) => bail!(e),
+    };
+    let is_first_turn = history.is_empty();
+
+    let res = run_turn_observed(
+        TurnDeps {
+            llm: &*llm,
+            api: &api,
+            store,
+            vision: vision_ref,
+        },
+        &history,
+        question,
+        &cfg,
+        &sink,
+    );
+
+    // ★ 落库在推 usage/done **之前**：Go 收到 done 就会去刷会话历史，
+    //   那时候这一轮必须已经在库里了。
+    if let Err(e) = persist_turn(
+        store,
+        llm.model_name(),
+        &session_id,
+        question,
+        is_first_turn,
+        &res,
+    ) {
+        sink.emit(&error_json(&format!("写库失败: {e}")));
+        return Err(e);
+    }
+
+    let cost = llm
+        .pricing()
+        .cost_usd(res.input_tokens, res.cached_input_tokens, res.output_tokens);
+    sink.emit(&usage_json(&res, cost));
+    sink.emit(&done_json(&res.outcome, &outcome_note(&res, &cfg)));
     Ok(())
 }
 

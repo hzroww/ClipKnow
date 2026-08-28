@@ -1,5 +1,8 @@
 /target
 clipknow.db
+# WAL 模式下 SQLite 会多出这两个伴生文件（见 store/sqlite.rs 的 init）
+clipknow.db-wal
+clipknow.db-shm
 .env
 docs/
 .DS_Store

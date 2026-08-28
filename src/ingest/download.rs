@@ -121,13 +121,18 @@ impl VideoFetcher for HttpVideoFetcher {
     }
 }
 
-fn too_big(actual: usize, limit: usize) -> ClipKnowError {
+/// 文件比我们自己设的下载上限还大。
+///
+/// `pub(crate)` 是为了让 `is_permanent_failure` 的回归测试走真实构造路径，
+/// 而不是在测试里抄一句文案——抄的话这边改措辞测试照样绿，分类静默失效。
+pub(crate) fn too_big(actual: usize, limit: usize) -> ClipKnowError {
     ClipKnowError::Fetch {
         platform: "video-cdn".into(),
         message: format!(
-            "视频 {:.1}MB，超过 {}MB 下载上限（这条视频太大，换一条）",
+            "视频 {:.1}MB，超过 {}{}（这条视频太大，换一条）",
             actual as f64 / 1_048_576.0,
-            limit / 1_048_576
+            limit / 1_048_576,
+            crate::agent::vision::OVERSIZE_DOWNLOAD
         ),
     }
 }

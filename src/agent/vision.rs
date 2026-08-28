@@ -289,14 +289,7 @@ impl<F: VideoFetcher> VisionClient for QwenVisionClient<F> {
         // 服务端自己报的上限，在上传之前拒掉——比传了 50MB 再被拒好
         let cap = p.max_file_size_mb * 1_048_576;
         if bytes.len() > cap {
-            return Err(ClipKnowError::Fetch {
-                platform: "video-stage".into(),
-                message: format!(
-                    "视频 {:.1}MB，超过上传上限 {}MB",
-                    bytes.len() as f64 / 1_048_576.0,
-                    p.max_file_size_mb
-                ),
-            });
+            return Err(oversize_for_upload(bytes.len(), p.max_file_size_mb));
         }
 
         let key = format!("{}/{}", p.upload_dir, STAGED_FILE_NAME);
@@ -421,6 +414,27 @@ fn truncate_for_msg(s: &str) -> String {
 /// **默认判为可重试。** 因为可重试那条路现在会把上传引用留下来，重试只花
 /// 一次 analyze 调用（不用重新下载上传）；而误判成永久会让一条视频的画面
 /// 永远看不了。代价不对称，所以往宽的一边错。
+/// 上传体积超限的固定措辞。构造端和分类端共用，改一处两边一起动。
+pub(crate) const OVERSIZE_UPLOAD: &str = "超过上传上限 ";
+/// 下载体积超限的固定措辞，见 `ingest::download::too_big`。
+pub(crate) const OVERSIZE_DOWNLOAD: &str = "MB 下载上限";
+
+/// 文件比供应商的上传上限还大。
+///
+/// 单独抽成函数是为了让 `is_permanent_failure` 的回归测试能走真实的构造
+/// 路径——测试里直接写死一句文案的话，这边改了措辞测试照样绿，而分类
+/// 会静默失效。
+pub(crate) fn oversize_for_upload(bytes: usize, cap_mb: usize) -> ClipKnowError {
+    ClipKnowError::Fetch {
+        platform: "video-stage".into(),
+        message: format!(
+            "视频 {:.1}MB，{}{cap_mb}MB",
+            bytes as f64 / 1_048_576.0,
+            OVERSIZE_UPLOAD
+        ),
+    }
+}
+
 pub fn is_permanent_failure(err: &ClipKnowError) -> bool {
     let m = err.to_string();
     // 内容安全审查。实测原文：
@@ -435,7 +449,20 @@ pub fn is_permanent_failure(err: &ClipKnowError) -> bool {
         return true;
     }
     // 超过服务端的长度上限（base64 那条路撞过 28,000,000 字符）
-    if m.contains("exceeds the maximum allowed") || m.contains("超过") {
+    if m.contains("exceeds the maximum allowed") {
+        return true;
+    }
+    // 我们自己在下载/上传前做的体积检查。这条视频每次都是这个大小，
+    // 重试一百次都是同样的结果。
+    //
+    // ⚠️ 这里**必须**匹配这两句完整措辞，不能图省事匹配「超过」两个字。
+    //    上游的中文报错里「超过」满地都是（「请求频率超过限制」「并发数
+    //    超过上限」），那些恰恰是该重试的。而误判的代价是不对称的：
+    //      判成可重试 → 白重试一次
+    //      判成永久   → blocked_reason 落库，这条视频**永远**不再分析，
+    //                   除非手改数据库
+    //    所以拿不准一律算可重试。
+    if m.contains(OVERSIZE_UPLOAD) || m.contains(OVERSIZE_DOWNLOAD) {
         return true;
     }
     false
@@ -737,11 +764,33 @@ mod tests {
                 .into(),
         );
         assert!(is_permanent_failure(&e));
-        let e2 = ClipKnowError::Fetch {
-            platform: "video-stage".into(),
-            message: "视频 340.0MB，超过上传上限 1024MB".into(),
-        };
-        assert!(is_permanent_failure(&e2));
+        // 走真实构造路径，不抄文案——那两个函数改了措辞这里就该红
+        assert!(is_permanent_failure(&oversize_for_upload(
+            340 * 1_048_576,
+            1024
+        )));
+        assert!(is_permanent_failure(&crate::ingest::download::too_big(
+            600 * 1_048_576,
+            512 * 1_048_576
+        )));
+    }
+
+    /// 上游的中文报错里「超过」是个高频词，而其中绝大多数是**该重试**的。
+    /// 曾经这里是 `m.contains("超过")`，会把下面每一条都判成永久失败，
+    /// 于是那条视频的 blocked_reason 落库，以后再也不会被分析。
+    #[test]
+    fn throttling_messages_that_merely_contain_the_word_are_retryable() {
+        for msg in [
+            "视觉模型 HTTP 429: 请求频率超过限制，请稍后重试",
+            "视觉模型 HTTP 429: 当前并发数超过上限",
+            "视觉模型 HTTP 400: 输入长度超过模型上下文窗口",
+            "视觉模型 HTTP 503: 后端排队时间超过阈值",
+        ] {
+            assert!(
+                !is_permanent_failure(&ClipKnowError::Llm(msg.into())),
+                "不该判成永久失败：{msg}"
+            );
+        }
     }
 
     #[test]

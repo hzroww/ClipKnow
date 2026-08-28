@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClipKnow</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --panel: #fff; --line: #dde3e9; --line-soft: #eef2f5;
+    --ink: #131a22; --mid: #566270; --soft: #8b96a2;
+    --accent: #1d4e89; --ok: #0e7568; --warn: #9c5a08; --bad: #93301f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1319; --panel: #161c24; --line: #28323d; --line-soft: #1e262f;
+      --ink: #e3e9ef; --mid: #a3afbb; --soft: #78838f;
+      --accent: #6ba8df; --ok: #3fbfa6; --warn: #dc9b36; --bad: #e0806e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.65 -apple-system, "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .87em; }
+
+  /* ── 左：会话列表 ─────────────────────── */
+  aside {
+    width: 250px; flex: none; border-right: 1px solid var(--line);
+    background: var(--panel); display: flex; flex-direction: column;
+  }
+  aside header {
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  aside h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  #new {
+    font-size: 13px; padding: 4px 10px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 5px;
+    background: transparent; color: var(--ink);
+  }
+  #new:hover { border-color: var(--accent); color: var(--accent); }
+  #sessions { overflow-y: auto; flex: 1; padding: 6px; }
+  .sess {
+    padding: 9px 11px; border-radius: 6px; cursor: pointer;
+    font-size: 13.5px; color: var(--mid);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sess:hover { background: var(--line-soft); }
+  .sess.on { background: var(--line-soft); color: var(--ink); font-weight: 500; }
+  .sess .when { display: block; font-size: 11px; color: var(--soft); font-weight: 400; }
+
+  /* ── 右：聊天 ─────────────────────────── */
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 26px 0 8px; }
+  .row { max-width: 760px; margin: 0 auto 22px; padding: 0 26px; }
+  .who {
+    font-size: 11.5px; letter-spacing: .07em; text-transform: uppercase;
+    color: var(--soft); margin-bottom: 5px;
+  }
+  .bubble { white-space: pre-wrap; word-break: break-word; }
+  .row.user .bubble {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 11px 14px;
+  }
+  .failed { color: var(--bad); font-size: 13px; margin-top: 6px; }
+
+  /* Markdown */
+  .md > *:first-child { margin-top: 0; }
+  .md > *:last-child { margin-bottom: 0; }
+  .md p { margin: 0 0 .85em; white-space: pre-wrap; }
+  .md h3, .md h4, .md h5, .md h6 {
+    margin: 1.4em 0 .5em; font-weight: 600; line-height: 1.4;
+  }
+  .md h3 { font-size: 1.18em; }
+  .md h4 { font-size: 1.06em; }
+  .md h5, .md h6 { font-size: 1em; color: var(--mid); }
+  .md ul, .md ol { margin: 0 0 .85em; padding-left: 1.5em; }
+  .md li { margin: .25em 0; }
+  .md li > * { margin: 0; }
+  .md code {
+    background: var(--line-soft); padding: .12em .38em; border-radius: 3px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .87em;
+  }
+  .md pre {
+    background: var(--line-soft); padding: 12px 14px; border-radius: 6px;
+    overflow-x: auto; margin: 0 0 .85em;
+  }
+  .md pre code { background: none; padding: 0; }
+  .md hr { border: none; border-top: 1px solid var(--line); margin: 1.3em 0; }
+  .md a { color: var(--accent); }
+  /* 表格可能很宽，让它自己横向滚动，别把整页撑开 */
+  .md table {
+    border-collapse: collapse; margin: 0 0 .85em; font-size: .93em;
+    display: block; overflow-x: auto; max-width: 100%;
+  }
+  .md th, .md td {
+    border: 1px solid var(--line); padding: 6px 11px; text-align: left;
+    vertical-align: top;
+  }
+  .md th { background: var(--line-soft); font-weight: 600; white-space: nowrap; }
+
+  /* 进度 */
+  .steps {
+    border-left: 2px solid var(--line); padding-left: 13px;
+    margin: 0 0 12px; font-size: 13px; color: var(--mid);
+  }
+  .steps.done { cursor: pointer; }
+  .steps.done.collapsed .step:not(:last-child) { display: none; }
+  .step { padding: 2px 0; display: flex; gap: 8px; align-items: baseline; }
+  .step .ic { flex: none; width: 1.1em; text-align: center; }
+  .step .sub { color: var(--soft); font-size: 12px; }
+  .step.err { color: var(--bad); }
+  .usage { color: var(--soft); font-size: 12px; margin-top: 10px; }
+
+  /* ── 输入 ────────────────────────────── */
+  footer { border-top: 1px solid var(--line); background: var(--panel); }
+  .box { max-width: 760px; margin: 0 auto; padding: 14px 26px 18px; display: flex; gap: 10px; }
+  textarea {
+    flex: 1; resize: none; min-height: 46px; max-height: 180px;
+    padding: 11px 13px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font: inherit; font-size: 14.5px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  #send {
+    flex: none; align-self: flex-end; padding: 11px 20px; border-radius: 8px;
+    border: none; background: var(--accent); color: #fff; font: inherit;
+    font-size: 14.5px; cursor: pointer;
+  }
+  #send:disabled { background: var(--line); color: var(--soft); cursor: not-allowed; }
+  .hint { max-width: 760px; margin: 0 auto; padding: 0 26px 12px; font-size: 12px; color: var(--soft); }
+</style>
+</head>
+<body>
+
+<aside>
+  <header><h1>ClipKnow</h1><button id="new">新会话</button></header>
+  <div id="sessions"></div>
+</aside>
+
+<main>
+  <div id="log"></div>
+  <footer>
+    <div class="box">
+      <textarea id="q" placeholder="贴一个视频链接，或者问点什么…"></textarea>
+      <button id="send">发送</button>
+    </div>
+    <div class="hint" id="hint">Enter 发送 · Shift+Enter 换行</div>
+  </footer>
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────
+// 这个文件是**唯一**把事件翻译成人话的地方。
+// Go 那边只负责转发，不理解内容；Rust 那边只报事实，不管怎么显示。
+// ─────────────────────────────────────────────────────────
+
+const $ = s => document.querySelector(s);
+const log = $('#log'), qBox = $('#q'), sendBtn = $('#send'), hint = $('#hint');
+
+let sessionId = null;   // null = 下一次提问会新建一个会话
+let busy = false;
+
+// ── 事件 → 人话 ──────────────────────────
+const TOOL_NAME = {
+  fetch_video:        '看视频',
+  search_videos:      '搜视频',
+  search_creators:    '搜博主',
+  get_creator:        '查博主资料',
+  get_creator_videos: '翻博主的视频',
+};
+
+function toolCallText(d) {
+  const a = d.args || {};
+  switch (d.name) {
+    case 'fetch_video':
+      return a.question ? `看视频画面：${a.question}` : `正在看视频 ${shortUrl(a.url)}`;
+    case 'search_videos':
+    case 'search_creators':
+      return `正在${TOOL_NAME[d.name]}「${a.query ?? ''}」`;
+    case 'get_creator':
+    case 'get_creator_videos':
+      return `正在${TOOL_NAME[d.name]} @${a.handle ?? ''}`;
+    default:
+      return `正在调用 ${d.name}`;
+  }
+}
+
+function toolResultText(d) {
+  if (d.is_error) return `${TOOL_NAME[d.name] ?? d.name}没成功`;
+  const bits = [];
+  // external_calls 是**接口调用次数**，不是工具调用次数：
+  // fetch_video 一次要打 3 个接口，命中缓存打 0 个。0 次就是全走了缓存。
+  bits.push(d.external_calls === 0 ? '走的缓存，没花钱' : `${d.external_calls} 次接口`);
+  if (d.vision_calls > 0) bits.push(`分析了 ${d.vision_calls} 条视频画面`);
+  return `${TOOL_NAME[d.name] ?? d.name}完成 · ${bits.join(' · ')}`;
+}
+
+function usageText(d) {
+  const bits = [`${d.iterations} 轮`, `${d.external_calls} 次接口`];
+  if (d.credits > 0) bits.push(`${d.credits} credit`);
+  if (d.video_analyses > 0) {
+    // 视觉的账在千问那边按人民币算，和主模型的美元账分开写——
+    // 混成一个数字既不准也看不出钱花在哪
+    bits.push(`画面 ${d.video_analyses} 条（约 ¥${(d.video_tokens / 1e6 * 3).toFixed(3)}）`);
+  }
+  bits.push(`约 $${d.cost_usd.toFixed(4)}`);
+  return bits.join(' · ');
+}
+
+function shortUrl(u) {
+  if (!u) return '';
+  try { const x = new URL(u); return x.hostname.replace(/^www\./, '') + x.pathname.slice(0, 28); }
+  catch { return u.slice(0, 40); }
+}
+
+// ── Markdown ────────────────────────────
+// 手写一个小的，不引外部库——模型实际输出的就是标题、加粗、列表、表格、
+// 代码这几样，够用了。
+//
+// ★★ 顺序是安全关键：**先把所有 HTML 转义掉，再做 Markdown 替换。**
+//    答案里可能夹带视频材料的原文（评论、文字稿），那是从社媒抓来的
+//    **不可信数据**。反过来先渲染再转义的话，一条 `<img onerror=...>`
+//    的评论就能在页面上执行脚本。
+function escapeHtml(t) {
+  return t.replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// 行内：代码 → 加粗 → 斜体。代码放最前面，这样 `**x**` 在反引号里不会被当成加粗。
+function inline(t) {
+  const code = [];
+  t = t.replace(/`([^`]+)`/g, (_, c) => `\u0000${code.push(c) - 1}\u0000`);
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+                '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return t.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${code[i]}</code>`);
+}
+
+function renderMarkdown(src) {
+  const lines = escapeHtml(src).split('\n');
+  const out = [];
+  let i = 0, para = [];
+
+  const flushPara = () => {
+    if (para.length) { out.push(`<p>${inline(para.join('\n'))}</p>`); para = []; }
+  };
+
+  while (i < lines.length) {
+    const l = lines[i];
+
+    // 代码块：里面的东西一律原样，不做任何行内替换
+    if (/^```/.test(l)) {
+      flushPara();
+      const body = [];
+      for (i++; i < lines.length && !/^```/.test(lines[i]); i++) body.push(lines[i]);
+      i++;
+      out.push(`<pre><code>${body.join('\n')}</code></pre>`);
+      continue;
+    }
+    // 表格：| a | b |  紧跟一行 |---|---|
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length
+        && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushPara();
+      const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => inline(c.trim()));
+      const head = cells(l);
+      i += 2;
+      const body = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) body.push(cells(lines[i++]));
+      out.push(
+        '<table><thead><tr>' + head.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>'
+        + body.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('')
+        + '</tbody></table>'
+      );
+      continue;
+    }
+    // 标题
+    const h = l.match(/^(#{1,4})\s+(.*)$/);
+    if (h) {
+      flushPara();
+      const n = Math.min(h[1].length + 2, 6);   // ## → h4，别在页面里抢 h1
+      out.push(`<h${n}>${inline(h[2])}</h${n}>`);
+      i++;
+      continue;
+    }
+    // 列表（有序 / 无序连成一块）
+    if (/^\s*([-*+]|\d+\.)\s+/.test(l)) {
+      flushPara();
+      const ordered = /^\s*\d+\./.test(l);
+      const items = [];
+      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
+        items.push(inline(lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, '')));
+        i++;
+      }
+      const tag = ordered ? 'ol' : 'ul';
+      out.push(`<${tag}>` + items.map(x => `<li>${x}</li>`).join('') + `</${tag}>`);
+      continue;
+    }
+    // 分隔线
+    if (/^\s*(---+|\*\*\*+)\s*$/.test(l)) { flushPara(); out.push('<hr>'); i++; continue; }
+    // 空行 = 段落结束
+    if (!l.trim()) { flushPara(); i++; continue; }
+
+    para.push(l);
+    i++;
+  }
+  flushPara();
+  return out.join('');
+}
+
+// ── 渲染 ────────────────────────────────
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function addRow(role, text) {
+  const row = el('div', `row ${role}`);
+  row.append(el('div', 'who', role === 'user' ? '你' : '模型'));
+  if (role === 'assistant') {
+    // 只有模型的输出走 Markdown。用户自己打的字保持原样——
+    // 他打了 `**` 就该看到 `**`，那不是格式是内容。
+    const b = el('div', 'bubble md');
+    b.innerHTML = renderMarkdown(text);
+    row.append(b);
+  } else {
+    row.append(el('div', 'bubble', text));
+  }
+  log.append(row);
+  log.scrollTop = log.scrollHeight;
+  return row;
+}
+
+function addStep(box, icon, text, sub, cls) {
+  const s = el('div', `step ${cls || ''}`);
+  s.append(el('span', 'ic', icon));
+  const body = el('span', null, text);
+  if (sub) { body.append(document.createTextNode(' ')); body.append(el('span', 'sub', sub)); }
+  s.append(body);
+  box.append(s);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ── 会话 ────────────────────────────────
+async function loadSessions() {
+  const list = await (await fetch('/api/sessions')).json();
+  const box = $('#sessions');
+  box.textContent = '';
+  for (const s of list) {
+    const d = el('div', 'sess' + (s.id === sessionId ? ' on' : ''), s.title || '(还没有标题)');
+    d.append(el('span', 'when', new Date(s.created_at * 1000).toLocaleString('zh-CN')));
+    d.onclick = () => openSession(s.id);
+    box.append(d);
+  }
+}
+
+async function openSession(id) {
+  if (busy) return;                  // 跑着的时候不让切，不然进度会跑到别的会话里
+  sessionId = id;
+  log.textContent = '';
+  const msgs = await (await fetch('/api/sessions/' + encodeURIComponent(id))).json();
+  for (const m of msgs) {
+    const row = addRow(m.role, m.text);
+    if (m.failed) row.append(el('div', 'failed', '这一轮没有正常结束，上面的内容可能是残缺的'));
+  }
+  loadSessions();
+}
+
+$('#new').onclick = () => {
+  if (busy) return;
+  sessionId = null;
+  log.textContent = '';
+  loadSessions();
+};
+
+// ── 提问 ────────────────────────────────
+function setBusy(on) {
+  busy = on;
+  // 输入框**始终可用**——等的时候可以先把下一个问题打好。
+  // 只有发送按钮变灰，而且 Enter 也不触发。
+  sendBtn.disabled = on;
+  hint.textContent = on
+    ? '正在回答中…可以先打下一个问题，答完再发'
+    : 'Enter 发送 · Shift+Enter 换行';
+}
+
+qBox.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+sendBtn.onclick = send;
+
+async function send() {
+  if (busy) return;
+  const q = qBox.value.trim();
+  if (!q) return;
+  qBox.value = '';
+  setBusy(true);
+
+  addRow('user', q);
+  const steps = el('div', 'steps');
+  const wrap = el('div', 'row');
+  wrap.append(steps);
+  log.append(wrap);
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, question: q }),
+    });
+    if (!res.ok) {
+      addStep(steps, '✗', await res.text(), null, 'err');
+      return;
+    }
+    await readStream(res, steps);
+  } catch (e) {
+    addStep(steps, '✗', '连接断了：' + e.message, null, 'err');
+  } finally {
+    setBusy(false);
+    loadSessions();
+  }
+}
+
+// SSE 是纯文本流：事件之间用空行分隔，每行以 "data: " 开头。
+// 不用 EventSource 是因为它只能发 GET，而问题可能很长，塞不进 URL。
+async function readStream(res, steps) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    // 一个事件以空行结束。最后一段可能只收到一半，留在 buf 里等下一轮。
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const chunk = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      for (const line of chunk.split('\n')) {
+        if (line.startsWith('data: ')) handle(JSON.parse(line.slice(6)), steps);
+      }
+    }
+  }
+  // 流结束时把进度折叠起来，点一下能展开
+  steps.classList.add('done', 'collapsed');
+  steps.onclick = () => steps.classList.toggle('collapsed');
+}
+
+function handle(d, steps) {
+  switch (d.t) {
+    case 'hello':
+      // 新会话的 id 是 Rust 建的，从这里拿回来。**所有写操作都在 Rust**，
+      // 前端和 Go 都不建会话。
+      sessionId = d.session;
+      addStep(steps, '·', `${d.model}${d.vision ? ' + ' + d.vision : '（没配视觉模型）'}`);
+      break;
+    case 'compacted':
+      addStep(steps, '📦', `历史太长，已压缩成 ${d.summary_chars} 字的摘要`);
+      break;
+    case 'iteration':
+      addStep(steps, '⟳', `第 ${d.n} 轮`);
+      break;
+    case 'tool_call':
+      addStep(steps, '🔧', toolCallText(d));
+      break;
+    case 'tool_result':
+      addStep(steps, d.is_error ? '✗' : '✓', toolResultText(d), null, d.is_error ? 'err' : '');
+      break;
+    case 'answer':
+      addRow('assistant', d.text);
+      break;
+    case 'usage': {
+      const u = el('div', 'row');
+      u.append(el('div', 'usage', usageText(d)));
+      log.append(u);
+      break;
+    }
+    case 'done':
+      if (d.note) {
+        const n = el('div', 'row'); n.append(el('div', 'failed', d.note)); log.append(n);
+      }
+      break;
+    case 'error':
+      addStep(steps, '✗', d.message, null, 'err');
+      break;
+    // 认不出的事件类型直接忽略——Rust 那边加了新事件，这里不用同步改
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+loadSessions();
+</script>
+</body>
+</html>

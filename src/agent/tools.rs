@@ -651,12 +651,6 @@ fn look_at_video(
     let duration = sv.video.duration_sec;
     let provider = vision.provider();
 
-    // ★ 这条视频的画面被永久性拒过（内容审查、格式不对、太大）就直接返回
-    //   原因，零下载零上传零分析。不记住的话每次都要重新走一遍再被拒。
-    if let Ok(Some(why)) = ctx.store.blocked_reason(vid, provider) {
-        return VisualOutcome::unavailable(why);
-    }
-
     // ① 通用档案有缓存就直接用，零调用。带问题时必须重看——旧档案答不了
     //    一个它没被问过的问题。
     //
@@ -674,7 +668,23 @@ fn look_at_video(
         };
     }
 
-    // ② 还活着的上传引用能复用就复用。留 10 分钟余量：拿到引用之后还要
+    // ② 这条视频的画面被永久性拒过（内容审查、格式不对、太大）就不再重试，
+    //    零下载零上传零分析。不记住的话每次都要重新走一遍再被拒。
+    //
+    //    ★ 顺序很重要：这一步**必须在 ① 之后**。
+    //      不变量是「黑名单只能阻止新的分析，不能遮住已经拿到的成果」。
+    //      原来它在 ① 前面，于是「先成功落档、后来被封」的视频连那份好档案
+    //      都读不出来了——库里明明有，代码不去看。触发路径不是假设：
+    //      is_permanent_failure 曾经用 contains("超过") 判定，追问时被限流
+    //      一次就会误判成永久，从此把首次成功的档案永久埋掉。
+    //
+    //    带问题时走到这里说明没有能直接用的档案，但通用档案可能存在——
+    //    把它降级给出去，比只回一句「不可用」有用得多。
+    if let Ok(Some(why)) = ctx.store.blocked_reason(vid, provider) {
+        return blocked_with_fallback(ctx, vid, duration, &why);
+    }
+
+    // ③ 还活着的上传引用能复用就复用。留 10 分钟余量：拿到引用之后还要
     //    做一次分析，卡着过期线开始会白失败一次。
     let now = crate::content::model::now_ts();
     let live = ctx
@@ -690,7 +700,7 @@ fn look_at_video(
             size_bytes: None, // 复用时没下载，不知道大小
             fresh: false,
         },
-        // ③ 没有可用引用：拿 CDN 直链 → 下载 + 上传
+        // ④ 没有可用引用：拿 CDN 直链 → 下载 + 上传
         None => {
             let direct = match fresh_play_addr(ctx, vid, parsed) {
                 Some(u) => u,
@@ -751,7 +761,10 @@ fn look_at_video(
                             dossier_json: String::new(),
                             model: vision.model_name().to_string(),
                             fps: 0.0,
-                            question: None,
+                            // 记下是哪个问题触发的。查询 latest_general_dossier /
+                            // recent_dossier_answers 都过滤 dossier_json <> ''，
+                            // 这一行进不了它们，纯排障信息。
+                            question: question.map(str::to_string),
                             video_tokens: None,
                             created_at: crate::content::model::now_ts(),
                             provider: Some(provider.to_string()),
@@ -821,7 +834,9 @@ fn look_at_video(
                 dossier_json: String::new(),
                 model: vision.model_name().to_string(),
                 fps: 0.0,
-                question: None,
+                // 记下是哪个问题触发的，排障用。两个读档案的查询都过滤
+                // dossier_json <> ''，这一行进不了它们。
+                question: question.map(str::to_string),
                 video_tokens: None,
                 created_at: crate::content::model::now_ts(),
                 provider: Some(provider.to_string()),
@@ -873,6 +888,32 @@ fn render_answer(question: &str, answer: &str, fps: f32) -> String {
         question.trim(),
         answer.trim()
     )
+}
+
+/// 画面分析被永久性拒了。有旧档案就连着旧档案一起给，别把已有的成果丢掉。
+///
+/// 只在「带问题追问」这条路上会走到：不带问题的通用请求在上一步就被缓存
+/// 档案接走了，压根到不了这里。
+fn blocked_with_fallback(
+    ctx: &ToolCtx<'_>,
+    video_id: &str,
+    duration: Option<i64>,
+    reason: &str,
+) -> VisualOutcome {
+    let Ok(Some(d)) = ctx.store.latest_general_dossier(video_id) else {
+        return VisualOutcome::unavailable(reason);
+    };
+    let mut section = d.render(duration, true);
+    append_past_answers(ctx, video_id, &mut section);
+    // 明说「这次的问题没分析」，不让模型把通用档案当成对问题的回答。
+    section.push_str(&crate::content::dossier::render_unavailable(&format!(
+        "上面是之前分析出的通用档案；这次的具体问题没能分析——{reason}"
+    )));
+    VisualOutcome {
+        section,
+        calls: 0,
+        video_tokens: 0,
+    }
 }
 
 /// 把这个视频历史上问过的画面细节附在档案后面。
@@ -2475,6 +2516,130 @@ mod tests {
             second.result.content
         );
         assert!(!second.result.is_error, "文字材料仍然有效");
+    }
+
+    #[test]
+    fn a_later_block_does_not_bury_an_earlier_successful_dossier() {
+        // ★ 回归测试。不变量：**黑名单只能阻止新的分析，不能遮住已经拿到的
+        //   成果。** 原来 blocked_reason 的检查排在缓存档案前面，于是「先成功
+        //   落档、后来被封」的视频连那份好档案都读不出来——库里明明有。
+        //
+        //   触发路径不是假设：is_permanent_failure 曾经用 contains("超过")
+        //   判定，追问时被限流一次就误判成永久，首次成功的档案从此被埋。
+        //   而当时 363 个测试全绿。
+        let api = tt_api();
+        let mut st = store();
+
+        // ① 第一次问，成功落档
+        let good = MockVision::ok(DOSSIER);
+        let first = execute(
+            &mut with_vision(&api, &mut st, &good, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(first.result.content.contains("讲大脑可塑性"));
+
+        // ② 追问，撞上内容审查 → 落一行永久封禁
+        let bad = MockVision::failing(
+            "视觉模型 HTTP 400: InternalError.Algo.DataInspectionFailed: \
+             Input video data may contain inappropriate content.",
+        );
+        execute(
+            &mut with_vision(&api, &mut st, &bad, 5),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "画面里的标语写了什么"}),
+            ),
+        );
+
+        // ③ 再问通用问题：必须还能拿到 ① 那份档案，且零调用
+        let after = execute(
+            &mut with_vision(&api, &mut st, &bad, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(
+            after.result.content.contains("讲大脑可塑性"),
+            "已有的档案不该被封禁遮住: {}",
+            after.result.content
+        );
+        assert!(
+            !after.result.content.contains("这次的具体问题没能分析"),
+            "通用请求压根不该走到封禁那一步——它在缓存那一步就该被接走，\
+             否则会给模型一句「这次的问题没分析」，而这次根本没有问题: {}",
+            after.result.content
+        );
+        assert_eq!(after.vision_calls, 0, "读缓存，不该再调分析");
+        // 整条链路只上传过一次（① 那次）。② 复用了 ① 留下的引用，
+        // 所以 bad 自己一次都没传。
+        assert_eq!(*good.staged.borrow(), 1);
+        assert_eq!(*bad.staged.borrow(), 0, "不该有任何新上传");
+    }
+
+    #[test]
+    fn a_blocked_question_still_gets_the_general_dossier_with_a_note() {
+        // 带问题时走不到缓存那一步（旧档案答不了新问题），但通用档案总比
+        // 一句「不可用」有用。两样都给，并明说这次的问题没分析——不然模型
+        // 会把通用档案当成对问题的回答。
+        let api = tt_api();
+        let mut st = store();
+        let good = MockVision::ok(DOSSIER);
+        execute(
+            &mut with_vision(&api, &mut st, &good, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        let bad = MockVision::failing(
+            "视觉模型 HTTP 400: InternalError.Algo.DataInspectionFailed: inappropriate content",
+        );
+        execute(
+            &mut with_vision(&api, &mut st, &bad, 5),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "标语写了什么"}),
+            ),
+        );
+
+        let out = execute(
+            &mut with_vision(&api, &mut st, &bad, 5),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "旗子什么颜色"}),
+            ),
+        );
+        let c = &out.result.content;
+        assert!(c.contains("讲大脑可塑性"), "通用档案要给出去: {c}");
+        assert!(c.contains("这次的具体问题没能分析"), "但要明说没分析: {c}");
+        assert!(c.contains("inappropriate content"), "原因要带上: {c}");
+        assert_eq!(out.vision_calls, 0);
+        // 第一个问题复用了通用分析那次的上传，第二个问题被封禁短路，
+        // 两次都没有新上传。
+        assert_eq!(*good.staged.borrow(), 1);
+        assert_eq!(*bad.staged.borrow(), 0, "不该为任何问题重新上传");
+    }
+
+    #[test]
+    fn a_block_without_any_dossier_still_returns_just_the_reason() {
+        // 没有旧档案可降级时，行为和原来一样：只回原因。
+        let api = tt_api();
+        let mut st = store();
+        let bad = MockVision::failing(
+            "视觉模型 HTTP 400: InternalError.Algo.DataInspectionFailed: inappropriate content",
+        );
+        execute(
+            &mut with_vision(&api, &mut st, &bad, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        let out = execute(
+            &mut with_vision(&api, &mut st, &bad, 5),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert!(out.result.content.contains("inappropriate content"));
+        assert!(
+            !out.result.content.contains("这次的具体问题没能分析"),
+            "没有档案就不该出现降级说明: {}",
+            out.result.content
+        );
+        assert_eq!(out.vision_calls, 0);
+        assert_eq!(*bad.staged.borrow(), 1);
     }
 
     #[test]

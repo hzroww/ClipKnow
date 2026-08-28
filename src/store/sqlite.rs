@@ -33,9 +33,39 @@ impl SqliteStore {
         Self::init(conn)
     }
 
+    /// 撞锁时等多久再报错。
+    ///
+    /// **不设的话是「立刻返回 SQLITE_BUSY」**，不是「等一会儿」——这是 SQLite
+    /// 的默认行为，单进程时永远碰不到，一变成多进程就必炸。
+    ///
+    /// 5 秒是按最坏情况估的：另一个写者要么在写 turn（毫秒级），要么在
+    /// `save` 一批评论（同一个事务，也是毫秒级）。真等满 5 秒说明对面卡死了，
+    /// 那时候报错比继续等有用。
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     fn init(conn: Connection) -> Result<Self> {
         // 外键约束在 SQLite 里默认是关的，要显式打开
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        // ★ WAL：读不挡写、写不挡读。
+        //
+        // 单进程时完全用不上，加它是为了 web 服务——Go 那边查会话列表的同时，
+        // Rust 子进程正在写这一轮的 turn。默认的 rollback journal 模式下写者
+        // 锁整个库，两边必有一个直接失败。
+        //
+        // 用 query_row 而不是 execute：`PRAGMA journal_mode` **会返回一行**
+        // （生效后的模式名），走 execute 会得到 ExecuteReturnedResults 错误。
+        // 顺手把返回值拿来做断言的依据——内存库不支持 WAL，会返回 "memory"，
+        // 那是正常的，不当失败处理。
+        //
+        // ⚠️ WAL 常说的「读不挡写」对**这个函数自己**不成立：`init` 每次都跑
+        // 一遍迁移，那是写操作。实测另一个进程持写锁时，这里要等 2.2 秒
+        // （靠下面的 busy_timeout 撑住），而不是立刻返回。
+        // 真正白得「读不挡写」的是**不跑迁移的只读连接**——web 服务查会话
+        // 列表走的就是那条路，它不经过这里。
+        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+
         conn.execute_batch(include_str!("../../migrations/001_init.sql"))?;
         migrate_drop_video_raw_json(&conn)?;
         conn.execute_batch(include_str!("../../migrations/002_agent_loop.sql"))?;
@@ -402,6 +432,23 @@ impl SqliteStore {
         })
     }
 
+    /// 这个会话 id 存在吗。
+    ///
+    /// web 服务把 session id 从浏览器传回来，那是**外部输入**——不检查就直接
+    /// 拿去 `save_turn`，会在跑完整个循环（花掉几十秒和真金白银）之后才撞上
+    /// 外键约束失败，结果全丢。在花钱之前拦。
+    pub fn session_exists(&self, session_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![session_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.title, s.created_at,
@@ -597,6 +644,50 @@ impl SqliteStore {
     /// 命中它就直接把原因返回给模型——零下载零上传零分析。起因是一条政治
     /// 评论视频被内容审查拒了，而那个失败是确定性的：不记住的话每次都要
     /// 重新下载 + 上传 + 被拒一遍。
+    /// 把连接降级回**加 WAL 之前**的行为：rollback journal + 撞锁立刻失败。
+    ///
+    /// 只给探针用，用来证明「不加 WAL 会怎样」——不然那个改动没法验证，
+    /// 只能靠嘴说。
+    #[doc(hidden)]
+    pub fn downgrade_to_legacy_for_test(&self) -> Result<()> {
+        let _m: String = self
+            .conn
+            .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        Ok(())
+    }
+
+    /// 当前的 journal 模式。给多进程探针用。
+    #[doc(hidden)]
+    pub fn journal_mode_for_test(&self) -> String {
+        self.conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap_or_else(|_| "?".into())
+    }
+
+    /// 开一个写事务并占住 `secs` 秒。给多进程探针用，验证 busy_timeout。
+    #[doc(hidden)]
+    pub fn hold_write_lock_for_test(&self, secs: u64) -> Result<()> {
+        // IMMEDIATE 立刻拿写锁，不等到第一条写语句
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        debug_assert!(!self.conn.is_autocommit(), "BEGIN IMMEDIATE 没开成事务");
+        self.conn.execute(
+            "INSERT INTO sessions (id, title, created_at) VALUES (?1, NULL, ?2)",
+            params![new_id(), now_ts()],
+        )?;
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// 给多进程探针用。
+    #[doc(hidden)]
+    pub fn count_sessions_for_test(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?)
+    }
+
     pub fn blocked_reason(&self, video_id: &str, provider: &str) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT blocked_reason FROM video_dossiers

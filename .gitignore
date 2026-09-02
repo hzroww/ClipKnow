@@ -6,3 +6,8 @@ clipknow.db-shm
 .env
 docs/
 .DS_Store
+# 邀请码和配额（含密钥性质的码，绝不能进版本库）
+access.json
+access.json.tmp
+# eval 每跑一次都从 evals/baseline.db 重建这个库，不用进版本库
+evals/results/warm.db

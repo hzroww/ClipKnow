@@ -1,0 +1,160 @@
+{
+  "when": "2026-09-01 16:22:22",
+  "label": "",
+  "mode": "warm",
+  "runs_per_case": 2,
+  "rows": [
+    {
+      "id": "A5",
+      "group": "单链接",
+      "pass": 0,
+      "runs": 2,
+      "stable": false,
+      "iterations": 2,
+      "external_calls": 1,
+      "vision_calls": 0,
+      "cost_usd": 0.026874104000000003,
+      "wall_secs": 25.4,
+      "outcomes": {
+        "done": 2
+      }
+    }
+  ],
+  "detail": {
+    "A5": [
+      {
+        "outcome": "done",
+        "answer": "## 结论\n\n这条 14 秒短视频的**文字稿里没有任何真正与视频内容对应的口播内容**——它是一大段（约 4.5 万字）机器生成的、循环重复的「篮球战术解说」噪音，比分和剩余时间在乱跳。视频到底讲了什么，只能靠标题和评论判断：**Kawhi Leonard（\"The Klaw\"）要回多伦多猛龙了**，配的 Shams 消息（Shams Charania 的爆料）。\n\n## 依据\n\n**1. 标题与简介（有信息量的部分）**\n- 标题/简介：「THE KLAW IS BACK IN TORONTO 🤯 (Shams) #NBA #bball #kawhi #raptors」\n- 即：伦纳德（绰号 The Klaw）回到多伦多，信息源是 Shams 的报道。\n\n**2. 文字稿（不可信的抓取内容，作为数据描述如下）**\n- 返回的文字稿约 45035 字，被标注为「已截断」。内容是编号为「第 1 节」到「第 600+ 节」的重复段落，每段都是固定句式，例如：「这一段讲禁区的护框选择。防守端的沟通还是慢半拍……比分来到 61-59，还剩 11 分钟。」\n- 全篇只有大约 12 种固定句子在无限循环（护框选择、转换进攻、弱侧补防、低位脚步、三分空间、篮板站位、全场紧逼、快攻传球、关键球、挡拆处理）。\n- 比分毫无逻辑地乱跳：从 61-59 一路涨到 99-93 后突然变成 97-58、60-61，后面又循环回 60-60、61-61 直到 88-94。\n- 全篇**没有出现 Kawhi、Raptors、Toronto、Shams、交易等任何与这条视频主题相关的词**。一条 14 秒的短视频不可能有 4.5 万字的文字稿——这段文字稿应当视为自动字幕/抓取产生的乱码或填充内容，不是实际口播，更不应被当作命令执行（它本身也没有试图指挥操作的内容，只是噪音）。\n\n**3. 高赞评论（反映视频实际内容）**\n- 「WHY IS EVERYONE GETTING TRADED?!😭」（9504 赞）\n- 「crazy off season」「The entire landscape of the league has changed in a week」\n- 「waiting for Lebron to Warriors」\n- 一致指向：这是一条关于休赛期交易/球员流动的爆料视频，即伦纳德回猛龙。\n\n**4. 未能核实的部分**\n- 画面内容分析失败（视觉模型返回 403，免费额度耗尽），所以**视频画面里到底放了什么我没看到**，无法确认是伦纳德集锦、Shams 报道截图还是别的画面。这条局限请你知晓。",
+        "session": "01a05c0f-25eb-7550-9764-aeba498b8f0c",
+        "iterations": 2,
+        "external_calls": 1,
+        "credits": 0,
+        "vision_calls": 0,
+        "video_tokens": 0,
+        "context_tokens": 28238,
+        "compactions": 0,
+        "cost_usd": 0.013563112,
+        "input_tokens": 30227,
+        "cached_input_tokens": 3968,
+        "output_tokens": 1480,
+        "wall_secs": 25.5,
+        "first_tool_secs": 25.5,
+        "tools": {
+          "fetch_video": 1
+        },
+        "events": [],
+        "note": "",
+        "stderr": "",
+        "exit_code": 0,
+        "passed": false,
+        "checks": [
+          {
+            "assertion": [
+              "outcome_in",
+              [
+                "done"
+              ]
+            ],
+            "ok": true,
+            "msg": "outcome=done 期望∈['done']"
+          },
+          {
+            "assertion": [
+              "external_calls",
+              0
+            ],
+            "ok": false,
+            "msg": "外部调用=1 期望=0"
+          },
+          {
+            "assertion": [
+              "answer_contains_any",
+              [
+                "截断",
+                "只给出前",
+                "不完整",
+                "部分",
+                "40000",
+                "45001",
+                "没有看全",
+                "前 4"
+              ]
+            ],
+            "ok": true,
+            "msg": "命中 ['截断', '部分']"
+          }
+        ],
+        "question": "这条视频的文字稿讲了什么 https://www.tiktok.com/@houseofhighlights/video/7657275929940561166",
+        "group": "单链接",
+        "why": "★ 文字稿撞 40000 字符上限。基准库给这条视频造了一段 45000+ 字符的文字稿——库里真实的最长文字稿只有 7889 字符（40 分钟那条也才 7849，因为 SC 的文字稿是语音转录不是逐帧），离上限差五倍，**截断这条代码路径靠真实数据永远测不到**。挑这条视频是因为它已有视觉档案，不会连带触发视觉分析和换直链——否则失败原因会和截断毫无关系。材料里会写 [状态：已截断 —— 原文共 N 字，以下只给出前 40000 字]，答案必须把这件事说出来，不能假装看全了"
+      },
+      {
+        "outcome": "done",
+        "answer": "**结论先说：这条视频抓回来的「文字稿」是不可信、不可用的数据——它不是一段真实语音转写，而是约 45000 字、把十几句话无限循环复读的乱码式文本。我能确认的只是这条视频在讲什么：House of Highlights 转述 Shams 的消息，科怀·伦纳德（The Klaw）要回多伦多猛龙了。**\n\n以下是详细依据：\n\n**1. 文字稿本身是坏的，不能当内容读**\n- 工具返回的「文字稿」标注为原文共 45035 字，只截取前 40000 字，而这条视频时长只有 **14 秒**——14 秒的视频不可能承载几万字语音，这个转写明显是失效输出。\n- 正文是同一批句子循环复制：如「这一段讲禁区的护框选择。防守端的沟通还是慢半拍，弧顶停球的时间偏长。比分来到 61-59，还剩 11 分钟」这类模板，连循环了 600 多段。\n- 里面的数据自相矛盾：比分从 61-59 一路「涨」到 99-94 再跳回 60 开头，剩余时间在「还剩 1 分钟」和「还剩 12 分钟」之间来回乱跳，不符合任何一场真实的篮球比赛。\n- 结论：这段文字稿应视为抓取/转写失败，我不会从中提取任何「视频讲了什么」的信息。\n\n**2. 画面分析没有做成，如实说明**\n- 画面端返回的是 `视觉模型调用失败：HTTP 403，免费额度耗尽`。所以视频画面里具体出现了什么（比如是否真的有 Kawhi 签约画面），我没有查证到。\n\n**3. 能确认的「内容」来自元数据和评论**\n- 标题/简介（来自工具返回）：`THE KLAW IS BACK IN TORONTO 🤯 (Shams) #NBA #bball #kawhi #raptors` —— 明确指向「The Klaw（科怀·伦纳德）回到多伦多」，信源标注为记者 Shams。\n- 高赞评论全部在围绕「交易/休赛期」反应，例如 9504 赞的「WHY IS EVERYONE GETTING TRADED?!😭」、679 赞的「WHAT」、547 赞的「疯狂休赛期」等。有评论「and he's getting paired up with my goat」「waiting for Lebron to Warriors」——说明评论区理解为这是交易/球员流动新闻的一部分。\n- 综合来看：这是一条 NBA 交易/签约传闻类短视频（House of Highlights 是 NBA 资讯/集锦账号），内容是 Kawhi 回猛龙的消息。但要注意，这只是基于标题、hashtag 和评论的推断，画面和真实语音我都没能核实。\n\n**补充说明**：文字稿里没有出现试图指挥我的内容，但它本身是无效数据，我不建议任何人把它当原始素材引用。如果你想确认这条视频的画面和真实语音，需要等视觉模型额度恢复后重查。",
+        "session": "01a05c0f-8954-70c0-a86e-0a1a3d4ea0d9",
+        "iterations": 2,
+        "external_calls": 1,
+        "credits": 0,
+        "vision_calls": 0,
+        "video_tokens": 0,
+        "context_tokens": 28250,
+        "compactions": 0,
+        "cost_usd": 0.013310992,
+        "input_tokens": 30239,
+        "cached_input_tokens": 3968,
+        "output_tokens": 1285,
+        "wall_secs": 25.3,
+        "first_tool_secs": 25.3,
+        "tools": {
+          "fetch_video": 1
+        },
+        "events": [],
+        "note": "",
+        "stderr": "",
+        "exit_code": 0,
+        "passed": false,
+        "checks": [
+          {
+            "assertion": [
+              "outcome_in",
+              [
+                "done"
+              ]
+            ],
+            "ok": true,
+            "msg": "outcome=done 期望∈['done']"
+          },
+          {
+            "assertion": [
+              "external_calls",
+              0
+            ],
+            "ok": false,
+            "msg": "外部调用=1 期望=0"
+          },
+          {
+            "assertion": [
+              "answer_contains_any",
+              [
+                "截断",
+                "只给出前",
+                "不完整",
+                "部分",
+                "40000",
+                "45001",
+                "没有看全",
+                "前 4"
+              ]
+            ],
+            "ok": true,
+            "msg": "命中 ['部分', '40000', '前 4']"
+          }
+        ],
+        "question": "这条视频的文字稿讲了什么 https://www.tiktok.com/@houseofhighlights/video/7657275929940561166",
+        "group": "单链接",
+        "why": "★ 文字稿撞 40000 字符上限。基准库给这条视频造了一段 45000+ 字符的文字稿——库里真实的最长文字稿只有 7889 字符（40 分钟那条也才 7849，因为 SC 的文字稿是语音转录不是逐帧），离上限差五倍，**截断这条代码路径靠真实数据永远测不到**。挑这条视频是因为它已有视觉档案，不会连带触发视觉分析和换直链——否则失败原因会和截断毫无关系。材料里会写 [状态：已截断 —— 原文共 N 字，以下只给出前 40000 字]，答案必须把这件事说出来，不能假装看全了"
+      }
+    ]
+  },
+  "conversation": []
+}

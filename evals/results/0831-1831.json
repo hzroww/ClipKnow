@@ -1,0 +1,195 @@
+{
+  "when": "2026-08-31 18:31:49",
+  "label": "",
+  "mode": "warm",
+  "runs_per_case": 1,
+  "rows": [
+    {
+      "id": "A1",
+      "group": "单链接",
+      "pass": 1,
+      "runs": 1,
+      "stable": true,
+      "iterations": 2,
+      "external_calls": 0,
+      "vision_calls": 0,
+      "cost_usd": 0.002352792,
+      "wall_secs": 11.5,
+      "outcomes": {
+        "done": 1
+      }
+    },
+    {
+      "id": "A10",
+      "group": "单链接",
+      "pass": 1,
+      "runs": 1,
+      "stable": true,
+      "iterations": 1,
+      "external_calls": 0,
+      "vision_calls": 0,
+      "cost_usd": 0.00100148,
+      "wall_secs": 6.9,
+      "outcomes": {
+        "done": 1
+      }
+    }
+  ],
+  "detail": {
+    "A1": [
+      {
+        "outcome": "done",
+        "answer": "**结论：这条视频是一个「神秘海洋生物」猎奇向短视频——渔民在甲板上处理一条体型巨大的银灰色大鱼，画面加字声称「渔民捕获的疑似 Tritón（传说海神/海妖）」，全程没有旁白，靠标题和悬念吸引观众，评论区讨论的焦点是「这到底是 AI 生成还是真的」。**\n\n依据（来自对这条视频的完整抓取）：\n\n**视频基本信息**\n- 作者 @kencivii，标题是西班牙语：「渔民们无意中捕获了一只奇怪的海洋生物，你觉得它是什么？」标签 #terror #criaturasextrañas #sirenas #misterio #horror（恐怖/奇怪生物/美人鱼/神秘/恐怖）\n- 时长仅 10 秒，发布于 2026-07-19，播放 774 万、点赞 13.8 万、评论 8782 条\n- 没有语音和文字稿，纯画面+文字形式\n\n**画面内容（逐帧分析）**\n- 镜头俯拍渔船的湿滑木质甲板，一条银灰色、流线型的大鱼横躺其上，体长目测超过站立渔民身高的 1.5 倍（估计 2.5–3 米以上）\n- 两名穿黄/橙色防水裤的渔民用绳索捆绑控制鱼身，鱼在挣扎，画面抖动剧烈，旁有渔网、白色桶\n- 画面叠加文字：「PESCADORES CAPTURAN / LO QUE PARECE SER UN TRITÓN」（渔民捕获疑似 Tritón）\n- 鱼尾鳍为深叉形新月尾，尾鳍下叶后缘有一排清晰的锯齿状突起——这是画面里最引人注目的特征\n- 画面分析明确指出：这实际是某种大型硬骨鱼类（形态类似旗鱼/枪鱼一类），「Tritón」是误称，且画质低、抖动大，**无法确认确切物种，也无法判断是否真实拍摄**——这正是这条视频的卖点\n\n**评论区在吵什么（高赞 19 条抽样）**\n- 核心争议是「AI 还是真的」：3.8 万赞热评说「可怕的是这可能 100% 是真的，但 AI 毁了一切，我们永远无法知道真相」；另一条 1.6 万赞说「那个肚子抖得太真实了」；也有俄语评论反驳「这不是 AI，看它用尾巴拍打时肚子在抖，是实拍」\n- 有人玩梗（「30 岁之后连海神都会长啤酒肚」），有人说是「pejelagarto」（雀鳝）、「南智利的 totoretos」之类具体物种\n- 整体气氛是：观众无法分辨真伪，而这正是这类视频的传播逻辑\n\n一句话总结：它是一条约 7 成靠「悬念+恐怖标签」、3 成靠「实拍感 vs AI 争议」传播的猎奇短视频，内容本身信息量很低——没有旁白、没有结论、没有出处，只说「你觉得这是什么？」。",
+        "session": "01a0575f-cabc-7a10-b8a2-cccb521eb1e3",
+        "iterations": 2,
+        "external_calls": 0,
+        "credits": 0,
+        "vision_calls": 0,
+        "video_tokens": 0,
+        "context_tokens": 3895,
+        "compactions": 0,
+        "cost_usd": 0.002352792,
+        "input_tokens": 5883,
+        "cached_input_tokens": 3968,
+        "output_tokens": 1102,
+        "wall_secs": 11.5,
+        "first_tool_secs": 11.5,
+        "tools": {
+          "fetch_video": 1
+        },
+        "events": [],
+        "note": "",
+        "stderr": "",
+        "exit_code": 0,
+        "passed": true,
+        "checks": [
+          {
+            "assertion": [
+              "outcome_in",
+              [
+                "done"
+              ]
+            ],
+            "ok": true,
+            "msg": "outcome=done 期望∈['done']"
+          },
+          {
+            "assertion": [
+              "external_calls",
+              0
+            ],
+            "ok": true,
+            "msg": "外部调用=0 期望=0"
+          },
+          {
+            "assertion": [
+              "vision_calls",
+              0
+            ],
+            "ok": true,
+            "msg": "视觉=0 期望=0"
+          },
+          {
+            "assertion": [
+              "iterations_max",
+              3
+            ],
+            "ok": true,
+            "msg": "迭代=2 上限=3"
+          },
+          {
+            "assertion": [
+              "tool_used",
+              "fetch_video"
+            ],
+            "ok": true,
+            "msg": "fetch_video 调用 1 次，期望 >0"
+          },
+          {
+            "assertion": [
+              "tool_not_used",
+              "search_videos"
+            ],
+            "ok": true,
+            "msg": "search_videos 调用 0 次，期望 0"
+          }
+        ],
+        "question": "这条视频在讲什么 https://www.tiktok.com/@kencivii/video/7664027875661630728",
+        "group": "单链接",
+        "why": "全缓存命中：文字和视觉档案都在库里，不该花任何钱"
+      }
+    ],
+    "A10": [
+      {
+        "outcome": "done",
+        "answer": "这个链接我查不了，先说明原因：\n\n**结论：无法核实这条视频的内容。** 我手头的工具只能访问 YouTube、TikTok、Instagram 三个平台的内容（搜索、账号主页、视频文字稿/画面分析都只覆盖这三家），B 站不在支持范围内，`fetch_video` 对这个链接也不会返回有效结果。我没有假装查过，所以这条视频具体在讲什么，我无法给出任何有依据的判断。\n\n如果你需要我帮你查，可以这样补救：\n\n- 如果这条视频（或同一作者的内容）在 **YouTube / TikTok / Instagram** 上有搬运或同步发布，把对应的链接或账号 handle 给我，我可以读文字稿和画面内容，告诉你它实际讲了什么；\n- 或者把视频的**标题、UP 主名字**给我，我在另外三个平台上搜搜看有没有同主题、同作者的镜像内容，但注意那是另一条视频，不是这条本身；\n- B 站本身的内容，建议直接看视频简介、置顶评论或弹幕来确认，那部分我够不到。",
+        "session": "01a0575f-f777-7322-bb22-bfbe55ec2f56",
+        "iterations": 1,
+        "external_calls": 0,
+        "credits": 0,
+        "vision_calls": 0,
+        "video_tokens": 0,
+        "context_tokens": 1984,
+        "compactions": 0,
+        "cost_usd": 0.00100148,
+        "input_tokens": 1984,
+        "cached_input_tokens": 1920,
+        "output_tokens": 717,
+        "wall_secs": 6.9,
+        "first_tool_secs": null,
+        "tools": {},
+        "events": [],
+        "note": "",
+        "stderr": "",
+        "exit_code": 0,
+        "passed": true,
+        "checks": [
+          {
+            "assertion": [
+              "outcome_in",
+              [
+                "done"
+              ]
+            ],
+            "ok": true,
+            "msg": "outcome=done 期望∈['done']"
+          },
+          {
+            "assertion": [
+              "external_calls",
+              0
+            ],
+            "ok": true,
+            "msg": "外部调用=0 期望=0"
+          },
+          {
+            "assertion": [
+              "iterations_max",
+              3
+            ],
+            "ok": true,
+            "msg": "迭代=1 上限=3"
+          },
+          {
+            "assertion": [
+              "answer_contains_any",
+              [
+                "不支持",
+                "只支持",
+                "无法识别",
+                "不在支持",
+                "暂不支持"
+              ]
+            ],
+            "ok": true,
+            "msg": "命中 ['不在支持']"
+          }
+        ],
+        "question": "这条视频在讲什么 https://www.bilibili.com/video/BV1xx411c7mD",
+        "group": "单链接",
+        "why": "不支持的平台。要在打任何网络之前就拒掉"
+      }
+    ]
+  },
+  "conversation": []
+}

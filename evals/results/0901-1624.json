@@ -1,0 +1,160 @@
+{
+  "when": "2026-09-01 16:24:04",
+  "label": "",
+  "mode": "warm",
+  "runs_per_case": 2,
+  "rows": [
+    {
+      "id": "A5",
+      "group": "单链接",
+      "pass": 2,
+      "runs": 2,
+      "stable": true,
+      "iterations": 2,
+      "external_calls": 0,
+      "vision_calls": 0,
+      "cost_usd": 0.028495504000000005,
+      "wall_secs": 18.299999999999997,
+      "outcomes": {
+        "done": 2
+      }
+    }
+  ],
+  "detail": {
+    "A5": [
+      {
+        "outcome": "done",
+        "answer": "## 结论\n\n这条视频的**文字稿（转录文本）和视频内容完全对不上**——工具返回的是一份 45035 字、被截断的**篮球比赛解说稿**，而视频本身是一段 LED 发光标识工厂的**营销推广短片**。这基本可以判断为转录工具抓错了音频来源（或转录出错），不能当作该视频的真实口播内容。\n\n依据（都是这次 fetch_video 的实际返回）：\n\n**1. 视频是什么（元数据 + 画面分析）**\n- 作者：LCSIGN（@lcsign_lightbox），时长 24 秒，标题/简介是「No MOQ（无起订量）🤗🤗 + WhatsApp/Email 联系 + #ledsign #ledlights」，播放 170 万、点赞 4.9 万、评论 610。\n- 画面：交替剪辑两组镜头——疑似特朗普的蓝西装红领带男子在户外人群中被拍摄；以及工厂车间里一名戴眼镜、穿黑 T 恤的年轻男子展示 A 形、L 形、环形 LED 发光标识，背景有「质检区1」标牌和工人。画面叠加文字：`What's up homie / for a bad quality / order a led sign / No source factory / indoor use or / Come to LC sign / you can find our...`，并带联系信息（Email: siya@lcsign.com，电话 +86 153 6000 7583 等）。\n\n**2. 返回的「文字稿」内容**\n- 开头标注「原文共 45035 字，以下只给出前 40000 字」——24 秒的视频不可能有 4 万多字的语音内容，本身就不合理。\n- 内容是一套循环复读的篮球战术解说，例如：「这一段讲禁区的护框选择」「这一段讲转换进攻的推进速度」「这一段讲弱侧的补防轮转」「这一段讲低位单打的脚步」，每段配一句循环的比分和剩余时间（如「比分来到 61-59，还剩 11 分钟」），从第 1 节到第 629 节，比分循环滚动。这套文本与视频里的 LED 标识工厂毫无关系。\n\n**3. 真实的口播内容（来自画面分析的口述记录）**\n男子实际说的话约是：「What's up homie, for a bad quality, order a led sign, No source factory, indoor use or, Come to LC sign, you can find our...」——其中「for a bad quality」明显是口误/字幕错误，结合语境应为「good quality」。画面分析也注明：因音频质量与字幕不全，完整句子无法精确还原，仅能依据字幕片段推断。\n\n**附带说明**\n- 高赞评论里多次出现「Tony」和「广告很会做」（如「Tony is the reason I bought a sign」「His marketing always on another level」），与画面里疑似特朗普的素材相呼应——但画面分析明确标注：户外人物身份仅凭外貌推测，未获官方确认，不能 100% 断定是特朗普。\n- 文字稿这段异常文本里没有出现试图操纵阅读者的指令，只是纯粹对不上号的解说内容，按异常数据处理即可。",
+        "session": "01a05c10-ed6f-7432-92dd-c100981e610c",
+        "iterations": 2,
+        "external_calls": 0,
+        "credits": 0,
+        "vision_calls": 0,
+        "video_tokens": 0,
+        "context_tokens": 29381,
+        "compactions": 0,
+        "cost_usd": 0.014256992000000001,
+        "input_tokens": 31372,
+        "cached_input_tokens": 3968,
+        "output_tokens": 1624,
+        "wall_secs": 18.2,
+        "first_tool_secs": 18.2,
+        "tools": {
+          "fetch_video": 1
+        },
+        "events": [],
+        "note": "",
+        "stderr": "",
+        "exit_code": 0,
+        "passed": true,
+        "checks": [
+          {
+            "assertion": [
+              "outcome_in",
+              [
+                "done"
+              ]
+            ],
+            "ok": true,
+            "msg": "outcome=done 期望∈['done']"
+          },
+          {
+            "assertion": [
+              "external_calls",
+              0
+            ],
+            "ok": true,
+            "msg": "外部调用=0 期望=0"
+          },
+          {
+            "assertion": [
+              "answer_contains_any",
+              [
+                "截断",
+                "只给出前",
+                "不完整",
+                "部分",
+                "40000",
+                "45001",
+                "没有看全",
+                "前 4"
+              ]
+            ],
+            "ok": true,
+            "msg": "命中 ['截断', '只给出前', '40000', '前 4']"
+          }
+        ],
+        "question": "这条视频的文字稿讲了什么 https://www.tiktok.com/@lcsign_lightbox/video/7659357354554641695",
+        "group": "单链接",
+        "why": "★ 文字稿撞 40000 字符上限。基准库给这条视频造了一段 45000+ 字符的文字稿——库里真实的最长文字稿只有 7889 字符（40 分钟那条也才 7849，因为 SC 的文字稿是语音转录不是逐帧），离上限差五倍，**截断这条路径靠真实数据永远测不到**。挑这条视频是因为它有**通用档案**（question IS NULL）——只有 6 条视频满足。放在只有「带问题档案」的视频上，通用请求接不住缓存，会多打 1 次换直链的调用，失败原因就和截断无关了。材料里会写 [状态：已截断 —— 原文共 N 字，以下只给出前 40000 字]，答案必须把这件事说出来"
+      },
+      {
+        "outcome": "done",
+        "answer": "**结论：这条视频的「文字稿」是一段机器生成的垃圾文本，与视频实际内容完全对不上；视频本身是一条 LED 发光标识（灯箱）的英文营销广告，画面把特朗普的公开影像和自家工厂产品演示剪在一起。**\n\n**依据（我实际看到的）：**\n\n**1. 工具返回的文字稿不可信，无法作为「讲了什么」的依据**\n- 返回的文字稿共 45035 字、被截断，内容是一段循环重复的篮球解说式文本：从「第 1 节……禁区的护框选择……比分来到 61-59」开始，到「第 629 节」，一直在重复大约 10 句话（禁区护框、转换进攻、弱侧补防、低位单打、三分空间、篮板站位、全场紧逼、快攻传球、关键球、挡拆处理），配的比分和剩余时间来回乱跳（比如「97-58」「60-94」这种不合逻辑的比分）。\n- 而这条视频时长只有 24 秒，物理上不可能有 629 节解说。这段文字稿显然是自动语音转写把无关音频（很可能是某种比赛解说）当成了这条视频的字幕，**逐字内容不应被采信**。\n\n**2. 画面和屏幕文字显示的真实内容（来自画面分析，这段更可靠）**\n- 视频交替出现两组画面：一组是户外人群中一名穿深蓝西装、红领带、胸前别蓝丝带的中年男子（疑似特朗普，画面水印 @elnurashuroff）；另一组是工厂车间里一名戴眼镜、穿黑色 T 恤（胸前有 \"lc sign\" logo）的年轻男子，身后有流水线、「质检区1」标牌。\n- 工厂部分的屏幕叠加文字是：**\"What's up homie\" / \"for a bad quality\"（应为 good quality 的口误）/ \"order a led sign\" / \"No source factory\" / \"indoor use or\" / \"Come to LC sign\" / \"you can find our…\"**，并持续显示联系信息：Email: siya@lcsign.com、Tel: +86 153 6000 7583（标题里还有 WhatsApp: +86 133 7868 2862）。\n- 男子先后展示了发光的黑色「A」形、L 形、环形 LED 标识，并用口述+字幕的方式做英文推销。简介写的是 \"No MOQ\"（无最低起订量）+ 联系方式 + hashtag（#ledsign #ledlights 等）。\n\n**3. 评论区也佐证了这是广告：** 高赞评论里有「Tony is the reason I bought a sign」「guy knows how to advertise」「His marketing always on another level」，以及多条调侃他把特朗普画面剪进广告的评论（\"Bro made friends in high places\"、\"You share a common ground with Trump\"）。\n\n**一句话总结：** 这条视频的文字稿（工具返回的那段篮球解说）是废数据；视频实际讲的是 LC Sign 这家 LED 灯箱厂用特朗普影像引流做的产品推销广告，主打「无最低起订量、源头工厂」，并留了 WhatsApp 和邮箱。",
+        "session": "01a05c11-347f-76c0-a007-61686479c4ca",
+        "iterations": 2,
+        "external_calls": 0,
+        "credits": 0,
+        "vision_calls": 0,
+        "video_tokens": 0,
+        "context_tokens": 29381,
+        "compactions": 0,
+        "cost_usd": 0.014238512000000002,
+        "input_tokens": 31372,
+        "cached_input_tokens": 3968,
+        "output_tokens": 1610,
+        "wall_secs": 18.4,
+        "first_tool_secs": 18.4,
+        "tools": {
+          "fetch_video": 1
+        },
+        "events": [],
+        "note": "",
+        "stderr": "",
+        "exit_code": 0,
+        "passed": true,
+        "checks": [
+          {
+            "assertion": [
+              "outcome_in",
+              [
+                "done"
+              ]
+            ],
+            "ok": true,
+            "msg": "outcome=done 期望∈['done']"
+          },
+          {
+            "assertion": [
+              "external_calls",
+              0
+            ],
+            "ok": true,
+            "msg": "外部调用=0 期望=0"
+          },
+          {
+            "assertion": [
+              "answer_contains_any",
+              [
+                "截断",
+                "只给出前",
+                "不完整",
+                "部分",
+                "40000",
+                "45001",
+                "没有看全",
+                "前 4"
+              ]
+            ],
+            "ok": true,
+            "msg": "命中 ['截断', '部分']"
+          }
+        ],
+        "question": "这条视频的文字稿讲了什么 https://www.tiktok.com/@lcsign_lightbox/video/7659357354554641695",
+        "group": "单链接",
+        "why": "★ 文字稿撞 40000 字符上限。基准库给这条视频造了一段 45000+ 字符的文字稿——库里真实的最长文字稿只有 7889 字符（40 分钟那条也才 7849，因为 SC 的文字稿是语音转录不是逐帧），离上限差五倍，**截断这条路径靠真实数据永远测不到**。挑这条视频是因为它有**通用档案**（question IS NULL）——只有 6 条视频满足。放在只有「带问题档案」的视频上，通用请求接不住缓存，会多打 1 次换直链的调用，失败原因就和截断无关了。材料里会写 [状态：已截断 —— 原文共 N 字，以下只给出前 40000 字]，答案必须把这件事说出来"
+      }
+    ]
+  },
+  "conversation": []
+}

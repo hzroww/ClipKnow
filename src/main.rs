@@ -29,7 +29,7 @@ use clipknow::agent::runner::{
 use clipknow::agent::vision::{VisionClient, build_vision_client};
 use clipknow::content::evidence::{
     QUESTION_CLOSE, QUESTION_OPEN, SINGLE_VIDEO_SYSTEM_PROMPT, build_evidence, format_date,
-    format_duration,
+    format_duration, with_signature,
 };
 use clipknow::content::model::TurnStatus;
 use clipknow::error::{ClipKnowError, Result};
@@ -97,6 +97,38 @@ enum Command {
         session: Option<String>,
         /// 这一轮的问题
         question: String,
+
+        // ── 闸门覆盖，给 evals 用 ──────────────────────
+        //
+        // 不给就用默认值。存在的理由：**闸门要能被便宜地触发**。
+        //
+        // 默认的工具调用上限是 25、压缩阈值 40 万 token（实测一次提问约
+        // 2.7 万，得连问十几轮才到）。照默认值测这些闸门，一轮 eval 烧掉的
+        // SC 配额比一周用的还多——而跑不起的 eval 等于没有。
+        //
+        // 压低之后测的是「闸门逻辑对不对」，不是「25 和 40 万这两个数字定得
+        // 对不对」。后者靠一次真实冷跑单独验。
+        /// 迭代上限
+        #[arg(long)]
+        max_iterations: Option<usize>,
+        /// 第几轮插入收敛提示
+        #[arg(long)]
+        convergence_iteration: Option<usize>,
+        /// 外部端点调用上限
+        #[arg(long)]
+        max_tool_calls: Option<usize>,
+        /// 单次提问最多分析几条视频
+        #[arg(long)]
+        max_video_analyses: Option<usize>,
+        /// 上下文预算（token）
+        #[arg(long)]
+        context_budget: Option<usize>,
+        /// 压缩触发线（token）
+        #[arg(long)]
+        compaction_threshold: Option<usize>,
+        /// 压缩后的目标大小（token）
+        #[arg(long)]
+        compaction_target: Option<usize>,
     },
     /// 列出已抓过的视频
     List {
@@ -116,16 +148,123 @@ fn main() {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
-    // --provider 给了但拼错时，明确报错而不是悄悄用默认的那家
-    let provider = match &cli.provider {
-        Some(s) => Some(Provider::parse(s).ok_or_else(|| {
-            ClipKnowError::Llm(format!(
-                "不认识的 provider: {s}（可选 deepseek / anthropic）"
+/// 命令行给的闸门覆盖值。全是 Option，None = 用默认。
+#[derive(Debug, Default)]
+struct GateOverrides {
+    max_iterations: Option<usize>,
+    convergence_iteration: Option<usize>,
+    max_tool_calls: Option<usize>,
+    max_video_analyses: Option<usize>,
+    context_budget: Option<usize>,
+    compaction_threshold: Option<usize>,
+    compaction_target: Option<usize>,
+}
+
+impl GateOverrides {
+    /// 套到默认配置上，并检查改完之后不变量还成立。
+    fn apply(&self) -> Result<LoopConfig> {
+        let d = LoopConfig::default();
+        let max_iter = self.max_iterations.unwrap_or(d.max_iterations);
+        // 只压低迭代上限、没管收敛点时，让收敛点**按比例跟着走**（默认值本来
+        // 就是上限的 8/10）。不然 `--max-iterations 3` 会因为默认收敛点 16 比它
+        // 大而被拒——而压低上限恰恰是 eval 最常用的覆盖。
+        let converge = self
+            .convergence_iteration
+            .unwrap_or_else(|| (max_iter * 8 / 10).max(1));
+        let cfg = LoopConfig {
+            max_iterations: max_iter,
+            convergence_iteration: converge,
+            max_tool_calls: self.max_tool_calls.unwrap_or(d.max_tool_calls),
+            max_video_analyses: self.max_video_analyses.unwrap_or(d.max_video_analyses),
+            context_budget_tokens: self.context_budget.unwrap_or(d.context_budget_tokens),
+            compaction_threshold: self.compaction_threshold.unwrap_or(d.compaction_threshold),
+            compaction_target_tokens: self.compaction_target.unwrap_or(d.compaction_target_tokens),
+        };
+
+        // ★ 覆盖值也要守不变量，不然 eval 会在一个不可能的配置上跑出
+        //   看似有意义的结果。这几条在默认配置上有测试钉着，覆盖之后
+        //   同样要成立。
+        if cfg.max_iterations == 0 {
+            return Err(ClipKnowError::BadRequest("max-iterations 不能是 0".into()));
+        }
+        if cfg.convergence_iteration >= cfg.max_iterations {
+            return Err(ClipKnowError::BadRequest(format!(
+                "convergence-iteration({}) 必须小于 max-iterations({})——\
+                 否则收敛提示永远插不进去",
+                cfg.convergence_iteration, cfg.max_iterations
+            )));
+        }
+        if cfg.max_video_analyses >= cfg.max_tool_calls {
+            return Err(ClipKnowError::BadRequest(format!(
+                "max-video-analyses({}) 必须小于 max-tool-calls({})——\
+                 否则视觉闸门永远不会先触发，等于形同虚设",
+                cfg.max_video_analyses, cfg.max_tool_calls
+            )));
+        }
+        if cfg.compaction_target_tokens >= cfg.compaction_threshold {
+            return Err(ClipKnowError::BadRequest(format!(
+                "compaction-target({}) 必须小于 compaction-threshold({})——\
+                 否则压完还在阈值以上，等于没压",
+                cfg.compaction_target_tokens, cfg.compaction_threshold
+            )));
+        }
+        Ok(cfg)
+    }
+}
+
+/// `--provider` 的字符串 → 枚举。拼错时明确报错，不悄悄用默认那家。
+fn parse_provider(s: Option<&str>) -> Result<Option<Provider>> {
+    match s {
+        Some(v) => Provider::parse(v).map(Some).ok_or_else(|| {
+            ClipKnowError::BadRequest(format!(
+                "不认识的 provider: {v}（可选 deepseek / anthropic）"
             ))
-        })?),
-        None => None,
-    };
+        }),
+        None => Ok(None),
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    // ★ turn 单独提到最前面，什么都还没做就交给它。
+    //
+    //   因为它要**先建立 NDJSON 输出通道，再干活**——在那之前的任何失败
+    //   都只能喊给 stderr，而 Go 那边只看 stdout，浏览器就是一片空白。
+    //   原来「解析 provider」和「打开数据库」在这一步之前，于是数据库被锁死
+    //   （另一个进程占着写锁超过 busy_timeout）时，网页上什么提示都没有。
+    //
+    //   别的命令是给人看的，stderr 就在眼前，不需要这个待遇。
+    if let Command::Turn {
+        session,
+        question,
+        max_iterations,
+        convergence_iteration,
+        max_tool_calls,
+        max_video_analyses,
+        context_budget,
+        compaction_threshold,
+        compaction_target,
+    } = cli.command
+    {
+        let overrides = GateOverrides {
+            max_iterations,
+            convergence_iteration,
+            max_tool_calls,
+            max_video_analyses,
+            context_budget,
+            compaction_threshold,
+            compaction_target,
+        };
+        return cmd_turn_json(
+            &cli.db,
+            cli.provider.as_deref(),
+            session,
+            &question,
+            &overrides,
+        );
+    }
+
+    // --provider 给了但拼错时，明确报错而不是悄悄用默认的那家
+    let provider = parse_provider(cli.provider.as_deref())?;
 
     let mut store = SqliteStore::open(&cli.db)?;
     match cli.command {
@@ -134,10 +273,9 @@ fn run(cli: Cli) -> Result<()> {
             question,
             refresh,
         } => cmd_ask(&mut store, &url, &question, refresh, provider),
-        Command::Turn { session, question } => {
-            cmd_turn_json(&mut store, session, &question, provider)
-        }
         Command::Show { url, raw } => cmd_show(&store, &url, raw),
+        // 上面提前 return 了。编译器不做跨语句的变体流分析，所以这条必须写出来。
+        Command::Turn { .. } => unreachable!("turn 在函数开头就返回了"),
         Command::Find {
             question,
             continue_,
@@ -202,7 +340,7 @@ fn cmd_ask(
         tools: vec![],
     })?;
 
-    println!("{}", resp.text);
+    println!("{}", with_signature(&resp.text));
 
     if resp.stop_reason == StopReason::MaxTokens {
         eprintln!("\n(注意：回答因为达到长度上限被截断了)");
@@ -332,7 +470,7 @@ fn one_turn(
     )?;
 
     match res.outcome {
-        TurnOutcome::Done => println!("\n{}", res.answer),
+        TurnOutcome::Done => println!("\n{}", with_signature(&res.answer)),
         TurnOutcome::IterationCap => println!(
             "\n(跑了 {} 轮还没收敛，已停下。已经查到的都在库里，可以换个更具体的问法)",
             res.iterations
@@ -468,8 +606,43 @@ fn outcome_note(res: &TurnResult, cfg: &LoopConfig) -> String {
             "这个会话的历史太长了（约 {used} / {limit} token）。继续问会被模型拒掉，\
              请开一个新会话——当前会话已存好，随时能回去。"
         ),
-        TurnOutcome::ModelError(e) => format!("模型调用失败：{e}"),
+        // 不加「模型调用失败：」前缀——e 本身就是 ClipKnowError::Llm，
+        // 渲染出来已经带「大模型调用失败: 」了，加了就是重一遍。
+        TurnOutcome::ModelError(e) => model_error_note(e),
     }
+}
+
+/// 把供应商的原始报错翻成能行动的一句话。
+///
+/// 原样吐给用户是没用的——`HTTP 400 Bad Request: Content Exists Risk` 这种
+/// 话，看到的人既不知道发生了什么，也不知道下一步该干什么。
+///
+/// 这里只认**确实见过、而且有明确对策**的几种，其余原样保留：编一套看似
+/// 全面的映射，撞上没覆盖的错误时反而会给出误导性的建议。
+fn model_error_note(e: &str) -> String {
+    // DeepSeek 的内容审查。它审的是**整个请求**（系统提示词 + 全部历史 +
+    // 这一轮抓到的材料），所以触发点常常在抓回来的搜索结果里，而不是用户
+    // 的问题上。
+    //
+    // 这一轮已经标成 failed，而 load_turns_with_items 只带 done 的 turn，
+    // 所以触发审查的那批材料不会污染后续提问——这一点要明说，不然用户会
+    // 以为整个会话废了。
+    if e.contains("Content Exists Risk") {
+        // ⚠️ 别在这里建议「换 Claude」——Anthropic 的工具调用这一版还没实现
+        // （agent/llm.rs 会直接拒掉带 tools 的请求），而这条路径必然带工具。
+        // 给一个必然失败的建议比不给建议更糟。
+        return "DeepSeek 的内容审查拒绝了这次请求。它审查的是**整个请求**，\
+                包括这一轮抓回来的材料——触发点多半在搜索结果里，而不是你的问题。\
+                \n这一轮已标记为失败，不会带进后续的历史，接着问别的没问题。\
+                \n原样重问大概率还是同样的结果（同样的搜索会拿回同样的材料）。\
+                换个更窄的问法能绕开：直接给视频链接让它只看那一条，\
+                而不是让它去搜——搜索会把话题相关的一大堆东西都捞回来。"
+            .into();
+    }
+    if e.contains("rate limit") || e.contains("429") {
+        return format!("{e}\n（限流，等一会儿再试就行）");
+    }
+    e.to_string()
 }
 
 /// `clipknow turn` —— 跑一次提问，进度按 NDJSON 打到 stdout。
@@ -477,12 +650,19 @@ fn outcome_note(res: &TurnResult, cfg: &LoopConfig) -> String {
 /// **stdout 只有 JSON。** 出错也走 JSON（`{"t":"error"}`），不然 Go 那边
 /// 只能看到一个非零退出码，没法在界面上说清出了什么事。同时照样返回 Err，
 /// 让手敲这条命令时有个非零退出码可看。
+///
+/// ★ 它自己开库、自己解析 provider，而不是让 `run` 先做好递进来——
+///   因为**第一件事必须是建立输出通道**。在那之前失败的话，错误只能进
+///   stderr，而 Go 只读 stdout，浏览器上就是一片空白（实测：HTTP 200，
+///   响应体 0 字节，页面把进度收起来，什么都不说）。
 fn cmd_turn_json(
-    store: &mut SqliteStore,
+    db_path: &str,
+    provider: Option<&str>,
     session: Option<String>,
     question: &str,
-    provider: Option<Provider>,
+    overrides: &GateOverrides,
 ) -> Result<()> {
+    // 嘴要先长出来。下面每一步失败都能被它报出去。
     let sink = NdjsonSink::new(std::io::stdout());
 
     // 宏：出错时先把错误推出去，再往上抛
@@ -494,6 +674,25 @@ fn cmd_turn_json(
         }};
     }
 
+    // ★ 纯参数校验排在最前面：配置写错不该等到建完模型客户端、连完 SC
+    //   之后才报。这两步要读环境变量、可能失败，而它们的错误会盖住真正的
+    //   原因（「缺少 SCRAPECREATORS_API_KEY」而不是「参数写错了」）。
+    let cfg = match overrides.apply() {
+        Ok(c) => c,
+        Err(e) => bail!(e),
+    };
+    let provider = match parse_provider(provider) {
+        Ok(p) => p,
+        Err(e) => bail!(e),
+    };
+    // ★ 开库放在 sink 之后。数据库被锁死（另一个进程占着写锁超过
+    //   busy_timeout）时，这条错误现在能到浏览器上。
+    let mut store_owned = match SqliteStore::open(db_path) {
+        Ok(s) => s,
+        Err(e) => bail!(e),
+    };
+    let store = &mut store_owned;
+
     let llm = match build_client(provider) {
         Ok(l) => l,
         Err(e) => bail!(e),
@@ -504,7 +703,6 @@ fn cmd_turn_json(
     };
     let vision = build_vision_client();
     let vision_ref = vision.as_deref();
-    let cfg = LoopConfig::default();
 
     // 会话由 Rust 这边建，不由 Go 建——这样**所有写操作都在这个进程里**，
     // Go 只读。新会话的 id 在 hello 那一行报出去，Go 记下来下次传回。

@@ -65,6 +65,76 @@
     border-radius: 8px; padding: 11px 14px;
   }
   .failed { color: var(--bad); font-size: 13px; margin-top: 6px; }
+  /* 开场欢迎语 */
+  .welcome { display: flex; flex-direction: column; gap: 14px; padding-top: 14px }
+  .welcome .sig {
+    font-size: 17px; font-weight: 600; color: var(--ink); letter-spacing: -.01em;
+  }
+  .welcome .md p { margin: 0; color: var(--mid) }
+  dl.can { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px }
+  dl.can dt { font-weight: 600; font-size: 14px; white-space: nowrap }
+  dl.can dd { margin: 0; font-size: 14px; color: var(--mid); line-height: 1.6 }
+  dl.can dd strong { color: var(--ink) }
+  .try-hint { margin: 4px 0 0; font-size: 12.5px; color: var(--soft) }
+  .tries { display: flex; flex-direction: column; gap: 6px; align-items: flex-start }
+  button.try {
+    text-align: left; font: inherit; font-size: 13px; color: var(--accent);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 11px; cursor: pointer; max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  button.try:hover { border-color: var(--accent); background: var(--line-soft) }
+  button.try:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px }
+  .caveat {
+    margin: 6px 0 0; font-size: 12.5px; color: var(--soft); line-height: 1.6;
+    border-left: 2px solid var(--line); padding-left: 11px; max-width: 62ch;
+  }
+
+  /* 「在想」指示条：一个跳动的星号 + 文字上扫过的微光 */
+  .live { padding: 3px 0; display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+  .live .spark {
+    flex: none; width: 1.1em; text-align: center; color: var(--accent);
+    animation: spark 1.1s ease-in-out infinite;
+  }
+  .live .what {
+    /* 微光是一条更亮的竖带在文字上来回扫。用 background-clip: text 把渐变
+       裁进字形里——比整行改透明度好看，也不会让字变模糊。 */
+    background: linear-gradient(90deg,
+      var(--soft) 0%, var(--soft) 38%,
+      var(--ink) 50%,
+      var(--soft) 62%, var(--soft) 100%);
+    background-size: 260% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: shimmer 1.9s linear infinite;
+  }
+  @keyframes spark {
+    0%, 100% { opacity: .35; transform: scale(.85) }
+    50%      { opacity: 1;   transform: scale(1.12) }
+  }
+  @keyframes shimmer {
+    from { background-position: 130% 0 }
+    to   { background-position: -130% 0 }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    /* 关了动画偏好的人：不扫光、不跳，只留一个静态的星号和正常颜色的字 */
+    .live .spark { animation: none; opacity: .8 }
+    .live .what {
+      animation: none; background: none;
+      -webkit-background-clip: initial; background-clip: initial; color: var(--mid);
+    }
+  }
+
+  /* 流式中：末尾一个闪动的光标，表示还在来 */
+  .bubble.streaming > *:last-child::after {
+    content: "▋"; margin-left: 2px; color: var(--accent);
+    animation: blink 1s step-end infinite;
+  }
+  @keyframes blink { 50% { opacity: 0 } }
+  @media (prefers-reduced-motion: reduce) {
+    .bubble.streaming > *:last-child::after { animation: none }
+  }
 
   /* Markdown */
   .md > *:first-child { margin-top: 0; }
@@ -129,14 +199,57 @@
     font-size: 14.5px; cursor: pointer;
   }
   #send:disabled { background: var(--line); color: var(--soft); cursor: not-allowed; }
+  .ctl { display: flex; flex-direction: column; gap: 6px; align-self: flex-end; }
+  #provider {
+    padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--mid); font: inherit; font-size: 12px;
+  }
+  #send { align-self: stretch; }
+  /* 登录 */
+  #gate {
+    position: fixed; inset: 0; z-index: 10; display: none;
+    align-items: center; justify-content: center; background: var(--bg);
+  }
+  #gate.on { display: flex; }
+  .gate-box {
+    display: flex; flex-direction: column; gap: 10px; width: 260px;
+    padding: 30px 28px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px;
+  }
+  .gate-box h2 { margin: 0; font-size: 19px; font-weight: 600; }
+  .gate-box p { margin: 0 0 4px; font-size: 13.5px; color: var(--mid); }
+  #code {
+    padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--bg); color: var(--ink); font: inherit;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 17px; letter-spacing: .18em; text-transform: uppercase;
+  }
+  #code:focus { outline: none; border-color: var(--accent); }
+  #enter {
+    padding: 10px; border: none; border-radius: 7px;
+    background: var(--accent); color: #fff; font: inherit; font-size: 14.5px; cursor: pointer;
+  }
+  #gate-err { color: var(--bad); font-size: 13px; min-height: 1.2em; }
+  .who-am-i { font-size: 11.5px; color: var(--soft); padding: 8px 16px; border-top: 1px solid var(--line); }
   .hint { max-width: 760px; margin: 0 auto; padding: 0 26px 12px; font-size: 12px; color: var(--soft); }
 </style>
 </head>
 <body>
 
+<div id="gate">
+  <div class="gate-box">
+    <h2>ClipKnow</h2>
+    <p>输入邀请码</p>
+    <input id="code" maxlength="8" autocomplete="off" spellcheck="false" placeholder="8 位">
+    <button id="enter">进入</button>
+    <div id="gate-err"></div>
+  </div>
+</div>
+
 <aside>
   <header><h1>ClipKnow</h1><button id="new">新会话</button></header>
   <div id="sessions"></div>
+  <div class="who-am-i" id="whoami"></div>
 </aside>
 
 <main>
@@ -144,7 +257,17 @@
   <footer>
     <div class="box">
       <textarea id="q" placeholder="贴一个视频链接，或者问点什么…"></textarea>
-      <button id="send">发送</button>
+      <div class="ctl">
+        <select id="provider" title="换一家模型">
+          <option value="">自动</option>
+          <option value="deepseek">DeepSeek</option>
+          <!-- Anthropic 的工具调用这一版还没实现（见 agent/llm.rs），
+               而网页永远走工具循环，所以选了必失败。留在这里标成不可用，
+               比悄悄删掉更能说明现状——实现之后把 disabled 去掉即可。 -->
+          <option value="anthropic" disabled>Claude（还不支持工具调用）</option>
+        </select>
+        <button id="send">发送</button>
+      </div>
     </div>
     <div class="hint" id="hint">Enter 发送 · Shift+Enter 换行</div>
   </footer>
@@ -155,6 +278,10 @@
 // 这个文件是**唯一**把事件翻译成人话的地方。
 // Go 那边只负责转发，不理解内容；Rust 那边只报事实，不管怎么显示。
 // ─────────────────────────────────────────────────────────
+
+// 和 Rust 的 content::evidence::ANSWER_SIGNATURE 保持一致。
+// 两处各存一份是因为开场页不经过模型、拿不到那个事件——改的时候记得两边都改。
+const ANSWER_SIGNATURE = '你好呀 我叫王浩宇 是个扫0 很开心为你福务';
 
 const $ = s => document.querySelector(s);
 const log = $('#log'), qBox = $('#q'), sendBtn = $('#send'), hint = $('#hint');
@@ -326,8 +453,8 @@ function addRow(role, text) {
     // 只有模型的输出走 Markdown。用户自己打的字保持原样——
     // 他打了 `**` 就该看到 `**`，那不是格式是内容。
     const b = el('div', 'bubble md');
-    b.innerHTML = renderMarkdown(text);
     row.append(b);
+    b.innerHTML = renderMarkdown(text);
   } else {
     row.append(el('div', 'bubble', text));
   }
@@ -346,9 +473,178 @@ function addStep(box, icon, text, sub, cls) {
   log.scrollTop = log.scrollHeight;
 }
 
+// ── 开场欢迎语 ──────────────────────────
+//
+// 新会话（或者打开一个还没提问的会话）时显示。纯前端，不调模型、不花钱。
+//
+// ⚠️ 这里列的能力和限制是**手写的**，加/删工具时要记得同步。
+//    本来想从 Rust 的 tool_defs() 生成，但那要多开一个接口、还要把给模型看的
+//    工具说明改写成给人看的——为一个开场页不值得。
+const CAN_DO = [
+  ['看一条视频',
+   '贴链接就行。文字稿、高赞评论、还有**画面内容**我都会看一遍'],
+  ['找博主 / 找素材',
+   '说清平台和领域。我先广搜，再翻候选人最近发的内容核实，不看粉丝数就推荐'],
+  ['追着问',
+   '同一条视频问第二遍不重新花钱。画面里的细节可以接着挖'],
+];
+
+const TRY_THESE = [
+  '这条视频在讲什么 https://www.tiktok.com/@kencivii/video/7664027875661630728',
+  '帮我找两个 tiktok 上粉丝 50 万以上的健身博主',
+  '这条视频画面里出现了哪些文字 https://www.tiktok.com/@mu10146/video/7674908946200612117',
+];
+
+function showWelcome() {
+  const row = el('div', 'row welcome');
+  row.append(el('div', 'sig', ANSWER_SIGNATURE));
+
+  const intro = el('div', 'md');
+  intro.innerHTML = '<p>我能帮你干这些：</p>';
+  row.append(intro);
+
+  const list = el('dl', 'can');
+  for (const [what, how] of CAN_DO) {
+    list.append(el('dt', null, what));
+    const dd = el('dd');
+    dd.innerHTML = renderMarkdown(how).replace(/^<p>|<\/p>$/g, '');
+    list.append(dd);
+  }
+  row.append(list);
+
+  row.append(el('p', 'try-hint', '点一下就填进输入框：'));
+  const tries = el('div', 'tries');
+  for (const t of TRY_THESE) {
+    const b = el('button', 'try', t.length > 62 ? t.slice(0, 62) + '…' : t);
+    b.title = t;
+    b.onclick = () => { qBox.value = t; qBox.focus(); };
+    tries.append(b);
+  }
+  row.append(tries);
+
+  row.append(el('p', 'caveat',
+    'YouTube 拿不到视频直链，所以只能看文字稿和评论，画面分析做不了——'
+    + '不是坏了，是那条路不存在。TikTok 和 Instagram 都能看画面。'));
+
+  log.append(row);
+}
+
+// ── 「在想」指示条 ──────────────────────
+//
+// 一次提问要 10–60 秒，其中大段时间是在等上游（模型在想、视频在下载上传）。
+// 进度区那些 ⟳ 🔧 ✓ 是**已经发生的事**，静态的；这一条是「此刻在干什么」，
+// 会动，让人知道程序没死。
+//
+// 星号在几个字形之间循环，文字上有一条微光扫过——和 Claude Code 那个意思一样。
+// 第一片 token 到了就撤掉，交给流式光标接手。
+const SPARKS = ['✳', '✦', '✧', '✶'];
+const SPARK_MS = 130;
+let live = null;
+
+function setLive(steps, what) {
+  if (!live) {
+    const row = el('div', 'live');
+    const spark = el('span', 'spark', SPARKS[0]);
+    const label = el('span', 'what', what);
+    row.append(spark, label);
+    steps.append(row);
+    let i = 0;
+    live = {row, label, timer: setInterval(() => {
+      i = (i + 1) % SPARKS.length;
+      spark.textContent = SPARKS[i];
+    }, SPARK_MS)};
+  } else {
+    live.label.textContent = what;
+    // 一直挂在进度区最后一行
+    live.row.parentNode.append(live.row);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearLive() {
+  if (!live) return;
+  clearInterval(live.timer);
+  live.row.remove();
+  live = null;
+}
+
+// ── 流式待定区 ──────────────────────────
+//
+// 模型的正文是一片一片到的（实测一条 1066 字的答案分成 655 片，第一片在
+// 3.7 秒、answer 在 9.8 秒——能提早 6 秒看到字）。
+//
+// ★ 难点不在显示，在**判断这段文字是中间话还是最终答案**：
+//   模型发起工具调用时常常同时说一句「我来帮你查看这条视频的内容。」，
+//   那句话也会流出来。而收到 token 的那一刻，前端无法知道后面来的是
+//   tool_call（说明刚才那段是中间话）还是 answer（说明那就是答案）。
+//
+//   所以 token 先流进一个**待定气泡**，等下一个事件到了再决定：
+//     收到 tool_call → 把文字挪进进度区当一条 💬，气泡清空
+//     收到 answer    → 就地定稿（用 answer 的全文覆盖一遍做校准）
+//
+// ★ 渲染节流：每片都重渲染会让文字没法选中、而且闪。80ms 一次足够顺。
+const RENDER_MS = 80;
+
+let pending = null;   // { box, text, timer, row }
+
+function pendingBox() {
+  if (pending) return pending;
+  const row = el('div', 'row assistant');
+  row.append(el('div', 'who', '模型'));
+  const box = el('div', 'bubble md streaming');
+  row.append(box);
+  log.append(row);
+  pending = {row, box, text: '', timer: null};
+  return pending;
+}
+
+function stickBottom() {
+  // 用户往上翻看历史时就别抢滚动条
+  if (log.scrollHeight - log.scrollTop - log.clientHeight < 140) {
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+function onToken(t) {
+  const p = pendingBox();
+  p.text += t;
+  if (p.timer) return;              // 已经排了一次渲染，等它
+  p.timer = setTimeout(() => {
+    p.timer = null;
+    // 边流边渲染成 Markdown。半截的标记会短暂露出来（`**` 还没闭合、
+    // 半张表还没等到分隔行），这是这种做法的固有代价——散文和列表没问题，
+    // 表格会闪一下再成形。
+    p.box.innerHTML = renderMarkdown(p.text);
+    stickBottom();
+  }, RENDER_MS);
+}
+
+// 这一段流的是中间话（后面来了 tool_call）：挪进进度区，别占最终答案的位置
+function foldPendingIntoSteps(steps) {
+  if (!pending) return;
+  if (pending.timer) clearTimeout(pending.timer);
+  const said = pending.text.trim();
+  pending.row.remove();
+  pending = null;
+  if (said) addStep(steps, '💬', said.length > 160 ? said.slice(0, 160) + '…' : said);
+}
+
+// 最终答案：用 answer 的全文覆盖一遍（校准），然后定稿
+function finalizePending(text) {
+  const p = pending;
+  pending = null;
+  if (!p) { addRow('assistant', text); return; }
+  if (p.timer) clearTimeout(p.timer);
+  p.box.classList.remove('streaming');
+  p.box.innerHTML = renderMarkdown(text);
+  stickBottom();
+}
+
 // ── 会话 ────────────────────────────────
 async function loadSessions() {
-  const list = await (await fetch('/api/sessions')).json();
+  const r = await fetch('/api/sessions');
+  if (!r.ok) { if (r.status === 401) showGate(); return; }
+  const list = await r.json();
   const box = $('#sessions');
   box.textContent = '';
   for (const s of list) {
@@ -364,6 +660,7 @@ async function openSession(id) {
   sessionId = id;
   log.textContent = '';
   const msgs = await (await fetch('/api/sessions/' + encodeURIComponent(id))).json();
+  if (!msgs.length) showWelcome();   // 建了会话但还没问过
   for (const m of msgs) {
     const row = addRow(m.role, m.text);
     if (m.failed) row.append(el('div', 'failed', '这一轮没有正常结束，上面的内容可能是残缺的'));
@@ -375,6 +672,7 @@ $('#new').onclick = () => {
   if (busy) return;
   sessionId = null;
   log.textContent = '';
+  showWelcome();
   loadSessions();
 };
 
@@ -401,28 +699,40 @@ async function send() {
   qBox.value = '';
   setBusy(true);
 
+  pending = null;   // 上一次的残留（理论上不该有，出错路径下可能留着）
+  clearLive();
+  log.querySelector('.welcome')?.remove();   // 开始问了，开场页让位
   addRow('user', q);
   const steps = el('div', 'steps');
   const wrap = el('div', 'row');
   wrap.append(steps);
   log.append(wrap);
+  setLive(steps, '思考中');
 
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sessionId, question: q }),
+      body: JSON.stringify({
+        session: sessionId,
+        question: q,
+        provider: $('#provider').value,
+      }),
     });
     if (!res.ok) {
-      addStep(steps, '✗', await res.text(), null, 'err');
+      const t = await res.text();
+      addStep(steps, '✗', t, null, 'err');
+      if (res.status === 401) showGate('登录过期了，重新输一次');
       return;
     }
     await readStream(res, steps);
   } catch (e) {
     addStep(steps, '✗', '连接断了：' + e.message, null, 'err');
   } finally {
+    clearLive();
     setBusy(false);
     loadSessions();
+    refreshMe();
   }
 }
 
@@ -461,18 +771,31 @@ function handle(d, steps) {
       break;
     case 'compacted':
       addStep(steps, '📦', `历史太长，已压缩成 ${d.summary_chars} 字的摘要`);
+      setLive(steps, '压缩历史中');
+      break;
+    case 'token':
+      // 第一片字到了 → 撤掉指示条，交给流式光标
+      clearLive();
+      onToken(d.text);
       break;
     case 'iteration':
+      // 新一轮开始前，上一轮流出来的话（如果有）已经在 tool_call 那里
+      // 折进进度区了；这里只画轮次
       addStep(steps, '⟳', `第 ${d.n} 轮`);
       break;
     case 'tool_call':
+      // 来了工具调用 → 刚才流的那段是中间话，不是答案
+      foldPendingIntoSteps(steps);
       addStep(steps, '🔧', toolCallText(d));
+      // 工具那一步最久（视频下载上传分析实测能到 36 秒），这里最需要有东西在动
+      setLive(steps, TOOL_NAME[d.name] ? `${TOOL_NAME[d.name]}中` : '执行中');
       break;
     case 'tool_result':
       addStep(steps, d.is_error ? '✗' : '✓', toolResultText(d), null, d.is_error ? 'err' : '');
+      setLive(steps, '思考中');
       break;
     case 'answer':
-      addRow('assistant', d.text);
+      finalizePending(d.text);
       break;
     case 'usage': {
       const u = el('div', 'row');
@@ -481,11 +804,15 @@ function handle(d, steps) {
       break;
     }
     case 'done':
+      clearLive();
       if (d.note) {
         const n = el('div', 'row'); n.append(el('div', 'failed', d.note)); log.append(n);
       }
       break;
     case 'error':
+      clearLive();
+      // 出错时把已经流出来的半截话折进进度区，别留一个悬着的空气泡
+      foldPendingIntoSteps(steps);
       addStep(steps, '✗', d.message, null, 'err');
       break;
     // 认不出的事件类型直接忽略——Rust 那边加了新事件，这里不用同步改
@@ -493,7 +820,49 @@ function handle(d, steps) {
   log.scrollTop = log.scrollHeight;
 }
 
-loadSessions();
+// ── 登录 ────────────────────────────────
+let me = null;
+
+function showGate(msg) {
+  $('#gate').classList.add('on');
+  $('#gate-err').textContent = msg || '';
+  $('#code').focus();
+}
+
+function renderMe() {
+  $('#whoami').textContent = me
+    ? (me.quota < 0 ? `${me.name} · 不限次数` : `${me.name} · 还能问 ${me.quota} 次`)
+    : '';
+}
+
+async function enter() {
+  const code = $('#code').value.trim().toUpperCase();
+  if (!code) return;
+  const r = await fetch('/api/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  if (!r.ok) { $('#gate-err').textContent = await r.text(); return; }
+  me = await r.json();
+  $('#gate').classList.remove('on');
+  renderMe();
+  showWelcome();
+  loadSessions();
+}
+$('#enter').onclick = enter;
+$('#code').addEventListener('keydown', e => { if (e.key === 'Enter') enter(); });
+
+// 每次提问后剩余次数会变，重新拉一下
+async function refreshMe() {
+  const r = await fetch('/api/me');
+  if (r.ok) { me = await r.json(); renderMe(); }
+}
+
+(async () => {
+  const r = await fetch('/api/me');
+  if (r.ok) { me = await r.json(); renderMe(); showWelcome(); loadSessions(); }
+  else showGate();
+})();
 </script>
 </body>
 </html>

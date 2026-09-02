@@ -194,6 +194,24 @@ impl Pricing {
 pub trait LlmClient {
     fn complete(&self, req: &ModelRequest) -> Result<ModelResponse>;
 
+    /// 流式版本：正文一片一片到达时回调 `on_token`，返回值和 `complete`
+    /// **完全一样**——一个完整的 `ModelResponse`。
+    ///
+    /// 所以调用方只多了一个「等待期间会被回调」的行为，循环结构、工具调用
+    /// 时机、配对不变量一个都不变。
+    ///
+    /// **默认回退到非流式。** 这条很要紧：这个 trait 有 7 个实现，其中 5 个是
+    /// 测试用的 mock。没有默认实现的话，加一个方法就要改 5 个 mock，
+    /// 而那些 mock 的意义恰恰是「只关心自己那点行为」。
+    fn complete_streaming(
+        &self,
+        req: &ModelRequest,
+        on_token: &dyn Fn(&str),
+    ) -> Result<ModelResponse> {
+        let _ = on_token; // 非流式实现下没有中间片，天然没得回调
+        self.complete(req)
+    }
+
     /// 这家的报价，用来估算成本。
     fn pricing(&self) -> Pricing;
 
@@ -393,6 +411,8 @@ pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 pub struct DeepSeekClient {
     http: reqwest::blocking::Client,
+    /// 流式专用：没有总超时，只有「两片之间」的读超时。见 new() 的注释。
+    streaming: reqwest::blocking::Client,
     api_key: String,
     model: String,
     base_url: String,
@@ -404,8 +424,27 @@ impl DeepSeekClient {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("构造 HTTP 客户端失败");
+        // ★ 流式要单独一个客户端。
+        //
+        //   reqwest 的 `timeout` 覆盖的是**整个请求，包括读完响应体**。流式下
+        //   响应体要读几十秒，照非流式那 300 秒算虽然够，但边界更近了：
+        //   撞上就是「偶发地少半截答案」，而且断在哪儿不确定，极难查。
+        //
+        //   本来想用「两片之间的读超时」（模型一直在吐就不触发，真卡住才退出），
+        //   但 reqwest 0.13 的 blocking builder 只有 timeout 和 connect_timeout，
+        //   没有 read_timeout。所以退一步：总超时放到 600 秒。
+        //
+        //   代价说清楚：这是**上限**不是**空闲检测**。连接真挂死时要等满 600 秒
+        //   才报错，而不是几十秒就发现。取 600 是因为实测最长的答案流完在
+        //   30 秒内，600 留了 20 倍余量，撞上基本只可能是真挂死。
+        let streaming = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .build()
+            .expect("构造流式 HTTP 客户端失败");
         Self {
             http,
+            streaming,
             api_key,
             model,
             base_url: "https://api.deepseek.com".to_string(),
@@ -425,7 +464,7 @@ impl DeepSeekClient {
     /// 对比 Anthropic 版本看差异：
     /// - system 不是顶层字段，而是 messages 里 role="system" 的第一条
     /// - 其余结构基本一致
-    fn to_openai_body(&self, req: &ModelRequest) -> Value {
+    fn to_openai_body(&self, req: &ModelRequest, stream: bool) -> Value {
         let mut messages = vec![json!({ "role": "system", "content": req.system })];
         messages.extend(req.messages.iter().map(|m| match m {
             Msg::User(t) => json!({ "role": "user", "content": t }),
@@ -473,7 +512,7 @@ impl DeepSeekClient {
             "model": self.model,
             "max_tokens": req.max_tokens.min(self.max_tokens_limit()),
             "messages": messages,
-            "stream": false,
+            "stream": stream,
         });
 
         // 没有工具时整个字段都不带。传 "tools": [] 有些 OpenAI 兼容端点会报错。
@@ -499,6 +538,35 @@ impl DeepSeekClient {
 }
 
 impl LlmClient for DeepSeekClient {
+    fn complete_streaming(
+        &self,
+        req: &ModelRequest,
+        on_token: &dyn Fn(&str),
+    ) -> Result<ModelResponse> {
+        let resp = self
+            .streaming
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(&self.to_openai_body(req, true))
+            .send()?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // 失败时响应体是普通 JSON，不是 SSE
+            let body: Value = resp.json().unwrap_or(Value::Null);
+            let msg = body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("(响应里没有 error.message)");
+            return Err(ClipKnowError::Llm(format!("HTTP {status}: {msg}")));
+        }
+
+        // 重组成非流式的形状，再走同一条解析路——见 read_openai_stream 的注释
+        let rebuilt = read_openai_stream(resp, on_token)?;
+        parse_openai_response(&rebuilt)
+    }
+
     fn pricing(&self) -> Pricing {
         // 2026-08-19 查自 https://api-docs.deepseek.com/quick_start/pricing
         // 这里用**高峰价**（保守，宁可高估成本）。低谷价是它的一半，
@@ -541,7 +609,7 @@ impl LlmClient for DeepSeekClient {
             // ★ 和 Anthropic 的第一个差异：Bearer 认证，不是 x-api-key
             .header("authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
-            .json(&self.to_openai_body(req))
+            .json(&self.to_openai_body(req, false))
             .send()?;
 
         let status = resp.status();
@@ -557,6 +625,153 @@ impl LlmClient for DeepSeekClient {
 
         parse_openai_response(&body)
     }
+}
+
+/// 流式响应里一个工具调用的半成品。
+///
+/// 实测 DeepSeek 的分片长这样（一次真实调用，共 45 片）：
+///   片 16  {"index":0,"id":"call_00_Sb0E…","function":{"name":"fetch_video","arguments":""}}
+///   片 18  {"index":0,"function":{"arguments":"{"}}
+///   片 20  {"index":0,"function":{"arguments":"\""}}
+///   片 22  {"index":0,"function":{"arguments":"url"}}
+///   …34 片之后才拼出一个完整的 {"url":"…","question":"…"}
+///
+/// `id` 和 `name` **只在第一片出现**，`arguments` 是一片一片拼的。
+#[derive(Default)]
+struct PartialCall {
+    id: String,
+    name: String,
+    args: String,
+}
+
+/// 读一条 SSE 流，把分片重组成**和非流式一模一样形状**的响应体。
+///
+/// ★ 为什么要重组成同一个形状，而不是直接构造 `ModelResponse`：
+///
+///   这样 `parse_openai_response` 里已有的四道检查全部自动适用——
+///     finish_reason → StopReason 的映射
+///     content_filter → 直接返回 LlmRefusal
+///     参数不是合法 JSON → 那句带原文的错误信息
+///     同一轮里重复的 call_id → 报错
+///
+///   两条解析路迟早会走岔，而走岔的表现是「流式下某个检查失效了」，
+///   极难发现。一份代码就不会。
+///
+/// ★ 正文一片一片回调出去，工具调用**只累加字符串**，
+///   收完（[DONE] 或流结束）才交给解析。拼错了 JSON 解析必然失败，
+///   不会静默产生半个参数。
+fn read_openai_stream(resp: reqwest::blocking::Response, on_token: &dyn Fn(&str)) -> Result<Value> {
+    reassemble_stream(std::io::BufReader::new(resp), on_token)
+}
+
+/// 分片重组的本体。收 `BufRead` 而不是 `Response`，这样能**离线喂真实分片**测。
+///
+/// 不这么拆的话这段逻辑只能靠联网测，而它恰好是最需要回归测试的一块：
+/// 坏了的表现是某次真实提问的工具参数变成半截 JSON，偶发且难复现。
+fn reassemble_stream<R: std::io::BufRead>(reader: R, on_token: &dyn Fn(&str)) -> Result<Value> {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut buckets: std::collections::BTreeMap<u64, PartialCall> = Default::default();
+    let mut finish: Option<String> = None;
+    let mut usage: Option<Value> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue; // SSE 的注释行、心跳、空行
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            break;
+        }
+        // 单片解析失败不该整轮崩掉——跳过它，让后面的片继续拼。
+        // 真正的完整性检查在最后那次 JSON 解析上。
+        let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+
+        if let Some(t) = chunk
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+            && !t.is_empty()
+        {
+            text.push_str(t);
+            on_token(t);
+        }
+        // 思维链不往外转发（用户看的是答案，不是它的思考过程），但要存下来：
+        // 发回给模型时要带上，否则它下一轮会重新想一遍。
+        if let Some(r) = chunk
+            .pointer("/choices/0/delta/reasoning_content")
+            .and_then(Value::as_str)
+        {
+            reasoning.push_str(r);
+        }
+
+        if let Some(arr) = chunk
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+        {
+            for tc in arr {
+                // 按 index 分桶。多个工具调用是交错到达的，
+                // 拿到达顺序分桶会把参数拼串。
+                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let b = buckets.entry(idx).or_default();
+                if let Some(v) = tc.get("id").and_then(Value::as_str)
+                    && !v.is_empty()
+                {
+                    b.id = v.to_string();
+                }
+                if let Some(v) = tc.pointer("/function/name").and_then(Value::as_str)
+                    && !v.is_empty()
+                {
+                    b.name = v.to_string();
+                }
+                if let Some(v) = tc.pointer("/function/arguments").and_then(Value::as_str) {
+                    b.args.push_str(v);
+                }
+            }
+        }
+
+        if let Some(f) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            finish = Some(f.to_string());
+        }
+        if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+            usage = Some(u.clone());
+        }
+    }
+
+    let tool_calls: Vec<Value> = buckets
+        .into_values()
+        .map(|b| {
+            json!({
+                "id": b.id,
+                "type": "function",
+                // ★ arguments 保持**字符串**，和非流式响应一致——
+                //   parse_openai_response 会去解析它，坏 JSON 在那里报错。
+                "function": { "name": b.name, "arguments": b.args }
+            })
+        })
+        .collect();
+
+    let mut message = json!({ "content": text });
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::from(reasoning);
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
+    Ok(json!({
+        "choices": [{
+            // 流断在中途时 finish_reason 会缺，交给下游映射成 Other("missing")
+            "finish_reason": finish,
+            "message": message,
+        }],
+        "usage": usage,
+    }))
 }
 
 /// 解析 OpenAI 格式的响应。
@@ -810,12 +1025,15 @@ mod tests {
         // 这是和 Anthropic 最大的结构差异：
         // Anthropic 的 system 是顶层字段，OpenAI 格式要塞进 messages 第一条
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "你是助手".into(),
-            messages: vec![Msg::user("你好")],
-            max_tokens: 8192,
-            tools: vec![],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "你是助手".into(),
+                messages: vec![Msg::user("你好")],
+                max_tokens: 8192,
+                tools: vec![],
+            },
+            false,
+        );
 
         assert!(
             body.get("system").is_none(),
@@ -834,12 +1052,15 @@ mod tests {
         // ⚠️ 这个测试原来断言夹到 8192——那是 V3 时代 deepseek-chat 的真实
         // 上限，2026-08-19 实测 v4-flash 传 384000 也接受，旧断言已失效。
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![Msg::user("u")],
-            max_tokens: 999_999,
-            tools: vec![],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::user("u")],
+                max_tokens: 999_999,
+                tools: vec![],
+            },
+            false,
+        );
         assert_eq!(body["max_tokens"], c.max_tokens_limit());
     }
 
@@ -911,7 +1132,7 @@ mod tests {
         let deepseek = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
 
         let a_body = anthropic.to_anthropic_body(&req);
-        let d_body = deepseek.to_openai_body(&req);
+        let d_body = deepseek.to_openai_body(&req, false);
 
         // 同样的 system 提示词，落在两个完全不同的位置
         assert_eq!(a_body["system"], "你是助手");
@@ -944,12 +1165,15 @@ mod tests {
     #[test]
     fn deepseek_wraps_tools_in_openai_function_envelope() {
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![Msg::user("hi")],
-            max_tokens: 100,
-            tools: vec![search_tool()],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::user("hi")],
+                max_tokens: 100,
+                tools: vec![search_tool()],
+            },
+            false,
+        );
 
         let t = &body["tools"][0];
         assert_eq!(t["type"], "function");
@@ -962,12 +1186,15 @@ mod tests {
     #[test]
     fn deepseek_omits_tools_field_entirely_when_there_are_none() {
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![Msg::user("hi")],
-            max_tokens: 100,
-            tools: vec![],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::user("hi")],
+                max_tokens: 100,
+                tools: vec![],
+            },
+            false,
+        );
         // 传 "tools": [] 有些端点会报错，干脆不带这个字段
         assert!(body.get("tools").is_none(), "没有工具时不该出现 tools 字段");
     }
@@ -1057,22 +1284,25 @@ mod tests {
         // 收到时 arguments 是字符串→我们 parse 成了 Value；
         // 发回去时必须再变回字符串，否则 DeepSeek 不认。
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![
-                Msg::user("找科普博主"),
-                Msg::assistant_with_tools(
-                    "我来搜一下。",
-                    vec![ToolCall {
-                        id: "call_00_abc".into(),
-                        name: "search_videos".into(),
-                        args: json!({"platform": "youtube", "query": "科普"}),
-                    }],
-                ),
-            ],
-            max_tokens: 100,
-            tools: vec![search_tool()],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![
+                    Msg::user("找科普博主"),
+                    Msg::assistant_with_tools(
+                        "我来搜一下。",
+                        vec![ToolCall {
+                            id: "call_00_abc".into(),
+                            name: "search_videos".into(),
+                            args: json!({"platform": "youtube", "query": "科普"}),
+                        }],
+                    ),
+                ],
+                max_tokens: 100,
+                tools: vec![search_tool()],
+            },
+            false,
+        );
 
         let a = &body["messages"][2];
         assert_eq!(a["role"], "assistant");
@@ -1093,16 +1323,19 @@ mod tests {
         // OpenAI 格式里工具结果是独立一条 role:"tool" 消息，
         // 不是塞进 user 消息的 block（那是 Anthropic 的做法）。
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![Msg::tool_result(ToolResult {
-                call_id: "call_00_abc".into(),
-                content: "[20 条视频]".into(),
-                is_error: false,
-            })],
-            max_tokens: 100,
-            tools: vec![],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::tool_result(ToolResult {
+                    call_id: "call_00_abc".into(),
+                    content: "[20 条视频]".into(),
+                    is_error: false,
+                })],
+                max_tokens: 100,
+                tools: vec![],
+            },
+            false,
+        );
 
         let t = &body["messages"][1];
         assert_eq!(t["role"], "tool");
@@ -1115,16 +1348,19 @@ mod tests {
         // 工具失败**不能**中止循环，必须照样产出一条配对的 tool 消息，
         // 让模型自己决定绕路。见设计文档 7.3。
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![Msg::tool_result(ToolResult {
-                call_id: "call_00_abc".into(),
-                content: "SC 返回 503".into(),
-                is_error: true,
-            })],
-            max_tokens: 100,
-            tools: vec![],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::tool_result(ToolResult {
+                    call_id: "call_00_abc".into(),
+                    content: "SC 返回 503".into(),
+                    is_error: true,
+                })],
+                max_tokens: 100,
+                tools: vec![],
+            },
+            false,
+        );
 
         let t = &body["messages"][1];
         assert_eq!(t["role"], "tool");
@@ -1154,12 +1390,15 @@ mod tests {
         }
 
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: msgs,
-            max_tokens: 100,
-            tools: vec![search_tool()],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: msgs,
+                max_tokens: 100,
+                tools: vec![search_tool()],
+            },
+            false,
+        );
 
         let m = body["messages"].as_array().unwrap();
         // system + user + assistant + 2 条 tool
@@ -1294,20 +1533,23 @@ mod tests {
         // 实测三种做法都不会 400（丢掉、回传、连 content 也不带）。
         // 选择回传是因为历史更完整，不是为了防报错。
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![Msg::Assistant {
-                text: "我搜一下".into(),
-                reasoning: "用户想找科普博主，先搜关键词".into(),
-                tool_calls: vec![ToolCall {
-                    id: "call_00_x".into(),
-                    name: "search_videos".into(),
-                    args: json!({"query": "科普"}),
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::Assistant {
+                    text: "我搜一下".into(),
+                    reasoning: "用户想找科普博主，先搜关键词".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "call_00_x".into(),
+                        name: "search_videos".into(),
+                        args: json!({"query": "科普"}),
+                    }],
                 }],
-            }],
-            max_tokens: 100,
-            tools: vec![search_tool()],
-        });
+                max_tokens: 100,
+                tools: vec![search_tool()],
+            },
+            false,
+        );
 
         let a = &body["messages"][1];
         assert_eq!(a["content"], "我搜一下");
@@ -1318,12 +1560,15 @@ mod tests {
     fn an_empty_reasoning_field_is_omitted_from_the_request() {
         // 别发一个空字符串上去，那是噪音
         let c = DeepSeekClient::new("k".into(), DEEPSEEK_DEFAULT_MODEL.into());
-        let body = c.to_openai_body(&ModelRequest {
-            system: "s".into(),
-            messages: vec![Msg::assistant("普通回答")],
-            max_tokens: 100,
-            tools: vec![],
-        });
+        let body = c.to_openai_body(
+            &ModelRequest {
+                system: "s".into(),
+                messages: vec![Msg::assistant("普通回答")],
+                max_tokens: 100,
+                tools: vec![],
+            },
+            false,
+        );
         assert!(body["messages"][1].get("reasoning_content").is_none());
     }
 
@@ -1402,5 +1647,147 @@ mod tests {
         });
         let r = parse_openai_response(&body).unwrap();
         assert_eq!(r.tool_calls[0].name, "search_the_web");
+    }
+
+    // ── 流式分片重组 ────────────────────────────────────────
+    //
+    // 这几条是整个流式改动里最该有的测试。坏掉的表现是某次真实提问的工具
+    // 参数变成半截 JSON——偶发、难复现、而且会连带破坏 tool_call/result 配对
+    // 导致下一次请求 400。
+    //
+    // fixture 是**真实抓的**（tests/fixtures/deepseek_stream_tool_call.sse，
+    // 44 行 SSE），不是我手写的。DeepSeek 哪天改分片格式，这里会先红。
+
+    fn feed(sse: &str) -> (Value, String) {
+        let seen = std::cell::RefCell::new(String::new());
+        let v = reassemble_stream(std::io::Cursor::new(sse), &|t| {
+            seen.borrow_mut().push_str(t);
+        })
+        .expect("重组失败");
+        (v, seen.into_inner())
+    }
+
+    #[test]
+    fn a_real_streamed_tool_call_reassembles_into_valid_json() {
+        let sse = include_str!("../../tests/fixtures/deepseek_stream_tool_call.sse");
+        let (body, streamed) = feed(sse);
+
+        // 正文一片一片回调出去的内容，要和最终拼出来的一致
+        assert_eq!(streamed, "我来帮你查看这条视频的内容。");
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("我来帮你查看这条视频的内容。")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+
+        // ★ 关键：34 片拼出来的 arguments 必须是合法 JSON，而且字段对
+        let resp = parse_openai_response(&body).expect("解析重组后的响应失败");
+        assert_eq!(resp.tool_calls.len(), 1);
+        let c = &resp.tool_calls[0];
+        assert_eq!(c.name, "fetch_video");
+        assert!(c.id.starts_with("call_"), "call_id 丢了: {}", c.id);
+        assert_eq!(
+            c.args.get("url").and_then(Value::as_str),
+            Some("https://www.tiktok.com/@x/video/123")
+        );
+        assert!(c.args.get("question").is_some(), "question 参数丢了");
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn interleaved_tool_calls_do_not_get_their_arguments_mixed() {
+        // 两个工具调用交错到达。按**到达顺序**分桶会把参数拼串，
+        // 必须按 index 分。
+        let sse = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_A","function":{"name":"fetch_video","arguments":""}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_B","function":{"name":"search_videos","arguments":""}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"url\":\"a\""}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"query\":\"b\""}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"}"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]\n",
+        );
+        let resp = parse_openai_response(&feed(sse).0).expect("解析失败");
+        assert_eq!(resp.tool_calls.len(), 2);
+        assert_eq!(resp.tool_calls[0].name, "fetch_video");
+        assert_eq!(
+            resp.tool_calls[0].args.get("url").and_then(Value::as_str),
+            Some("a")
+        );
+        assert_eq!(resp.tool_calls[1].name, "search_videos");
+        assert_eq!(
+            resp.tool_calls[1].args.get("query").and_then(Value::as_str),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn a_truncated_argument_stream_fails_loudly_with_the_raw_text() {
+        // 流断在参数中间。不能静默产生半个参数——要报错，而且带上原文，
+        // 不然看到「解析失败」也不知道断在哪。
+        let sse = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_X","function":{"name":"fetch_video","arguments":"{\"url\":\"htt"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+        );
+        let err = parse_openai_response(&feed(sse).0)
+            .expect_err("半截 JSON 居然解析成功了")
+            .to_string();
+        assert!(err.contains("不是合法 JSON"), "错误信息不对: {err}");
+        assert!(err.contains("htt"), "错误信息里没带原文: {err}");
+    }
+
+    #[test]
+    fn plain_text_streaming_reports_no_tool_calls() {
+        // 纯文字的一轮：tool_calls 必须是空的——循环靠「空」判断这是最终答案。
+        let sse = concat!(
+            r#"data: {"choices":[{"delta":{"content":"结"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"content":"论"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2}}"#,
+            "\n",
+            "data: [DONE]\n",
+        );
+        let (body, streamed) = feed(sse);
+        assert_eq!(streamed, "结论");
+        let resp = parse_openai_response(&body).expect("解析失败");
+        assert!(resp.tool_calls.is_empty(), "纯文字轮次不该有工具调用");
+        assert_eq!(resp.text, "结论");
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        // usage 在最后一片里，不能丢——丢了成本统计就静默变 0
+        assert_eq!(resp.input_tokens, 9);
+        assert_eq!(resp.output_tokens, 2);
+    }
+
+    #[test]
+    fn a_garbage_line_in_the_middle_does_not_kill_the_whole_turn() {
+        // SSE 流里混进一行坏 JSON（心跳、代理插的东西）。跳过它，
+        // 后面的片继续拼——完整性检查在最后那次 JSON 解析上。
+        let sse = concat!(
+            r#"data: {"choices":[{"delta":{"content":"好"}}]}"#,
+            "\n",
+            "data: {这不是合法 JSON\n",
+            ": 这是 SSE 注释行\n",
+            r#"data: {"choices":[{"delta":{"content":"的"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "\n",
+        );
+        assert_eq!(feed(sse).1, "好的");
     }
 }

@@ -24,11 +24,15 @@
 //! 4. **`PROTOCOL_VERSION` 变了才算破坏兼容。** 加字段不算(Go 忽略不认识的),
 //!    改字段含义、删字段、改 `t` 或 `outcome` 的取值才算。
 //!
-//! ## 以后加流式 token
+//! ## 流式 token（已实现）
 //!
-//! 在 `answer` **之前**多打一串 `{"t":"token","text":"..."}` 即可,这一层
-//! 和 Go 那边都不用改结构——前端按「有 token 就边收边拼,最后用 answer
-//! 校准」处理。
+//! `answer` **之前**会有一串 `{"t":"token","text":"..."}`。加这个的时候
+//! Go 和前端的结构都没改——协议当初就是按「加事件类型不影响老的解析」
+//! 设计的，Go 逐行转发、不理解内容。
+//!
+//! ⚠️ **中间轮次也有 token。** 模型发起工具调用时常常同时说一句话。所以
+//! 界面在收到 `tool_call` 之前无法判断刚才那段是中间话还是最终答案——
+//! 先流进待定区，等下一个事件再决定。`answer` 仍然要留着做校准和确认。
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -92,7 +96,10 @@ pub fn event_json(ev: &TurnEvent<'_>) -> Value {
             "vision_calls": vision_calls,
             "preview": preview,
         }),
-        TurnEvent::Answer { text } => json!({"t": "answer", "text": text}),
+        TurnEvent::Token { text } => json!({"t": "token", "text": text}),
+        TurnEvent::Answer { text } => {
+            json!({"t": "answer", "text": crate::content::evidence::with_signature(text)})
+        }
     }
 }
 
@@ -201,6 +208,7 @@ mod tests {
                 vision_calls: 1,
                 preview: "abc",
             },
+            TurnEvent::Token { text: "片" },
             TurnEvent::Answer { text: "hi" },
         ];
         for ev in &evs {
@@ -242,6 +250,46 @@ mod tests {
         for l in &lines {
             serde_json::from_str::<Value>(l).unwrap_or_else(|e| panic!("解析失败 {l}: {e}"));
         }
+    }
+
+    /// 签名是**输出时**拼的，所以 answer 事件里有它。
+    #[test]
+    fn the_answer_event_carries_the_signature() {
+        let v = event_json(&TurnEvent::Answer {
+            text: "结论是这样"
+        });
+        let t = v["text"].as_str().unwrap();
+        assert!(t.starts_with("结论是这样"));
+        assert!(
+            t.ends_with(crate::content::evidence::ANSWER_SIGNATURE),
+            "签名没拼上: {t}"
+        );
+        // 拼完还是一行 JSON
+        assert_eq!(v.to_string().lines().count(), 1);
+    }
+
+    /// ★ 但 token 事件**不能**带签名。
+    ///
+    /// token 是正文的碎片，前端会把它们拼起来显示。要是每片都拼一次签名，
+    /// 屏幕上会出现几百个签名；只在最后一片拼也不行——事先不知道哪片是最后。
+    /// 签名只在 answer 那一次出现，前端拿它覆盖流出来的内容。
+    #[test]
+    fn token_events_never_carry_the_signature() {
+        let v = event_json(&TurnEvent::Token { text: "结论" });
+        assert_eq!(v["text"], "结论");
+    }
+
+    /// token 事件也必须是一行。正文里本来就有换行，而 token 是从正文切出来的
+    /// 片——某一片正好落在换行上时，序列化必须转义，否则一片会变成两行、
+    /// Go 那边解析立刻乱套。
+    #[test]
+    fn a_token_carrying_a_newline_still_serializes_to_one_line() {
+        let v = event_json(&TurnEvent::Token {
+            text: "第一行\n第二",
+        });
+        let s = v.to_string();
+        assert_eq!(s.lines().count(), 1, "序列化后不是一行: {s}");
+        assert_eq!(v["t"], "token");
     }
 
     /// outcome 的字面量是协议的一部分,Go 会 match 它们。

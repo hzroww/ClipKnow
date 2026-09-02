@@ -378,11 +378,19 @@ pub enum TurnEvent<'a> {
         /// 结果正文的前若干字符，给界面显示用。完整内容在库里。
         preview: &'a str,
     },
+    /// 正文的一片。模型边生成边吐的时候，一片一片推出来。
+    ///
+    /// ★ **中间轮次也有文字。** 实测 DeepSeek 发起工具调用时常常同时说一句
+    ///   「我来帮你查看这条视频的内容。」，那句话也会从这里流出去。所以界面
+    ///   在收到 `ToolCall` 之前无法判断刚才那段是中间话还是最终答案——
+    ///   做法是先流进一个待定区，等下一个事件来了再决定放哪儿。
+    Token { text: &'a str },
     /// 拿到最终答案了。
     ///
-    /// 以后 `LlmClient` 支持流式时，在它**之前**加一串 `Token` 事件即可，
-    /// 这条保持不变——界面按「有 Token 就边收边拼，最后用 Answer 校准」
-    /// 处理，那时前端不用改。
+    /// 流式下 `Token` 已经把同样的文字送出去过一遍，这条仍然要留着，
+    /// 两个作用：
+    ///   1. **校准**——万一某片 Token 丢了，这里是完整的
+    ///   2. **确认**——在它到达之前，界面不知道刚才那段是不是最终答案
     Answer { text: &'a str },
 }
 
@@ -572,12 +580,20 @@ pub fn run_turn_observed(
             return res;
         }
 
-        let resp = match llm.complete(&ModelRequest {
-            system: DISCOVERY_SYSTEM_PROMPT.to_string(),
-            messages: messages.clone(),
-            max_tokens: llm.max_tokens_limit(),
-            tools: tools.clone(),
-        }) {
+        // 流式：正文一片一片推给观察者。返回值和非流式完全一样（一个完整的
+        // ModelResponse），所以下面的 settle、配对、闸门一个字都不用改。
+        //
+        // 没实现流式的实现（5 个测试 mock、AnthropicClient）走 trait 的默认
+        // 实现，直接回退到 complete()，行为不变。
+        let resp = match llm.complete_streaming(
+            &ModelRequest {
+                system: DISCOVERY_SYSTEM_PROMPT.to_string(),
+                messages: messages.clone(),
+                max_tokens: llm.max_tokens_limit(),
+                tools: tools.clone(),
+            },
+            &|t| obs.on(&TurnEvent::Token { text: t }),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 res.outcome = TurnOutcome::ModelError(e.to_string());

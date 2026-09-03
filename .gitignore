@@ -11,3 +11,8 @@ access.json
 access.json.tmp
 # eval 每跑一次都从 evals/baseline.db 重建这个库，不用进版本库
 evals/results/warm.db
+__pycache__/
+*.pyc
+# 任何 SQLite 的 WAL 伴生文件（baseline.db 也会生成）
+*.db-wal
+*.db-shm

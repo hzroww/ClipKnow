@@ -1,0 +1,21 @@
+# 构建产物：几个 G，进了上下文光传输就要几分钟
+target/
+web/clipknow.db
+
+# 密钥性质的东西，绝不能进镜像
+.env
+access.json
+access.json.tmp
+
+# 数据和评测产物，运行时从挂载卷来
+*.db
+*.db-wal
+*.db-shm
+evals/results/
+evals/baseline.db
+__pycache__/
+*.pyc
+
+.git/
+docs/
+.DS_Store

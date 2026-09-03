@@ -1,0 +1,22 @@
+# docker compose up -d
+#
+# key 从宿主的环境变量透传进来，不写进文件、不进镜像。
+services:
+  clipknow:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      SCRAPECREATORS_API_KEY: ${SCRAPECREATORS_API_KEY:?先 export SCRAPECREATORS_API_KEY}
+      DEEPSEEK_API_KEY:       ${DEEPSEEK_API_KEY:?先 export DEEPSEEK_API_KEY}
+      # 画面分析要，没有也能跑（画面段会写明「未配置视觉模型」）
+      DASHSCOPE_API_KEY:      ${DASHSCOPE_API_KEY:-}
+      DASHSCOPE_VISION_MODEL: ${DASHSCOPE_VISION_MODEL:-}
+      DEEPSEEK_MODEL:         ${DEEPSEEK_MODEL:-}
+    volumes:
+      # 库和 access.json 都在这个卷里，容器删了数据还在
+      - clipknow-data:/data
+    restart: unless-stopped
+
+volumes:
+  clipknow-data:

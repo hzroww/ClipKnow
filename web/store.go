@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -67,11 +68,26 @@ func OpenStore(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// 库还没建表——**全新安装的正常状态**，不是错误。
+//
+// 建表是 Rust 那边 init() 跑迁移做的，而 Go 是只读打开的（query_only(1)），
+// 所以在第一次提问之前这些表根本不存在。实测：全新装好打开网页，会话列表
+// 直接 500「no such table: sessions」，而正确的显示是「一条会话都没有」。
+//
+// 不在 Go 里建表是刻意的：写只发生在 Rust 子进程里，这样就没有两个进程抢
+// SQLite 写锁的问题。所以这里认下这个错，返回空。
+func isNoSchema(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such table")
+}
+
 // 会话列表，新的在前。
 func (s *Store) Sessions(limit int) ([]Session, error) {
 	rows, err := s.db.Query(
 		`SELECT id, COALESCE(title, ''), created_at
 		 FROM sessions ORDER BY created_at DESC LIMIT ?`, limit)
+	if isNoSchema(err) {
+		return []Session{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +119,9 @@ func (s *Store) History(sessionID string) ([]Message, error) {
 		 WHERE t.session_id = ?
 		   AND i.item_type IN ('user_message', 'assistant_message')
 		 ORDER BY t.seq, i.idx`, sessionID)
+	if isNoSchema(err) {
+		return []Message{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

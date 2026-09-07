@@ -35,7 +35,9 @@ pub enum ClipKnowError {
     #[error("JSON 解析失败: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("缺少环境变量 {0}，请在 ~/.zshrc 里设置后重开终端")]
+    // 三个地方都写出来：README 让人放 .env，Docker 是 -e / compose，
+    // 而只提 ~/.zshrc 会让「我明明写进 .env 了」的人以为文件没生效。
+    #[error("缺少环境变量 {0}。放进项目目录的 .env、或 ~/.zshrc 后重开终端；Docker 用 -e 传")]
     MissingEnv(&'static str),
 
     /// 调用方传进来的参数不对。

@@ -513,9 +513,9 @@ pub fn parse_qwen_response(v: &Value, fps: f32) -> Result<VisionResult> {
 /// 这样别人 clone 下来只配 SC + DeepSeek 也能跑，`fetch_video` 会降级成
 /// 只给文字材料并明写「未配置视觉模型」。
 pub fn build_vision_client() -> Option<Box<dyn VisionClient>> {
-    let key = std::env::var("DASHSCOPE_API_KEY").ok()?;
+    let key = crate::env_var("DASHSCOPE_API_KEY")?;
     let model =
-        std::env::var("DASHSCOPE_VISION_MODEL").unwrap_or_else(|_| QWEN_DEFAULT_MODEL.to_string());
+        crate::env_var("DASHSCOPE_VISION_MODEL").unwrap_or_else(|| QWEN_DEFAULT_MODEL.to_string());
     Some(Box::new(QwenVisionClient::new(
         key,
         model,

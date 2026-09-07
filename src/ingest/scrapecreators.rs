@@ -45,8 +45,8 @@ impl ScrapeCreators {
 
     /// 从环境变量读 key。key 放在 ~/.zshrc 里。
     pub fn from_env() -> Result<Self> {
-        let key = std::env::var("SCRAPECREATORS_API_KEY")
-            .map_err(|_| ClipKnowError::MissingEnv("SCRAPECREATORS_API_KEY"))?;
+        let key = crate::env_var("SCRAPECREATORS_API_KEY")
+            .ok_or(ClipKnowError::MissingEnv("SCRAPECREATORS_API_KEY"))?;
         Ok(Self::new(key))
     }
 

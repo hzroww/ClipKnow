@@ -7,12 +7,21 @@ services:
     ports:
       - "3000:3000"
     environment:
-      SCRAPECREATORS_API_KEY: ${SCRAPECREATORS_API_KEY:?先 export SCRAPECREATORS_API_KEY}
-      DEEPSEEK_API_KEY:       ${DEEPSEEK_API_KEY:?先 export DEEPSEEK_API_KEY}
-      # 画面分析要，没有也能跑（画面段会写明「未配置视觉模型」）
-      DASHSCOPE_API_KEY:      ${DASHSCOPE_API_KEY:-}
-      DASHSCOPE_VISION_MODEL: ${DASHSCOPE_VISION_MODEL:-}
-      DEEPSEEK_MODEL:         ${DEEPSEEK_MODEL:-}
+      # 必需的两个：宿主没 export 就直接报错，不让容器带着半套配置起来
+      - SCRAPECREATORS_API_KEY=${SCRAPECREATORS_API_KEY:?先 export SCRAPECREATORS_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?先 export DEEPSEEK_API_KEY}
+      # ★ 可选的写成「只有变量名」，宿主没设就**完全不传**。
+      #   原来写的是「DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-}」这种带默认值的形式，
+      #   宿主没设时容器里拿到的是**空字符串**，而代码是
+      #   env::var(..).unwrap_or_else(默认值)——空串是 Ok("")，默认值
+      #   永远用不上。实测结果：模型名为空，请求被 API 拒掉，报错跟「模型名」
+      #   一个字都不沾，查了半天。
+      #   代码那边也补了兜底（crate::env_var 把空串当没设），两层都改了。
+      - DASHSCOPE_API_KEY
+      - DASHSCOPE_VISION_MODEL
+      - DEEPSEEK_MODEL
+      - ANTHROPIC_API_KEY
+      - ANTHROPIC_MODEL
     volumes:
       # 库和 access.json 都在这个卷里，容器删了数据还在
       - clipknow-data:/data

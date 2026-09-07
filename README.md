@@ -143,7 +143,7 @@ cargo build --release
 
 # ② key 放进 .env（已在 .gitignore 里）或 ~/.zshrc
 
-# ③ 网页（需要 Go 1.27+）
+# ③ 网页（需要 Go 1.25+，这个门槛来自 modernc.org/sqlite 而不是本项目代码）
 cd web && go run .
 ```
 

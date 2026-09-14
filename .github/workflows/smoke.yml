@@ -1,0 +1,117 @@
+# 从零跑一遍：在一台干净机器上按 README 的 Docker 步骤起服务，
+# 然后打几个 HTTP 请求确认它真的活着。
+#
+# 这个 workflow 是冲着一整类 bug 来的——「只在别人机器上出现」的那类。
+# 已经踩过三个：
+#   docker-compose 传空字符串环境变量 → 模型名为空，一提问就失败
+#   全新安装库还没建表           → 会话列表直接 500
+#   go.mod 门槛写太高            → 别人根本编不了
+# 这三个在开发机上永远复现不了，因为开发机有 .env、有库、装了最新工具链。
+#
+# 不用真 key：这三个 bug 假 key 全都能抓到，它们是「服务起不起得来」层面的，
+# 不是「模型答得对不对」层面的。后者归评测管。
+name: 从零跑一遍
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 构建镜像
+        run: docker compose build
+
+      - name: 起服务
+        env:
+          # 故意用假 key：只验证服务起得来、认证生效、空库不炸。
+          SCRAPECREATORS_API_KEY: ci-dummy
+          DEEPSEEK_API_KEY: ci-dummy
+        run: docker compose up -d
+
+      - name: 等它起来
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:3000/; then
+              echo "第 ${i} 秒起来了"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "30 秒还没起来，日志："
+          docker compose logs
+          exit 1
+
+      - name: 检查各个接口
+        run: |
+          set -euo pipefail
+
+          # ★ 每个 curl 单独一行拿状态码，不要用管道——
+          #   管道之后 $? 是最后一个命令的退出码，会把失败吃掉。
+          查() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@"; }
+          断言() {  # 断言 <说明> <实际> <期望>
+            if [ "$2" = "$3" ]; then
+              echo "  OK  $1: $2"
+            else
+              echo "  ✗   $1: 实际 $2，期望 $3"
+              exit 1
+            fi
+          }
+
+          断言 "首页" "$(查 http://localhost:3000/)" 200
+          断言 "未登录时的会话列表" "$(查 http://localhost:3000/api/sessions)" 401
+          断言 "未登录时的身份" "$(查 http://localhost:3000/api/me)" 401
+
+          # 第一次启动会把邀请码打进日志
+          码=$(docker compose logs 2>&1 | grep -oE '邀请码：[A-Z0-9]{8}' | grep -oE '[A-Z0-9]{8}' | head -1)
+          if [ -z "$码" ]; then
+            echo "✗ 日志里没找到邀请码"
+            docker compose logs
+            exit 1
+          fi
+          echo "  拿到邀请码 $码"
+
+          断言 "登录" \
+            "$(查 -c /tmp/jar -X POST http://localhost:3000/api/login \
+                 -H 'Content-Type: application/json' -d "{\"code\":\"$码\"}")" 200
+          断言 "错误的邀请码" \
+            "$(查 -X POST http://localhost:3000/api/login \
+                 -H 'Content-Type: application/json' -d '{"code":"WRONGWRONG"}')" 401
+
+          # ★ 这一条就是「全新安装 500」那个 bug 的护栏。
+          #   库是空的、连表都还没建（建表在 Rust 子进程里，第一次提问才跑），
+          #   Go 只读打开，正确行为是返回空列表而不是报错。
+          断言 "登录后的会话列表" "$(查 -b /tmp/jar http://localhost:3000/api/sessions)" 200
+          内容=$(curl -s -b /tmp/jar --max-time 10 http://localhost:3000/api/sessions)
+          断言 "空库时会话列表的内容" "$内容" "[]"
+
+      - name: 日志里不该有这些
+        run: |
+          set -euo pipefail
+          日志=$(docker compose logs 2>&1)
+          for 坏词 in "panic" "permission denied" "no such table" "unwrap"; do
+            if echo "$日志" | grep -qi "$坏词"; then
+              echo "✗ 日志里出现了「$坏词」："
+              echo "$日志" | grep -i -C2 "$坏词"
+              exit 1
+            fi
+          done
+          echo "  OK  日志干净"
+
+      # 前面任何一步失败时，把完整日志打出来——
+      # 不然你在 CI 页面上只看到「失败了」，不知道为什么。
+      - name: 失败时打印日志
+        if: failure()
+        run: docker compose logs
+
+      - name: 收摊
+        if: always()
+        run: docker compose down -v

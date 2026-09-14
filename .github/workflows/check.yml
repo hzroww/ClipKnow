@@ -1,0 +1,82 @@
+# 快检查：编译、测试、代码规范。每次 push 都跑。
+name: 快检查
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一个分支连着推两次时，把上一次还在跑的取消掉。
+# 不加这个的话，你连推三次就有三份在跑，看结果时不知道哪个是最新的。
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # runner 上预装了 rustup，但预装的 stable 不一定够新。
+      # Cargo.toml 里写着 rust-version = "1.88"（代码用了 let-chains），
+      # 装最新 stable 保证够。
+      - name: 装 Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+
+      # 编译产物存起来下次复用。不存的话每次都从零编几百个依赖，
+      # 一次要五六分钟；存了之后只有依赖变了才重编。
+      - name: 复用上次的编译产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Cargo.lock 变了就换一个新缓存（说明依赖变了）
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: 格式
+        run: cargo fmt --check
+
+      - name: clippy（警告当错误）
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: 测试
+        run: cargo test --locked
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # ★ 用 go.mod 里声明的版本，而不是写死一个。
+      #   这等于每次都在验证「go.mod 里那个门槛是真能编的」——
+      #   之前 go.mod 写 1.27 把人挡在门外，就是这类问题。
+      - name: 装 Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: web/go.mod
+          cache-dependency-path: web/go.sum
+
+      - name: 格式
+        working-directory: web
+        run: |
+          没格式化的=$(gofmt -l .)
+          if [ -n "$没格式化的" ]; then
+            echo "下面这些文件没格式化，本地跑 gofmt -w ."
+            echo "$没格式化的"
+            exit 1
+          fi
+
+      - name: vet
+        working-directory: web
+        run: go vet ./...
+
+      - name: 编译
+        working-directory: web
+        run: go build ./...

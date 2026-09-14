@@ -63,13 +63,19 @@ jobs:
           go-version-file: web/go.mod
           cache-dependency-path: web/go.sum
 
+      # gofmt -l 找到没格式化的文件时只把文件名打出来，**退出码仍然是 0**，
+      # 直接用会被它骗过去，所以要自己判断输出非空。
+      #
+      # ★ 变量名必须是 ASCII。bash 的变量名只认字母数字下划线，
+      #   写中文变量名会直接 command not found（第一次推上去就栽在这）。
+      #   注释和 echo 的内容用中文没问题。
       - name: 格式
         working-directory: web
         run: |
-          没格式化的=$(gofmt -l .)
-          if [ -n "$没格式化的" ]; then
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
             echo "下面这些文件没格式化，本地跑 gofmt -w ."
-            echo "$没格式化的"
+            echo "$unformatted"
             exit 1
           fi
 

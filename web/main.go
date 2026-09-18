@@ -79,6 +79,21 @@ func main() {
 
 	s := &Server{store: st, access: ac, dbPath: dbAbs, binPath: binAbs}
 
+	mux := s.routes()
+
+	log.Printf("ClipKnow web  →  http://localhost%s", *addr)
+	log.Printf("  库   %s", dbAbs)
+	log.Printf("  程序 %s", binAbs)
+	if err := http.ListenAndServe(*addr, mux); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// 路由表。
+//
+// 抽成函数是为了让端到端测试能起一个一模一样的服务（httptest）。
+// 测试里自己再列一遍的话，这里加了接口那边忘了加，测试就会悄悄漏掉它。
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/logout", s.handleLogout)
@@ -88,13 +103,7 @@ func main() {
 	mux.HandleFunc("/api/chat", s.needAuth(s.handleChat))
 	// 登录页本身不设防——它就是那个输邀请码的地方
 	mux.HandleFunc("/", s.handleIndex)
-
-	log.Printf("ClipKnow web  →  http://localhost%s", *addr)
-	log.Printf("  库   %s", dbAbs)
-	log.Printf("  程序 %s", binAbs)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
-		log.Fatal(err)
-	}
+	return mux
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {

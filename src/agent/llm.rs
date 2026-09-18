@@ -456,7 +456,15 @@ impl DeepSeekClient {
             .ok_or(ClipKnowError::MissingEnv("DEEPSEEK_API_KEY"))?;
         let model =
             crate::env_var("DEEPSEEK_MODEL").unwrap_or_else(|| DEEPSEEK_DEFAULT_MODEL.to_string());
-        Ok(Self::new(key, model))
+        let mut c = Self::new(key, model);
+        // 换一个 base_url 就能把请求打到本地的假服务器上——离线端到端测试靠这个。
+        //
+        // 只在 from_env 里读，new() 保持纯粹（单测构造时不受环境影响）。
+        // 不设就是线上那个地址，生产行为一个字不变。
+        if let Some(u) = crate::env_var("DEEPSEEK_BASE_URL") {
+            c.base_url = u.trim_end_matches('/').to_string();
+        }
+        Ok(c)
     }
 
     /// 把同一个 ModelRequest 翻译成 OpenAI 格式。
@@ -924,6 +932,40 @@ pub fn build_client(explicit: Option<Provider>) -> Result<Box<dyn LlmClient>> {
 }
 
 // ---------------------------------------------------------------------------
+#[cfg(test)]
+mod base_url_tests {
+    use super::*;
+
+    /// ★ 两个断言必须在**同一个** #[test] 里。
+    ///
+    /// cargo test 默认并行跑测试，而它们改的是同一个进程环境变量
+    /// （名字是代码定死的 DEEPSEEK_BASE_URL，不像别处可以各用各的名字）。
+    /// 拆成两个测试的话，一个刚 remove_var，另一个正好 set_var，
+    /// 就会随机失败——已经踩过一次。
+    #[test]
+    fn base_url_可以被环境变量覆盖() {
+        // SAFETY: 这个测试是唯一碰这两个变量的地方，而且断言按顺序跑。
+        unsafe {
+            std::env::set_var("DEEPSEEK_API_KEY", "k");
+            std::env::remove_var("DEEPSEEK_BASE_URL");
+        }
+        assert_eq!(
+            DeepSeekClient::from_env().unwrap().base_url,
+            "https://api.deepseek.com",
+            "不设的时候必须还是线上地址——生产行为不能被这个开关影响"
+        );
+
+        unsafe { std::env::set_var("DEEPSEEK_BASE_URL", "http://127.0.0.1:9/v1/") }
+        assert_eq!(
+            DeepSeekClient::from_env().unwrap().base_url,
+            "http://127.0.0.1:9/v1",
+            "末尾斜杠要去掉，不然拼出来是 .../v1//chat/completions"
+        );
+
+        unsafe { std::env::remove_var("DEEPSEEK_BASE_URL") }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

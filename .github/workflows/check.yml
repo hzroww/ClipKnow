@@ -86,3 +86,52 @@ jobs:
       - name: 编译
         working-directory: web
         run: go build ./...
+
+  # 离线端到端：Go → Rust 子进程 → SSE → 数据库 → 读回历史。
+  # 靠一个本地假模型服务器（httptest）做到不花钱、不联网。
+  #
+  # 单独一个 job 而不是塞进上面的 go：它要先编 Rust release，
+  # 会把那个 15 秒的 job 拖成几分钟。分开就能和别人并行。
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 装 Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: 复用上次的编译产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # 测试里找的是 ../target/release/clipknow，找不到会 t.Skip 而不是失败。
+      # 所以这一步必须真的成功，否则下面会"通过"但什么都没测。
+      - name: 编 Rust
+        run: cargo build --release --locked --bin clipknow
+
+      - name: 确认二进制在
+        run: test -x target/release/clipknow
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: web/go.mod
+          cache-dependency-path: web/go.sum
+
+      # ★ -count=1 关掉测试缓存。
+      #   Go 的缓存只看 Go 那边的输入，**Rust 二进制变了它不知道**——
+      #   实测：改了 Rust 重跑，go test 直接返回 "ok (cached)"，
+      #   而那份代码其实是坏的。CI 上更危险，缓存会跨提交复用。
+      #
+      # ★ -v 是故意的：这个测试只有一个，输出不多，
+      #   而失败时能直接看到是哪条断言炸的，不用再点开一层。
+      - name: 端到端
+        working-directory: web
+        run: go test -count=1 -v -run TestChatEndToEnd ./...

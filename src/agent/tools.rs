@@ -374,13 +374,6 @@ fn paged_creator_videos(
     Ok((all, raws, MAX_PAGES, credits))
 }
 
-/// 附在档案后面的历史问答条数上限。
-///
-/// 这一段**每轮迭代都要重发**，所以必须有上限。数字取自参照实现里实际
-/// 在跑的那三个（`MAX_CONTEXT_EXCHANGES = 6`、单条 1200 字符）。
-pub const MAX_DOSSIER_EXCHANGES: usize = 6;
-pub const MAX_EXCHANGE_CHARS: usize = 1_200;
-
 /// 工具执行需要的一切外部依赖。
 ///
 /// 从三个散参数改成一个结构，是因为这是第三个依赖，而且还会有第四个。
@@ -405,16 +398,6 @@ impl<'a> ToolCtx<'a> {
             vision_budget_left: 0,
         }
     }
-}
-
-/// 按字符数截断（不是字节——中文一个字三字节，按字节切会切出乱码）。
-fn truncate(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}…（共 {n} 字，已截断）")
 }
 
 pub fn execute(ctx: &mut ToolCtx<'_>, call: &ToolCall) -> ToolOutcome {
@@ -659,8 +642,7 @@ fn look_at_video(
     if question.is_none()
         && let Ok(Some(d)) = ctx.store.latest_general_dossier(vid)
     {
-        let mut section = d.render(duration, true);
-        append_past_answers(ctx, vid, &mut section);
+        let section = d.render(duration, true);
         return VisualOutcome {
             section,
             calls: 0,
@@ -761,9 +743,8 @@ fn look_at_video(
                             dossier_json: String::new(),
                             model: vision.model_name().to_string(),
                             fps: 0.0,
-                            // 记下是哪个问题触发的。查询 latest_general_dossier /
-                            // recent_dossier_answers 都过滤 dossier_json <> ''，
-                            // 这一行进不了它们，纯排障信息。
+                            // 记下是哪个问题触发的。latest_general_dossier 过滤
+                            // dossier_json <> ''，这一行进不了它，纯排障信息。
                             question: question.map(str::to_string),
                             video_tokens: None,
                             created_at: crate::content::model::now_ts(),
@@ -807,13 +788,10 @@ fn look_at_video(
             // 落库失败不影响这一轮的答案——档案已经拿到了
             let _ = ctx.store.save_dossier(vid, &stored);
 
-            let mut section = match question {
+            let section = match question {
                 Some(q) => render_answer(q, &r.text, r.fps),
                 None => stored.render(duration, false),
             };
-            if question.is_none() {
-                append_past_answers(ctx, vid, &mut section);
-            }
             VisualOutcome {
                 section,
                 calls: 1,
@@ -903,8 +881,8 @@ fn blocked_with_fallback(
     let Ok(Some(d)) = ctx.store.latest_general_dossier(video_id) else {
         return VisualOutcome::unavailable(reason);
     };
+    // mut 要留着——下面那句 push_str 还在用
     let mut section = d.render(duration, true);
-    append_past_answers(ctx, video_id, &mut section);
     // 明说「这次的问题没分析」，不让模型把通用档案当成对问题的回答。
     section.push_str(&crate::content::dossier::render_unavailable(&format!(
         "上面是之前分析出的通用档案；这次的具体问题没能分析——{reason}"
@@ -916,30 +894,25 @@ fn blocked_with_fallback(
     }
 }
 
-/// 把这个视频历史上问过的画面细节附在档案后面。
-///
-/// 目的是**省钱**：模型看见「这个问过了」就不会为同一个细节再花一次
-/// 分析的钱。因为不存视频，每次带问题重看都要重新下载 + 重新编码，
-/// 成本约等于一次完整分析。
-fn append_past_answers(ctx: &ToolCtx<'_>, video_id: &str, section: &mut String) {
-    let Ok(past) = ctx
-        .store
-        .recent_dossier_answers(video_id, MAX_DOSSIER_EXCHANGES)
-    else {
-        return;
-    };
-    if past.is_empty() {
-        return;
-    }
-    section.push_str("--- 之前针对画面问过的（无需重复分析）---\n");
-    for (q, a) in past {
-        section.push_str(&format!(
-            "问：{}\n答：{}\n",
-            truncate(&q, MAX_EXCHANGE_CHARS),
-            truncate(&a, MAX_EXCHANGE_CHARS)
-        ));
-    }
-}
+// ★ 这里原来有个 append_past_answers：把这个视频历史上被问过的 6 条问答
+//   附在通用档案后面，标题写死「无需重复分析」。删掉了，三条理由，
+//   即使永远单用户也都成立：
+//
+//   1. 同一个会话里是**纯重复**。历史回放会把上一轮工具返回的完整材料原样
+//      带回上下文（context.rs 的 FunctionCallOutput → Msg::Tool），这里再拼
+//      一份 1200 字截断版，同样的问答进两次。
+//   2. 跨会话是**越界**。新会话本来就该干净——要延续性该走长期记忆那条明路
+//      （可见、可删、带出处），不是从视频材料里夹带。
+//   3. 它**伪造证据**。拼进去的问答不带 fps，而 fps 就是这份答案的分辨率
+//      （0.2 = 每 5 秒才看一帧）。一个粗粒度问题的旧答案会被标成「无需重复
+//      分析」摆在模型面前，用来回答需要细粒度的新问题。答案还被截到 1200 字，
+//      而模型看不出它被截断了。
+//
+//   多用户下它还会泄漏——A 的提问原话出现在 B 的材料里。但泄漏只是最表层的
+//   症状。省的那点重新分析的钱（约 ¥0.07）不值这三条的代价。
+//
+//   现在的规则很简单：不带问题就返回通用档案（零成本），带问题就重新发给
+//   视觉模型。没有第三条路。
 
 /// 把画面段插进 `</video-material>` 之前。
 ///
@@ -2137,9 +2110,16 @@ mod tests {
     }
 
     #[test]
-    fn past_answers_are_attached_so_the_model_stops_paying_for_the_same_detail() {
-        // 因为不存视频，每次带问题重看都要重新下载+重新编码 ≈ 一次完整分析。
-        // 把问过的附在档案后面，模型见过就不会再问一遍。
+    fn 通用档案里不能出现任何人问过的问题() {
+        // 场景：先有人带着一个具体问题看过这条视频（答案落库），
+        //       之后（可能是另一个用户、另一个会话）问「这视频讲什么」。
+        //
+        // 这一条钉住的是一个删掉的「优化」：原来会把这个视频历史上被问过的
+        // 6 条问答拼在通用档案后面，标题写死「无需重复分析」。三个问题：
+        //   同会话是纯重复（完整材料本来就在历史回放里）
+        //   跨会话是越界（新会话该干净，延续性归长期记忆管）
+        //   拼进去的问答不带 fps，等于伪造一份精度不明的证据
+        // 多用户下还会把 A 的提问原话泄漏给 B。
         let api = tt_api();
         let mut st = store();
         let v = MockVision::ok("深蓝色针织衫。");
@@ -2157,9 +2137,59 @@ mod tests {
             &call("fetch_video", json!({"url": TT_URL})),
         );
         let c = &out.result.content;
-        assert!(c.contains("之前针对画面问过的"), "{c}");
-        assert!(c.contains("讲者穿什么颜色？"), "{c}");
-        assert!(c.contains("深蓝色针织衫"), "{c}");
+
+        assert!(!c.contains("讲者穿什么颜色？"), "泄漏了别人的提问原话：{c}");
+        assert!(!c.contains("深蓝色针织衫"), "泄漏了别人那次分析的答案：{c}");
+        // ★ 不能只断言「不含那两句话」。只查内容的话，有人把标题换个措辞、
+        //   内容照旧拼进来，这条测试还是绿的——blocked_reason 那次就是这么
+        //   漏过去的。所以连「附加段落存在与否」本身也钉住。
+        assert!(!c.contains("之前针对画面问过的"), "附加段落又回来了：{c}");
+        assert!(!c.contains("无需重复分析"), "附加段落又回来了：{c}");
+
+        // 正常的通用档案要照常返回，别把功能一起删没了
+        assert!(c.contains("=== 画面 ==="), "通用档案本身该在：{c}");
+    }
+
+    #[test]
+    fn 命中通用档案缓存那条路也不能带出别人的问题() {
+        // ★ 上面那条测的是「重新分析」那条路（分支②）。
+        //   这条测的是**命中缓存**那条路（分支①）——库里已经有通用档案，
+        //   直接返回、零成本的那条。它是最常走的一条，删掉的三处调用里
+        //   也有它一份。只测一条路的话，另外两处加回来测试照样是绿的。
+        let api = tt_api();
+        let mut st = store();
+
+        // ① 先建一份通用档案
+        let v0 = MockVision::ok(DOSSIER);
+        execute(
+            &mut with_vision(&api, &mut st, &v0, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+
+        // ② 再有人带着具体问题看一次
+        let v1 = MockVision::ok("深蓝色针织衫。");
+        execute(
+            &mut with_vision(&api, &mut st, &v1, 3),
+            &call(
+                "fetch_video",
+                json!({"url": TT_URL, "question": "讲者穿什么颜色？"}),
+            ),
+        );
+
+        // ③ 现在再问「这视频讲什么」——走缓存，不该调视觉模型
+        let v2 = MockVision::ok("不该被调到");
+        let out = execute(
+            &mut with_vision(&api, &mut st, &v2, 3),
+            &call("fetch_video", json!({"url": TT_URL})),
+        );
+        assert_eq!(out.vision_calls, 0, "该命中缓存，不该重新分析");
+
+        let c = &out.result.content;
+        assert!(!c.contains("讲者穿什么颜色？"), "泄漏了别人的提问原话：{c}");
+        assert!(!c.contains("深蓝色针织衫"), "泄漏了别人那次分析的答案：{c}");
+        assert!(!c.contains("之前针对画面问过的"), "附加段落又回来了：{c}");
+        assert!(!c.contains("无需重复分析"), "附加段落又回来了：{c}");
+        assert!(c.contains("=== 画面 ==="), "通用档案本身该在：{c}");
     }
 
     #[test]

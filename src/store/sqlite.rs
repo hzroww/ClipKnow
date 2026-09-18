@@ -729,26 +729,6 @@ impl SqliteStore {
         })
     }
 
-    /// 这个视频历史上带问题看过的问答，最近的在前。
-    ///
-    /// 附在档案后面给模型看，它见过就不会为同一个细节再花一次分析的钱。
-    /// 有上限是因为这一段**每轮迭代都要重发**。
-    pub fn recent_dossier_answers(
-        &self,
-        video_id: &str,
-        limit: usize,
-    ) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT question, dossier_json FROM video_dossiers
-             WHERE video_id = ?1 AND question IS NOT NULL AND dossier_json <> ''
-             ORDER BY created_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![video_id, limit as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
     /// 记一次压缩：摘要文本 + 它覆盖到哪个 turn.seq（含）。
     ///
     /// 挂在**最新那个 turn** 上，所以「始终只有一个摘要」——第二次压缩会写到
@@ -1920,23 +1900,6 @@ mod tests {
             st.latest_general_dossier(&vid).unwrap().is_none(),
             "只有带问题的结果时，通用档案该是空的"
         );
-    }
-
-    #[test]
-    fn past_answers_come_back_newest_first_and_respect_the_limit() {
-        // 这段要附在档案后面给模型看，而它每轮迭代都要重发，所以必须有上限
-        let mut st = mem();
-        let vid = st.save(&sample("v4", "标题")).unwrap();
-        for i in 0..5 {
-            let mut d = dossier(Some(&format!("问题{i}")), &format!("答案{i}"));
-            d.created_at = 1_000 + i;
-            st.save_dossier(&vid, &d).unwrap();
-        }
-
-        let got = st.recent_dossier_answers(&vid, 3).unwrap();
-        assert_eq!(got.len(), 3, "该受上限约束");
-        assert_eq!(got[0].0, "问题4", "最新的在前");
-        assert_eq!(got[0].1, "答案4");
     }
 
     #[test]

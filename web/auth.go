@@ -29,10 +29,10 @@ import (
 )
 
 const (
-	// 登录有效期。30 天，和原来邀请码 Cookie 一致。
+	// 登录有效期。
 	sessionTTL = 30 * 24 * time.Hour
-	// 新 Cookie 名。和旧的 ck_code 分开，这样两套可以共存到邀请码删掉为止，
-	// 而且老 Cookie 不会被误当成新令牌。
+	// Cookie 名。和已经删掉的邀请码那套（ck_code）不同名是有意的：
+	// 老用户浏览器里残留的旧 Cookie 不会被误当成登录令牌，会被当没登录处理。
 	authCookieName = "ck_session"
 	// 32 字节 = 256 bit。
 	tokenBytes = 32

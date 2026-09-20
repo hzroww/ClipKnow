@@ -418,11 +418,17 @@ fn row_to_video(r: &Row) -> rusqlite::Result<Video> {
 // ---------------------------------------------------------------------------
 
 impl SqliteStore {
-    pub fn create_session(&mut self, title: Option<&str>) -> Result<String> {
+    /// 建一个会话。
+    ///
+    /// `owner` 是这个会话属于谁（users.id）。命令行（find/ask）没有登录这回事，
+    /// 传 None——那些会话的 user_id 为空，网页上谁都看不到，只有命令行自己能用。
+    /// 网页那条路**必须**给 owner，否则建完之后连建它的人都列不出来。
+    pub fn create_session(&mut self, title: Option<&str>, owner: Option<&str>) -> Result<String> {
         let id = new_id();
         self.conn.execute(
-            "INSERT INTO sessions (id, created_at, title) VALUES (?1,?2,?3)",
-            params![id, now_ts(), title],
+            "INSERT INTO sessions (id, created_at, title, user_id, updated_at)
+             VALUES (?1,?2,?3,?4,?2)",
+            params![id, now_ts(), title, owner],
         )?;
         Ok(id)
     }
@@ -956,7 +962,7 @@ mod tests {
     #[test]
     fn credits_can_be_summed_with_one_query() {
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(
             &sid,
             "m",
@@ -988,7 +994,7 @@ mod tests {
     #[test]
     fn reasoning_survives_a_round_trip_through_the_database() {
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(
             &sid,
             "m",
@@ -1008,7 +1014,7 @@ mod tests {
         //   误导 —— 模型会看到「我上次试了这堆方向都没成」，可能重走死路
         //   危险 —— 截断的 turn 里可能有没配对的 function_call，发出去直接 400
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "成功那次")])
             .unwrap();
         st.save_turn(
@@ -1034,7 +1040,7 @@ mod tests {
     fn a_failed_turn_is_still_inspectable_even_though_history_skips_it() {
         // 不进上下文 ≠ 删掉。调试时还要能查。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         let tid = st
             .save_turn(
                 &sid,
@@ -1057,7 +1063,7 @@ mod tests {
         // --continue 时只想打印「有几条历史」，为了一个数字把几万字符读出来
         // 再数一遍是浪费。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(
             &sid,
             "m",
@@ -1091,7 +1097,7 @@ mod tests {
     #[test]
     fn a_summary_replaces_the_turns_it_covers_when_loading_history() {
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         for i in 1..=4 {
             st.save_turn(
                 &sid,
@@ -1120,7 +1126,7 @@ mod tests {
         // 压缩只影响「读出来给模型的历史」，存档一个字不改。
         // 这样它是可回退的，也不破坏存档的忠实性。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "原始内容")])
             .unwrap();
         st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "第二问")])
@@ -1147,7 +1153,7 @@ mod tests {
     fn a_second_compaction_replaces_the_first_instead_of_stacking() {
         // 始终只有一个摘要，它往前推进。不是「摘要A + 摘要B」堆起来。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         for i in 1..=5 {
             st.save_turn(
                 &sid,
@@ -1170,7 +1176,7 @@ mod tests {
     #[test]
     fn turns_grouped_for_the_splitter_skip_failed_ones_and_apply_the_summary() {
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "一")])
             .unwrap();
         st.save_turn(
@@ -1194,7 +1200,7 @@ mod tests {
         // 摘要跟 turn 一起读出来。只跳过被覆盖的 turn、不把摘要带回去，
         // 压缩就成了「把旧 turn 直接删掉」——库里存着，上下文里没有。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(
             &sid,
             "m",
@@ -1228,7 +1234,7 @@ mod tests {
         // 建会话时还不知道标题（要等第一个问题）。
         // 没标题的话 `clipknow sessions` 列出来全是「(无标题)」，认不出是哪次。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.set_session_title(&sid, "帮我找几个做科普的博主")
             .unwrap();
 
@@ -1239,7 +1245,7 @@ mod tests {
     #[test]
     fn a_turn_and_its_items_survive_a_round_trip() {
         let mut st = mem();
-        let sid = st.create_session(Some("找科普博主")).unwrap();
+        let sid = st.create_session(Some("找科普博主"), None).unwrap();
         let items = vec![
             user_item(1, "帮我找几个做科普的博主"),
             Item::assistant_message(2, 1, "我先搜一下"),
@@ -1263,7 +1269,7 @@ mod tests {
     fn load_history_does_not_drag_the_raw_json_along() {
         // 重建历史每轮都要跑一次。2MB 的原始响应混进来就是每轮白读一遍。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         let huge = format!(r#"{{"junk":"{}"}}"#, "x".repeat(50_000));
         let tid = st
             .save_turn(
@@ -1286,7 +1292,7 @@ mod tests {
     #[test]
     fn turns_are_numbered_and_history_spans_them_in_order() {
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "第一次提问")])
             .unwrap();
         st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "第二次追问")])
@@ -1303,7 +1309,7 @@ mod tests {
     fn a_failed_turn_is_recorded_as_failed_not_silently_dropped() {
         // 失败的 turn 和成功的长得不一样，不标就分不出
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(
             &sid,
             "m",
@@ -1324,7 +1330,7 @@ mod tests {
         // 按 session 匹配的话：第一个 turn 里配对好的同名 id，会把第二个 turn
         // 里的孤儿藏起来 —— 自查函数漏报比不报还糟。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(
             &sid,
             "m",
@@ -1355,7 +1361,7 @@ mod tests {
     #[test]
     fn get_raw_json_is_scoped_to_the_turn_not_the_whole_session() {
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         let t1 = st
             .save_turn(
                 &sid,
@@ -1404,7 +1410,7 @@ mod tests {
         // 配对不变量的自查：有 function_call 没有对应的 output，
         // 那次请求必然 400。这是 items 单表最直接的好处。
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(
             &sid,
             "m",
@@ -1425,8 +1431,8 @@ mod tests {
         // --continue 要续「最近活动的」，不是「最近创建的」。
         // 昨天建的会话五分钟前还在聊，今天建的一小时前就丢了 —— 该续昨天那个。
         let mut st = mem();
-        let old = st.create_session(Some("老会话")).unwrap();
-        let new = st.create_session(Some("新会话")).unwrap();
+        let old = st.create_session(Some("老会话"), None).unwrap();
+        let new = st.create_session(Some("新会话"), None).unwrap();
         // 老会话后发生了活动
         st.save_turn(&old, "m", TurnStatus::Done, &[user_item(1, "后来又聊了")])
             .unwrap();
@@ -1442,7 +1448,7 @@ mod tests {
     #[test]
     fn deleting_a_session_takes_its_turns_and_items_with_it() {
         let mut st = mem();
-        let sid = st.create_session(None).unwrap();
+        let sid = st.create_session(None, None).unwrap();
         st.save_turn(&sid, "m", TurnStatus::Done, &[user_item(1, "x")])
             .unwrap();
         st.delete_session(&sid).unwrap();

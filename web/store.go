@@ -81,10 +81,20 @@ func isNoSchema(err error) bool {
 }
 
 // 会话列表，新的在前。
-func (s *Store) Sessions(limit int) ([]Session, error) {
+// 这个用户的会话。
+//
+// ★ 过滤写在 SQL 里，不是查出来再在 Go 里筛。
+//
+//	以前归属存在 access.json，每加一个接口就要记得调一次 CanSee——漏一个
+//	就是越权。现在 `WHERE user_id = ?` 是查询本身的一部分，忘不掉。
+//	软删除的也在这里排掉。
+func (s *Store) Sessions(userID string, limit int) ([]Session, error) {
 	rows, err := s.db.Query(
 		`SELECT id, COALESCE(title, ''), created_at
-		 FROM sessions ORDER BY created_at DESC LIMIT ?`, limit)
+		 FROM sessions
+		 WHERE user_id = ? AND deleted_at IS NULL
+		 ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+		 LIMIT ?`, userID, limit)
 	if isNoSchema(err) {
 		return []Session{}, nil
 	}
@@ -111,14 +121,22 @@ func (s *Store) Sessions(limit int) ([]Session, error) {
 // 每个 turn 取两样：user_message（你问的），以及**最后一条**
 // assistant_message（最终答案）。前面那些 assistant_message 是模型在
 // 调工具之前的中间思考，界面上不显示。
-func (s *Store) History(sessionID string) ([]Message, error) {
+// 一个会话的聊天记录。
+//
+// ★ 归属检查也在 SQL 里：join 回 sessions 并比对 user_id。
+//
+//	不是自己的会话返回空，和「这个会话不存在」表现一致——不告诉调用方
+//	「有这么个会话但你看不了」，那本身就是信息泄漏。
+func (s *Store) History(userID, sessionID string) ([]Message, error) {
 	rows, err := s.db.Query(
 		`SELECT t.seq, t.status, i.item_type, i.payload_json
 		 FROM turns t
 		 JOIN items i ON i.turn_id = t.id
+		 JOIN sessions se ON se.id = t.session_id
 		 WHERE t.session_id = ?
+		   AND se.user_id = ? AND se.deleted_at IS NULL
 		   AND i.item_type IN ('user_message', 'assistant_message')
-		 ORDER BY t.seq, i.idx`, sessionID)
+		 ORDER BY t.seq, i.idx`, sessionID, userID)
 	if isNoSchema(err) {
 		return []Message{}, nil
 	}
@@ -165,4 +183,23 @@ func (s *Store) History(sessionID string) ([]Message, error) {
 		}
 	}
 	return out, rows.Err()
+}
+
+// 这个会话是不是这个用户的（且没被删）。
+//
+// chat.go 接着某个会话提问时要先问这一句。返回 false 的情况包括「不存在」
+// 和「是别人的」——调用方一律按未找到处理，不区分。
+func (s *Store) OwnsSession(userID, sessionID string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT count(*) FROM sessions
+		 WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+		sessionID, userID).Scan(&n)
+	if isNoSchema(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }

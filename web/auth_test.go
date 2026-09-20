@@ -28,10 +28,6 @@ func authServer(t *testing.T) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = acc.Close() })
-	ac, err := LoadAccess(defaultAccessPath(db))
-	if err != nil {
-		t.Fatal(err)
-	}
 	st, err := OpenStore(db)
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +35,7 @@ func authServer(t *testing.T) *httptest.Server {
 	t.Cleanup(func() { _ = st.Close() })
 
 	s := &Server{
-		store: st, access: ac, dbPath: db, binPath: bin,
+		store: st, dbPath: db, binPath: bin,
 		accounts: acc, limiter: newLoginLimiter(),
 	}
 	srv := httptest.NewServer(s.routes())

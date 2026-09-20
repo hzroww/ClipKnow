@@ -80,7 +80,7 @@ var okProvider = map[string]bool{"deepseek": true, "anthropic": true}
 // 特别难查。放到 4MB，同时下面显式检查 Err()。
 const maxLine = 4 << 20
 
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, code string, u *User) {
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, u *Account) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "只接受 POST", http.StatusMethodNotAllowed)
 		return
@@ -95,9 +95,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, code string,
 		return
 	}
 	// 接着别人的会话问，等于能看别人的历史。列表过滤挡不住直接拼 id。
-	if req.Session != "" && !s.access.CanSee(req.Session, code, u) {
-		http.Error(w, "这不是你的会话", http.StatusForbidden)
-		return
+	if req.Session != "" {
+		ok, err := s.store.OwnsSession(u.ID, req.Session)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			// 不存在和不是你的，统一按未找到处理——回 403 等于告诉对方
+			// 「有这么个会话，只是不给你看」。
+			http.Error(w, "没有这个会话", http.StatusNotFound)
+			return
+		}
 	}
 
 	// SSE 需要能一段一段把数据推出去。拿不到 Flusher 说明中间隔了某种
@@ -117,17 +126,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, code string,
 	}
 	defer s.gate.release()
 
-	// ★ 在**起子进程之前**扣。一次提问一旦开始就已经在花钱了（SC 调用、
-	//   模型 token、可能还有视频分析），哪怕最后失败。按「开始」计费才对得上
-	//   实际支出。放在拿锁之后，是为了让「排队被拒」不白扣一次。
-	allowed, left := s.access.Spend(code)
-	if !allowed {
-		http.Error(w, "你的提问次数用完了", http.StatusPaymentRequired)
-		return
-	}
-	if left != unlimited {
-		log.Printf("[%s] 提问，剩 %d 次", u.Name, left)
-	}
+	// 这里原来有一段「扣一次提问额度」。删掉了——设计文档明确不做额度、
+	// 扣费和套餐；容量保护（全局串行锁、以后的并发上限）不等于用户付费配额。
 
 	args := []string{"--db", s.dbPath}
 	if req.Provider != "" {
@@ -141,6 +141,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, code string,
 	if req.Session != "" {
 		args = append(args, "--session", req.Session)
 	}
+	// ★ 新会话由 Rust 创建，归属必须在创建那一刻就写进去。
+	//   以前是等 hello 那一行报回 id 之后再「认领」一次——中间那一小段时间里
+	//   会话是无主的，而且认领失败（比如进程被杀）就永远无主了。
+	args = append(args, "--user", u.ID)
 	args = append(args, req.Question)
 
 	// ★ 刻意用 Command 而不是 CommandContext：**浏览器关掉不杀子进程**。
@@ -208,7 +212,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, code string,
 	sc.Buffer(make([]byte, 0, 64<<10), maxLine)
 
 	clientGone := false
-	claimed := false
 	// 最后一行原样留着。流结束后解析它一次，看是不是正常收尾——
 	// 见下面 endedProperly 的注释。
 	var lastLine []byte
@@ -220,14 +223,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, code string,
 			//   不读的话管道很快写满，子进程就卡在 write 上再也动不了——
 			//   那才是真的把这一轮弄丢了。
 			continue
-		}
-		// hello 那一行带着会话 id（新会话是 Rust 建的）。记一笔归属，
-		// 别人就看不到这个会话了。**只解析 hello 这一行**，其余照样原样转发。
-		if !claimed {
-			if id := helloSession(line); id != "" {
-				s.access.Claim(id, code)
-				claimed = true
-			}
 		}
 		// SSE 的格式：data: <一行>，空行结束一个事件。
 		// Rust 那边保证一个事件正好一行（有测试钉着），所以这里直接拼。

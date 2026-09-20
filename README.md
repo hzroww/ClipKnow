@@ -29,7 +29,7 @@ flowchart TB
 
     subgraph G["Go 进程（常驻，只转发不理解）"]
         RT["main.go　路由 / go:embed 前端"]
-        AC["access.go　邀请码 · 配额 · 会话归属"]
+        AC["auth.go / users.go　注册 · 登录 · 会话归属"]
         ST["store.go　只读打开库 query_only(1)"]
         CH["chat.go　起子进程 · NDJSON→SSE · 全局串行锁"]
     end
@@ -147,12 +147,10 @@ cargo build --release
 cd web && go run .
 ```
 
-打开 <http://localhost:3000>。第一次跑会在库旁边生成 `access.json`,并把你自己的
-邀请码打到终端。加人:
+打开 <http://localhost:3000>,注册一个账号就能用(第一版不限制谁能注册)。
 
-```bash
-cd web && go run . -invite 张三 -quota 5     # 只能问 5 次的码
-```
+每个人只看得见自己的会话——过滤写在 SQL 的 `WHERE user_id = ?` 里,不是查出来
+之后在代码里筛,所以加接口时忘不掉。
 
 也可以完全不开网页,直接用命令行:
 
@@ -171,14 +169,10 @@ cd web && go run . -invite 张三 -quota 5     # 只能问 5 次的码
 ```bash
 export SCRAPECREATORS_API_KEY=... DEEPSEEK_API_KEY=... DASHSCOPE_API_KEY=...
 docker compose up -d --build
-docker compose logs -f            # 第一次跑：这里会打出你的邀请码
+docker compose logs -f            # 看启动日志（会先自动跑一次数据库迁移）
 ```
 
-打开 <http://localhost:3000>。加人:
-
-```bash
-docker compose exec clipknow clipknow-web -db /data/clipknow.db -invite 张三 -quota 5
-```
+打开 <http://localhost:3000>,注册账号即可。
 
 镜像分三段:Rust 编核心 → Go 编 web → 只留两个二进制。**运行镜像只额外装了
 根证书**,因为:

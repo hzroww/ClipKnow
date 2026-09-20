@@ -31,8 +31,11 @@ type Accounts struct {
 	db *sql.DB
 }
 
-// 叫 Account 而不是 User，是因为 access.go 里那个邀请码时代的 User 还在。
-// 等邀请码整套删掉之后再正名——现在改名会让两套东西在同一次改动里纠缠。
+// 一个账号。
+//
+// 叫 Account 不叫 User，是因为库里那张表叫 users——两个名字对着看，一眼能分清
+// 「内存里的结构」和「库里的行」。而且 password_hash 不在这里，它只在
+// Create / Authenticate 内部出现，不会顺手被 JSON 序列化出去。
 type Account struct {
 	ID          string `json:"id"`
 	Username    string `json:"username"`     // 规范化后的

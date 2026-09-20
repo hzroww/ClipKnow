@@ -77,21 +77,21 @@ jobs:
           expect "未登录时的会话列表" "$(code http://localhost:3000/api/sessions)" 401
           expect "未登录时的身份" "$(code http://localhost:3000/api/me)" 401
 
-          # 第一次启动会把邀请码打进日志
-          invite=$(docker compose logs 2>&1 | grep -oE '邀请码：[A-Z0-9]{8}' | grep -oE '[A-Z0-9]{8}' | head -1)
-          if [ -z "$invite" ]; then
-            echo "FAIL 日志里没找到邀请码"
-            docker compose logs
-            exit 1
-          fi
-          echo "  拿到邀请码 $invite"
-
-          expect "登录" \
-            "$(code -c /tmp/jar -X POST http://localhost:3000/api/login \
-                 -H 'Content-Type: application/json' -d "{\"code\":\"$invite\"}")" 200
-          expect "错误的邀请码" \
-            "$(code -X POST http://localhost:3000/api/login \
-                 -H 'Content-Type: application/json' -d '{"code":"WRONGWRONG"}')" 401
+          # 注册一个账号（第一版不限制谁能注册）
+          reg='{"username":"smoketest","password":"password123"}'
+          expect "注册" \
+            "$(code -c /tmp/jar -X POST http://localhost:3000/api/register \
+                 -H 'Content-Type: application/json' -d "$reg")" 200
+          expect "重名注册" \
+            "$(code -X POST http://localhost:3000/api/register \
+                 -H 'Content-Type: application/json' -d "$reg")" 409
+          expect "用密码登录" \
+            "$(code -X POST http://localhost:3000/api/auth/login \
+                 -H 'Content-Type: application/json' -d "$reg")" 200
+          expect "密码错" \
+            "$(code -X POST http://localhost:3000/api/auth/login \
+                 -H 'Content-Type: application/json' \
+                 -d '{"username":"smoketest","password":"wrongwrong"}')" 401
 
           # ★ 这一条就是「全新安装 500」那个 bug 的护栏。
           #   库是空的、连表都还没建（建表在 Rust 子进程里，第一次提问才跑），

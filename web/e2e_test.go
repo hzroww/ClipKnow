@@ -102,7 +102,7 @@ func clipknowBin(t *testing.T) string {
 }
 
 // 起一个和 main() 一模一样的服务，只是库在临时目录里。
-func startServer(t *testing.T, modelURL string) (*httptest.Server, string) {
+func startServer(t *testing.T, modelURL string) *httptest.Server {
 	t.Helper()
 	bin := clipknowBin(t)
 	dir := t.TempDir()
@@ -124,41 +124,43 @@ func startServer(t *testing.T, modelURL string) (*httptest.Server, string) {
 		t.Fatalf("建库失败: %v\n%s", err, out)
 	}
 
-	ac, err := LoadAccess(defaultAccessPath(db))
+	acc, err := OpenAccounts(db)
 	if err != nil {
-		t.Fatalf("建不了邀请码文件: %v", err)
+		t.Fatal(err)
 	}
-	code, err := ac.Invite("测试用户", unlimited)
-	if err != nil {
-		t.Fatalf("发不了邀请码: %v", err)
-	}
+	t.Cleanup(func() { _ = acc.Close() })
+
 	st, err := OpenStore(db)
 	if err != nil {
 		t.Fatalf("开不了库: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	s := &Server{store: st, access: ac, dbPath: db, binPath: bin}
+	s := &Server{
+		store: st, dbPath: db, binPath: bin,
+		accounts: acc, limiter: newLoginLimiter(),
+	}
 	srv := httptest.NewServer(s.routes())
 	t.Cleanup(srv.Close)
-	return srv, code
+	return srv
 }
 
-func login(t *testing.T, srv *httptest.Server, code string) *http.Client {
+// 注册一个账号并返回已登录的客户端。
+func register(t *testing.T, srv *httptest.Server, username string) *http.Client {
 	t.Helper()
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cli := &http.Client{Jar: jar, Timeout: 120 * time.Second}
-	body := strings.NewReader(fmt.Sprintf(`{"code":%q}`, code))
-	resp, err := cli.Post(srv.URL+"/api/login", "application/json", body)
+	body := strings.NewReader(fmt.Sprintf(`{"username":%q,"password":"password123"}`, username))
+	resp, err := cli.Post(srv.URL+"/api/register", "application/json", body)
 	if err != nil {
-		t.Fatalf("登录请求失败: %v", err)
+		t.Fatalf("注册请求失败: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("登录返回 %d，期望 200", resp.StatusCode)
+		t.Fatalf("注册返回 %d，期望 200", resp.StatusCode)
 	}
 	return cli
 }
@@ -226,8 +228,8 @@ func TestChatEndToEnd(t *testing.T) {
 	model := fakeModel(t, &hits)
 	defer model.Close()
 
-	srv, code := startServer(t, model.URL)
-	cli := login(t, srv, code)
+	srv := startServer(t, model.URL)
+	cli := register(t, srv, "e2euser")
 
 	// ── 第一轮 ──────────────────────────────────────────
 	evs := ask(t, cli, srv, "", "你好")
@@ -354,4 +356,79 @@ func getJSON(t *testing.T, cli *http.Client, url string, into any) {
 func lastLine(s string) string {
 	parts := strings.Split(strings.TrimSpace(s), "\n")
 	return parts[len(parts)-1]
+}
+
+// 两个用户各问一句，各自只看得见自己的。
+//
+// 设计文档验收表里的核心一条：A 读取/继续 B 的资源必须全部拒绝，
+// 而且不泄漏标题、状态或内容。
+func TestUsersAreIsolated(t *testing.T) {
+	hits := 0
+	model := fakeModel(t, &hits)
+	defer model.Close()
+	srv := startServer(t, model.URL)
+
+	alice := register(t, srv, "alice")
+	bob := register(t, srv, "bobbie")
+
+	aliceEvents := ask(t, alice, srv, "", "alice 的问题")
+	aliceSession := pick(aliceEvents, "hello")[0].Session
+	bobEvents := ask(t, bob, srv, "", "bob 的问题")
+	bobSession := pick(bobEvents, "hello")[0].Session
+
+	if aliceSession == bobSession {
+		t.Fatal("两个人拿到了同一个会话 id")
+	}
+
+	// ① 列表里只有自己的
+	for _, c := range []struct {
+		name string
+		cli  *http.Client
+		want string
+	}{{"alice", alice, aliceSession}, {"bob", bob, bobSession}} {
+		var list []Session
+		getJSON(t, c.cli, srv.URL+"/api/sessions", &list)
+		if len(list) != 1 {
+			t.Fatalf("%s 的会话列表有 %d 条，应该只有自己的那 1 条：%v", c.name, len(list), list)
+		}
+		if list[0].ID != c.want {
+			t.Errorf("%s 列表里的是 %s，期望 %s", c.name, list[0].ID, c.want)
+		}
+	}
+
+	// ② 直接拼 URL 读别人的历史：拿不到内容
+	//    列表过滤挡不住直接拼 id，所以这一条必须单独测。
+	resp, err := bob.Get(srv.URL + "/api/sessions/" + aliceSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var msgs []Message
+	_ = json.NewDecoder(resp.Body).Decode(&msgs)
+	if len(msgs) != 0 {
+		t.Errorf("bob 读到了 alice 的 %d 条历史：%v", len(msgs), msgs)
+	}
+	for _, m := range msgs {
+		if strings.Contains(m.Text, "alice 的问题") {
+			t.Fatal("bob 看到了 alice 的提问内容")
+		}
+	}
+
+	// ③ 接着别人的会话提问：必须被拒，而且不能把它变成自己的
+	body := strings.NewReader(fmt.Sprintf(`{"session":%q,"question":"偷看"}`, aliceSession))
+	r2, err := bob.Post(srv.URL+"/api/chat", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Body.Close()
+	if r2.StatusCode != http.StatusNotFound {
+		t.Errorf("bob 接着 alice 的会话提问返回 %d，期望 404", r2.StatusCode)
+	}
+
+	// ④ 闹了一圈之后，alice 的会话还是 alice 的
+	var aliceList []Session
+	getJSON(t, alice, srv.URL+"/api/sessions", &aliceList)
+	if len(aliceList) != 1 || aliceList[0].ID != aliceSession {
+		t.Errorf("alice 的会话被动过了：%v", aliceList)
+	}
 }

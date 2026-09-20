@@ -118,6 +118,12 @@ enum Command {
         /// 接着哪个会话。不给就新建一个，新会话的 id 在 hello 那一行里。
         #[arg(long)]
         session: Option<String>,
+        /// 这一轮属于哪个用户（users.id）。新建会话时写进 sessions.user_id。
+        ///
+        /// 网页那条路必须给——不给的话建出来的会话 user_id 为空，
+        /// 列表里谁都看不到它。命令行（find/ask）不需要。
+        #[arg(long)]
+        user: Option<String>,
         /// 这一轮的问题
         question: String,
 
@@ -258,6 +264,7 @@ fn run(cli: Cli) -> Result<()> {
     //   别的命令是给人看的，stderr 就在眼前，不需要这个待遇。
     if let Command::Turn {
         session,
+        user,
         question,
         max_iterations,
         convergence_iteration,
@@ -281,6 +288,7 @@ fn run(cli: Cli) -> Result<()> {
             &cli.db,
             cli.provider.as_deref(),
             session,
+            user,
             &question,
             &overrides,
         );
@@ -503,11 +511,11 @@ fn cmd_find(
             }
             None => {
                 println!("· 没有历史会话，开一个新的");
-                store.create_session(None)?
+                store.create_session(None, None)?
             }
         }
     } else {
-        store.create_session(None)?
+        store.create_session(None, None)?
     };
 
     // 一次性模式
@@ -544,7 +552,7 @@ fn cmd_find(
             "" => continue,
             "/quit" | "/exit" => return Ok(()),
             "/new" => {
-                session_id = store.create_session(None)?;
+                session_id = store.create_session(None, None)?;
                 println!("· 已开新会话（上一个已存好，`--continue` 能回去）");
                 continue;
             }
@@ -776,6 +784,7 @@ fn cmd_turn_json(
     db_path: &str,
     provider: Option<&str>,
     session: Option<String>,
+    user: Option<String>,
     question: &str,
     overrides: &GateOverrides,
 ) -> Result<()> {
@@ -832,7 +841,7 @@ fn cmd_turn_json(
             }
             id
         }
-        None => match store.create_session(None) {
+        None => match store.create_session(None, user.as_deref()) {
             Ok(id) => id,
             Err(e) => bail!(e),
         },

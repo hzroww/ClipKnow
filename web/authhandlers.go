@@ -191,3 +191,25 @@ func (s *Server) accountFrom(r *http.Request) *Account {
 	}
 	return u
 }
+
+// 包住需要登录的接口。认不出人就 401，处理函数拿到的一定是个有效账号。
+func (s *Server) needAuth(h func(http.ResponseWriter, *http.Request, *Account)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u := s.accountFrom(r)
+		if u == nil {
+			writeErr(w, http.StatusUnauthorized, "unauthorized", "没登录")
+			return
+		}
+		h(w, r, u)
+	}
+}
+
+// 我是谁。
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	u := s.accountFrom(r)
+	if u == nil {
+		writeErr(w, http.StatusUnauthorized, "unauthorized", "没登录")
+		return
+	}
+	writeJSON(w, u)
+}

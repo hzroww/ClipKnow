@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -49,6 +50,27 @@ func randomPassword(n int) string {
 // 哪个码。想要好看的名字，之后改显示名称或者重新注册。
 func usernameFromCode(code string) string {
 	return "u" + strings.ToLower(code)
+}
+
+// access.json 里我们要读的那部分。
+//
+// 邀请码那套代码已经删了，但**这个一次性导入工具还要读那个老文件**，
+// 所以在这里留一份最小的结构。等所有人都导入完、老文件可以扔掉时，
+// 这个文件整个删掉。
+type accessUser struct {
+	Name   string `json:"name"`
+	Admin  bool   `json:"admin"`
+	UserID string `json:"user_id,omitempty"`
+}
+
+type accessState struct {
+	Users map[string]*accessUser `json:"users"`
+	Owner map[string]string      `json:"owner"`
+}
+
+// access.json 默认就在库旁边。
+func defaultAccessPath(dbPath string) string {
+	return filepath.Join(filepath.Dir(dbPath), "access.json")
 }
 
 type importedAccount struct {

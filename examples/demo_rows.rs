@@ -5,7 +5,7 @@ use serde_json::json;
 
 fn main() {
     let mut st = SqliteStore::in_memory().unwrap();
-    let sid = st.create_session(Some("演示")).unwrap();
+    let sid = st.create_session(Some("演示"), None).unwrap();
     let big_raw = format!(r#"{{"videos":[{}]}}"#, "\"...\",".repeat(8000));
     let rendered = "[结果：20 条]\n1. 【千萬不要吃】人類不能吃生肉的真正原因\n   作者 老高與小茉 (@laogao) | 播放 4780929 ...".repeat(60);
 

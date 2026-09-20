@@ -10,7 +10,7 @@ fn main() {
     let llm = build_client(None).unwrap();
     let api = ScrapeCreators::from_env().unwrap();
     let mut st = SqliteStore::open("/tmp/compact.db").unwrap();
-    let sid = st.create_session(Some("压缩验证")).unwrap();
+    let sid = st.create_session(Some("压缩验证"), None).unwrap();
     let cfg = LoopConfig {
         compaction_threshold: 5_000, // 极低，第二轮就会触发
         compaction_target_tokens: 3_000,

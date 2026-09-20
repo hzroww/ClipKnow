@@ -218,13 +218,11 @@
   }
   .gate-box h2 { margin: 0; font-size: 19px; font-weight: 600; }
   .gate-box p { margin: 0 0 4px; font-size: 13.5px; color: var(--mid); }
-  #code {
+  .gate-box input {
     padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px;
-    background: var(--bg); color: var(--ink); font: inherit;
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 17px; letter-spacing: .18em; text-transform: uppercase;
+    background: var(--bg); color: var(--ink); font: inherit; font-size: 15px;
   }
-  #code:focus { outline: none; border-color: var(--accent); }
+  .gate-box input:focus { outline: none; border-color: var(--accent); }
   #enter {
     padding: 10px; border: none; border-radius: 7px;
     background: var(--accent); color: #fff; font: inherit; font-size: 14.5px; cursor: pointer;
@@ -232,6 +230,23 @@
   #gate-err { color: var(--bad); font-size: 13px; min-height: 1.2em; }
   .who-am-i { font-size: 11.5px; color: var(--soft); padding: 8px 16px; border-top: 1px solid var(--line); }
   .hint { max-width: 760px; margin: 0 auto; padding: 0 26px 12px; font-size: 12px; color: var(--soft); }
+
+/* 登录 / 注册 两个标签 */
+.tabs { display:flex; gap:0; margin:0 0 14px; border-bottom:1px solid var(--line); }
+.tab {
+  flex:1; background:none; border:none; padding:8px 0; cursor:pointer;
+  color:var(--dim); font-size:14px; border-bottom:2px solid transparent;
+}
+.tab.on { color:var(--fg); border-bottom-color:var(--accent); }
+.gate-box input { margin-bottom:10px; }
+
+/* 侧栏底部那个「退出」，做成链接的样子，别抢主按钮的视觉 */
+.who-am-i { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.linkish {
+  background:none; border:none; color:var(--dim); cursor:pointer;
+  font-size:12px; padding:2px 4px; text-decoration:underline;
+}
+.linkish:hover { color:var(--fg); }
 </style>
 </head>
 <body>
@@ -239,9 +254,15 @@
 <div id="gate">
   <div class="gate-box">
     <h2>ClipKnow</h2>
-    <p>输入邀请码</p>
-    <input id="code" maxlength="8" autocomplete="off" spellcheck="false" placeholder="8 位">
-    <button id="enter">进入</button>
+    <div class="tabs">
+      <button id="tab-login" class="tab on">登录</button>
+      <button id="tab-reg" class="tab">注册</button>
+    </div>
+    <input id="username" autocomplete="username" spellcheck="false"
+           placeholder="用户名（字母数字，3–32 位）">
+    <input id="password" type="password" autocomplete="current-password"
+           placeholder="密码（至少 8 位）">
+    <button id="enter">登录</button>
     <div id="gate-err"></div>
   </div>
 </div>
@@ -826,31 +847,78 @@ let me = null;
 function showGate(msg) {
   $('#gate').classList.add('on');
   $('#gate-err').textContent = msg || '';
-  $('#code').focus();
+  $('#username').focus();
 }
 
 function renderMe() {
-  $('#whoami').textContent = me
-    ? (me.quota < 0 ? `${me.name} · 不限次数` : `${me.name} · 还能问 ${me.quota} 次`)
-    : '';
+  if (!me) { $('#whoami').textContent = ''; return; }
+  // 账号时代没有次数概念。quota 这个字段是邀请码那套留下的，
+  // 等邀请码删掉之后整条分支跟着消失。
+  const name = me.display_name || me.name || me.username || '';
+  const quota = (me.quota !== undefined && me.quota >= 0)
+    ? ` · 还能问 ${me.quota} 次` : '';
+  $('#whoami').innerHTML = '';
+  $('#whoami').append(
+    el('span', '', name + quota),
+    (() => { const b = el('button', 'linkish', '退出'); b.onclick = logout; return b; })(),
+  );
 }
 
+// 登录还是注册。两个表单字段一样，只有提交的地址和按钮字不同。
+let mode = 'login';
+function setMode(m) {
+  mode = m;
+  $('#tab-login').classList.toggle('on', m === 'login');
+  $('#tab-reg').classList.toggle('on', m === 'reg');
+  $('#enter').textContent = m === 'login' ? '登录' : '注册并进入';
+  $('#password').autocomplete = m === 'login' ? 'current-password' : 'new-password';
+  $('#gate-err').textContent = '';
+}
+$('#tab-login').onclick = () => setMode('login');
+$('#tab-reg').onclick = () => setMode('reg');
+
 async function enter() {
-  const code = $('#code').value.trim().toUpperCase();
-  if (!code) return;
-  const r = await fetch('/api/login', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code }),
-  });
-  if (!r.ok) { $('#gate-err').textContent = await r.text(); return; }
-  me = await r.json();
-  $('#gate').classList.remove('on');
-  renderMe();
-  showWelcome();
-  loadSessions();
+  const username = $('#username').value.trim();
+  const password = $('#password').value;
+  if (!username || !password) {
+    $('#gate-err').textContent = '用户名和密码都要填';
+    return;
+  }
+  $('#enter').disabled = true;
+  try {
+    const url = mode === 'login' ? '/api/auth/login' : '/api/register';
+    const r = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!r.ok) {
+      // 后端统一返回 {code, message}；万一不是（比如代理返回的 HTML），
+      // 退回读文本，别让界面卡在「没反应」。
+      let msg;
+      try { msg = (await r.json()).message; } catch { msg = await r.text(); }
+      $('#gate-err').textContent = msg || `出错了（${r.status}）`;
+      return;
+    }
+    me = await r.json();
+    $('#password').value = '';
+    $('#gate').classList.remove('on');
+    renderMe();
+    showWelcome();
+    loadSessions();
+  } finally {
+    $('#enter').disabled = false;
+  }
 }
 $('#enter').onclick = enter;
-$('#code').addEventListener('keydown', e => { if (e.key === 'Enter') enter(); });
+for (const id of ['#username', '#password']) {
+  $(id).addEventListener('keydown', e => { if (e.key === 'Enter') enter(); });
+}
+
+async function logout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  me = null;
+  location.reload();
+}
 
 // 每次提问后剩余次数会变，重新拉一下
 async function refreshMe() {

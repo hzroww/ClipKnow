@@ -27,10 +27,13 @@ var staticFS embed.FS
 
 type Server struct {
 	store   *Store
-	access  *Access
+	access  *Access // 邀请码那套，正在被账号取代
 	dbPath  string
 	binPath string
 	gate    turnGate
+
+	accounts *Accounts     // 账号与登录态（Go 拥有）
+	limiter  *loginLimiter // 登录/注册的入口限速
 }
 
 func main() {
@@ -88,7 +91,16 @@ func main() {
 	}
 	defer st.Close()
 
-	s := &Server{store: st, access: ac, dbPath: dbAbs, binPath: binAbs}
+	acc, err := OpenAccounts(dbAbs)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	defer acc.Close()
+
+	s := &Server{
+		store: st, access: ac, dbPath: dbAbs, binPath: binAbs,
+		accounts: acc, limiter: newLoginLimiter(),
+	}
 
 	mux := s.routes()
 
@@ -106,6 +118,11 @@ func main() {
 // 测试里自己再列一遍的话，这里加了接口那边忘了加，测试就会悄悄漏掉它。
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
+	// 账号（新）
+	mux.HandleFunc("/api/register", s.handleRegister)
+	mux.HandleFunc("/api/auth/login", s.handleLoginNew)
+	mux.HandleFunc("/api/auth/logout", s.handleLogoutNew)
+	// 邀请码（旧，等前端切过去之后删）
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/logout", s.handleLogout)
 	mux.HandleFunc("/api/me", s.handleMe)

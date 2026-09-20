@@ -293,7 +293,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, u)
 }
 
+// 我是谁。
+//
+// 过渡期两套并存：先认新的账号登录态，认不出再退回邀请码。
+// 等前端切过去、邀请码整套删掉之后，后半段跟着消失。
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	if a := s.accountFrom(r); a != nil {
+		writeJSON(w, a)
+		return
+	}
 	_, u := s.access.From(r)
 	if u == nil {
 		http.Error(w, "没登录", http.StatusUnauthorized)
@@ -308,8 +316,19 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 // 包住需要登录的接口。
+// 包住需要登录的接口。
+//
+// ★ 过渡期：新账号登录态优先，认不出再退回邀请码。
+//
+//	新账号这条路上，传给处理函数的 "code" 位置放的是 **user_id**——
+//	下游（会话归属检查）只把它当不透明字符串用，不解析内容。等邀请码删掉
+//	之后这个参数就正名成 userID。
 func (s *Server) needAuth(h func(http.ResponseWriter, *http.Request, string, *User)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if a := s.accountFrom(r); a != nil {
+			h(w, r, a.ID, &User{Name: a.DisplayName, Quota: unlimited, Admin: a.Admin, UserID: a.ID})
+			return
+		}
 		code, u := s.access.From(r)
 		if u == nil {
 			http.Error(w, "没登录", http.StatusUnauthorized)

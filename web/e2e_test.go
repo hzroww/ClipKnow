@@ -116,6 +116,14 @@ func startServer(t *testing.T, modelURL string) (*httptest.Server, string) {
 	t.Setenv("SCRAPECREATORS_API_KEY", "fake-key-for-test")
 	t.Setenv("DASHSCOPE_API_KEY", "")
 
+	// ★ 先把库建出来。迁移不再由服务启动时顺手做（Go 和 Rust 会同时启动，
+	//   两边都跑 DDL 就是两个写者抢锁），所以这里显式跑一次——和真实部署
+	//   「先 clipknow migrate 再起服务」是同一个顺序。
+	mig := exec.Command(bin, "migrate", "--db", db)
+	if out, err := mig.CombinedOutput(); err != nil {
+		t.Fatalf("建库失败: %v\n%s", err, out)
+	}
+
 	ac, err := LoadAccess(defaultAccessPath(db))
 	if err != nil {
 		t.Fatalf("建不了邀请码文件: %v", err)

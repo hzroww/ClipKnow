@@ -28,9 +28,27 @@ impl SqliteStore {
     }
 
     /// 建一个只存在于内存里的库，测试用——跑完就没了，不会留下垃圾文件。
+    ///
+    /// 这条路**自己跑迁移**：内存库每次都是全新的（版本 0），没有「先 migrate
+    /// 再 open」那一步可走。生产库不能这样——见 `init` 里的说明。
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        crate::store::migrate::run(&mut conn)?;
         Self::init(conn)
+    }
+
+    /// 打开并把迁移跑完。**只给 `clipknow migrate` 用。**
+    ///
+    /// 和 `open` 分开是刻意的：服务启动走 `open`（只检查），升级走这条
+    /// （唯一执行 DDL 的地方）。合成一个的话，「启动时顺手升级」又回来了。
+    pub fn open_and_migrate(path: &str) -> Result<(Self, Vec<i64>)> {
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        let applied = crate::store::migrate::run(&mut conn)?;
+        Ok((Self::init(conn)?, applied))
     }
 
     /// 撞锁时等多久再报错。
@@ -66,13 +84,12 @@ impl SqliteStore {
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
 
-        conn.execute_batch(include_str!("../../migrations/001_init.sql"))?;
-        migrate_drop_video_raw_json(&conn)?;
-        conn.execute_batch(include_str!("../../migrations/002_agent_loop.sql"))?;
-        migrate_add_turn_summary(&conn)?;
-        conn.execute_batch(include_str!("../../migrations/004_video_dossier.sql"))?;
-        migrate_add_dossier_staging(&conn)?;
-        migrate_add_dossier_failure(&conn)?;
+        // ★ 这里**不再执行任何 DDL**。
+        //
+        //   以前每次 open 都把全部建表语句重跑一遍。多用户之后 Go 和 Rust 会
+        //   同时启动，两边都想跑 DDL 就是两个写者抢锁。现在唯一的执行入口是
+        //   `clipknow migrate`，服务启动只检查版本对不对。
+        crate::store::migrate::check(&conn)?;
         Ok(Self { conn })
     }
 }
@@ -122,7 +139,7 @@ fn row_to_dossier(r: &rusqlite::Row) -> rusqlite::Result<StoredDossier> {
 /// 给 video_dossiers 加 provider / staged_ref / staged_expires_at 三列。
 ///
 /// `ALTER TABLE ADD COLUMN` 在 SQLite 里不支持 IF NOT EXISTS，所以先查 PRAGMA。
-fn migrate_add_dossier_staging(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate_add_dossier_staging(conn: &Connection) -> Result<()> {
     let has: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('video_dossiers') WHERE name = 'staged_ref'")?
         .exists([])?;
@@ -132,7 +149,7 @@ fn migrate_add_dossier_staging(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_add_dossier_failure(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate_add_dossier_failure(conn: &Connection) -> Result<()> {
     let has: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('video_dossiers') WHERE name = 'blocked_reason'")?
         .exists([])?;
@@ -142,7 +159,7 @@ fn migrate_add_dossier_failure(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_add_turn_summary(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate_add_turn_summary(conn: &Connection) -> Result<()> {
     let has: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('turns') WHERE name = 'summary'")?
         .exists([])?;
@@ -152,7 +169,7 @@ fn migrate_add_turn_summary(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_drop_video_raw_json(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate_drop_video_raw_json(conn: &Connection) -> Result<()> {
     let has_col = conn
         .prepare("PRAGMA table_info(videos)")?
         .query_map([], |r| r.get::<_, String>(1))?
@@ -1727,7 +1744,11 @@ mod tests {
         )
         .unwrap();
 
-        // 打开时应自动迁移
+        // 迁移由 `clipknow migrate` 跑，不再由 open 顺手做。
+        // 这里手工造的是「只有 videos 表」的半截老库，没有 sessions，
+        // 所以 is_legacy 认不出它，baseline 会完整执行——正是这个测试要的。
+        let mut conn = conn;
+        crate::store::migrate::run(&mut conn).unwrap();
         let store = SqliteStore::init(conn).unwrap();
 
         // 1) 老的原始响应被搬进了 artifacts，没丢
@@ -1795,6 +1816,8 @@ mod tests {
         )
         .unwrap();
 
+        let mut conn = conn;
+        crate::store::migrate::run(&mut conn).unwrap();
         let store = SqliteStore::init(conn).unwrap();
         let arts = store.get_artifacts("v1").unwrap();
         assert_eq!(

@@ -82,6 +82,17 @@ enum Command {
         #[arg(long)]
         continue_: bool,
     },
+    /// 把数据库升级到当前代码需要的版本。
+    ///
+    /// **这是唯一执行建表语句的地方。** 服务启动只检查版本，不自己升级——
+    /// Go 和 Rust 会同时启动，两边都想跑 DDL 就是两个写者抢锁。
+    ///
+    /// 跑之前先停服务并备份数据库（连同 -wal / -shm 两个伴生文件）。
+    Migrate {
+        /// 只看看差几版，不动数据库
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// 列出历史会话
     Sessions {
         #[arg(long, default_value_t = 20)]
@@ -266,6 +277,13 @@ fn run(cli: Cli) -> Result<()> {
     // --provider 给了但拼错时，明确报错而不是悄悄用默认的那家
     let provider = parse_provider(cli.provider.as_deref())?;
 
+    // ★ migrate 必须在 open 之前处理。
+    //   open 现在会因为「库版本落后」直接报错——那正是它存在的意义，
+    //   而落后的库恰恰就是要来跑 migrate 的那个。
+    if let Command::Migrate { dry_run } = cli.command {
+        return cmd_migrate(&cli.db, dry_run);
+    }
+
     let mut store = SqliteStore::open(&cli.db)?;
     match cli.command {
         Command::Ask {
@@ -280,9 +298,58 @@ fn run(cli: Cli) -> Result<()> {
             question,
             continue_,
         } => cmd_find(&mut store, question, continue_, provider),
+        // 上面提前 return 了
+        Command::Migrate { .. } => unreachable!("migrate 在 open 之前就返回了"),
         Command::Sessions { limit } => cmd_sessions(&store, limit),
         Command::List { limit } => cmd_list(&store, limit),
     }
+}
+
+/// 把数据库升级到当前代码需要的版本。
+fn cmd_migrate(db: &str, dry_run: bool) -> Result<()> {
+    use clipknow::store::migrate;
+
+    let conn = rusqlite::Connection::open(db)?;
+    let have = migrate::current_version(&conn)?;
+    let want = migrate::expected_version();
+    drop(conn);
+
+    println!("库   {db}");
+    println!("当前 第 {have} 版 → 目标 第 {want} 版");
+
+    if have == want {
+        println!("已经是最新的，什么都不用做。");
+        return Ok(());
+    }
+    if have > want {
+        println!(
+            "\n⚠️  库比程序新。多半是回退了代码却没回退库——\n\
+             用对应版本的程序，或者从备份恢复。这里不做任何改动。"
+        );
+        return Ok(());
+    }
+    if dry_run {
+        println!("\n（--dry-run，没有改动）差 {} 版没应用。", want - have);
+        return Ok(());
+    }
+
+    println!("\n⚠️  升级前请确认：服务已停、数据库连同 -wal / -shm 都备份过。");
+    let (_store, applied) = SqliteStore::open_and_migrate(db)?;
+    if applied.is_empty() {
+        println!("没有需要应用的迁移。");
+    } else {
+        println!(
+            "应用了 {} 条迁移：{}",
+            applied.len(),
+            applied
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("现在是第 {want} 版。");
+    Ok(())
 }
 
 /// 确保库里有这个视频；没有（或要求刷新）就去抓。

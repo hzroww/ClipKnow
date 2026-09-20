@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && useradd -m -u 10001 clipknow
 COPY --from=rust-build /src/target/release/clipknow      /usr/local/bin/clipknow
 COPY --from=go-build   /out/clipknow-web                 /usr/local/bin/clipknow-web
+COPY docker-entrypoint.sh                                /usr/local/bin/docker-entrypoint.sh
 
 # 库和邀请码都在这里。access.json 的路径是「库所在目录 + access.json」，
 # 所以挂一个卷两样都覆盖到。
@@ -53,6 +54,9 @@ RUN mkdir -p /data && chown clipknow:clipknow /data
 VOLUME /data
 USER clipknow
 EXPOSE 3000
+
+# 入口脚本先跑迁移再起服务。建表只发生在这一个地方，服务启动只检查版本。
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # -bin 指向 Rust 二进制：web 每次提问起一个子进程
 CMD ["/usr/local/bin/clipknow-web", \

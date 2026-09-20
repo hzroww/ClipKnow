@@ -53,9 +53,17 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         name: "multi_user",
-        steps: &[Step::Sql(include_str!(
-            "../../migrations/007_multi_user.sql"
-        ))],
+        // ★ 一条迁移可以带多个拥有方的 SQL。文件按拥有方分目录放，执行仍由
+        //   这一个 runner 按全局版本号顺序跑——「单一 runner + 全局版本号」
+        //   和「文件按业务分开」不矛盾。
+        steps: &[
+            // Go 拥有
+            Step::Sql(include_str!("../../migrations/accounts/007a_users.sql")),
+            // Rust 拥有
+            Step::Sql(include_str!(
+                "../../migrations/agent/007_session_ownership.sql"
+            )),
+        ],
     },
 ];
 

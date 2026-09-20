@@ -65,6 +65,13 @@ const MIGRATIONS: &[Migration] = &[
             )),
         ],
     },
+    Migration {
+        version: 3,
+        name: "user_is_admin",
+        steps: &[Step::Sql(include_str!(
+            "../../migrations/accounts/008a_user_is_admin.sql"
+        ))],
+    },
 ];
 
 /// 代码期望的库版本。
@@ -191,7 +198,12 @@ mod tests {
     fn 全新库从零建到最新版() {
         let mut c = fresh();
         let applied = run(&mut c).unwrap();
-        assert_eq!(applied, vec![1, 2], "两条迁移都该跑");
+        // 不写死版本号——每加一条迁移就要来改一次测试，是纯粹的噪音
+        assert_eq!(
+            applied.len(),
+            expected_version() as usize,
+            "全新库该把每一条都跑一遍"
+        );
         assert_eq!(current_version(&c).unwrap(), expected_version());
         // 关键表都在
         for t in [
@@ -234,7 +246,7 @@ mod tests {
         // CREATE TABLE IF NOT EXISTS——不报错，但也建不出 turns。
         // 这里断言的是「它被跳过了」：版本记上了，而 turns 确实没有。
         let applied = run(&mut c).unwrap();
-        assert_eq!(applied, vec![1, 2]);
+        assert_eq!(applied.len(), expected_version() as usize);
 
         let baseline_ran: i64 = c
             .query_row(

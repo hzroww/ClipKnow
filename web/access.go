@@ -50,6 +50,13 @@ type User struct {
 	Name  string `json:"name"`
 	Quota int    `json:"quota"` // 剩余提问次数；unlimited 表示不限
 	Admin bool   `json:"admin"` // 看得见所有会话（包括命令行建的那些）
+
+	// 导入成真账号之后填上，指向 users.id。
+	//
+	// 这是邀请码时代和账号时代之间的桥：导入工具靠它判断「这个码处理过没有」
+	// （重复跑不会建两个账号），Rust 认领会话时靠它把 owner 映射翻译成 user_id。
+	// 整套邀请码删掉时，这个字段跟着一起消失。
+	UserID string `json:"user_id,omitempty"`
 }
 
 type accessState struct {

@@ -40,12 +40,23 @@ func main() {
 	bin := flag.String("bin", "../target/release/clipknow", "clipknow 可执行文件")
 	invite := flag.String("invite", "", "生成一个邀请码给这个人，然后退出。用法：-invite 张三")
 	quota := flag.Int("quota", 5, "配合 -invite：这个人能问几次")
+	importAcc := flag.Bool("import-accounts", false,
+		"一次性：把 access.json 里的邀请码变成真账号，打印初始密码后退出")
 	flag.Parse()
 
 	dbAbs, err := filepath.Abs(*db)
 	if err != nil {
 		log.Fatalf("数据库路径不对: %v", err)
 	}
+	// ★ 一次性的导入动作，放在「检查 Rust 二进制」之前——它只碰账号表，
+	//   不需要 Rust。放在后面的话，没编译过 Rust 的机器上导入不了账号。
+	if *importAcc {
+		if err := importAccounts(defaultAccessPath(dbAbs), dbAbs); err != nil {
+			log.Fatalf("导入失败: %v", err)
+		}
+		return
+	}
+
 	binAbs, err := filepath.Abs(*bin)
 	if err != nil {
 		log.Fatalf("可执行文件路径不对: %v", err)

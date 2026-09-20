@@ -5,6 +5,7 @@
 //!
 //! trait 就是 C++ 里的抽象基类：定义「能做什么」，不管「怎么做」。
 
+pub mod claim;
 pub mod migrate;
 pub mod sqlite;
 

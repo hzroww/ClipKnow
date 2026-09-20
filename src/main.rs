@@ -93,6 +93,18 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// 一次性：把邀请码时代的会话归属搬进 sessions.user_id。
+    ///
+    /// 先在 web 那边跑 `-import-accounts` 建好账号，这一步才有 user_id 可用。
+    ClaimSessions {
+        /// access.json 的位置
+        #[arg(long, default_value = "access.json")]
+        access: String,
+        /// 命令行建的那些会话（从来没有归属）归给谁。
+        /// 给 user_id。不给就只报数，一条都不动。
+        #[arg(long)]
+        unowned: Option<String>,
+    },
     /// 列出历史会话
     Sessions {
         #[arg(long, default_value_t = 20)]
@@ -283,6 +295,9 @@ fn run(cli: Cli) -> Result<()> {
     if let Command::Migrate { dry_run } = cli.command {
         return cmd_migrate(&cli.db, dry_run);
     }
+    if let Command::ClaimSessions { access, unowned } = &cli.command {
+        return cmd_claim_sessions(&cli.db, access, unowned.as_deref());
+    }
 
     let mut store = SqliteStore::open(&cli.db)?;
     match cli.command {
@@ -300,6 +315,7 @@ fn run(cli: Cli) -> Result<()> {
         } => cmd_find(&mut store, question, continue_, provider),
         // 上面提前 return 了
         Command::Migrate { .. } => unreachable!("migrate 在 open 之前就返回了"),
+        Command::ClaimSessions { .. } => unreachable!("claim-sessions 在上面就返回了"),
         Command::Sessions { limit } => cmd_sessions(&store, limit),
         Command::List { limit } => cmd_list(&store, limit),
     }
@@ -349,6 +365,40 @@ fn cmd_migrate(db: &str, dry_run: bool) -> Result<()> {
         );
     }
     println!("现在是第 {want} 版。");
+    Ok(())
+}
+
+/// 把邀请码时代的会话归属搬进 sessions.user_id。
+fn cmd_claim_sessions(db: &str, access_path: &str, unowned: Option<&str>) -> Result<()> {
+    use clipknow::store::claim;
+
+    let access = claim::AccessFile::load(access_path)?;
+    let mut conn = rusqlite::Connection::open(db)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    clipknow::store::migrate::check(&conn)?;
+
+    let rep = claim::claim(&mut conn, &access, unowned)?;
+
+    println!("认领了 {} 个会话", rep.claimed);
+    if rep.already > 0 {
+        println!("{} 个已经有主，没动", rep.already);
+    }
+    if !rep.missing_user.is_empty() {
+        println!(
+            "\n⚠️  {} 个会话的邀请码还没导入成账号，跳过了。\n\
+             先在 web 那边跑一次 `-import-accounts`。",
+            rep.missing_user.len()
+        );
+    }
+    if !rep.unowned.is_empty() {
+        println!(
+            "\n⚠️  {} 个会话没有任何归属记录（命令行建的），**一条都没动**。\n\
+             它们属于谁只有你知道，不能猜。要归给某个人就加参数：\n\
+             \n    clipknow claim-sessions --db {db} --access {access_path} --unowned <user_id>\n\
+             \n不处理的话它们的 user_id 一直是空，普通用户看不到。",
+            rep.unowned.len()
+        );
+    }
     Ok(())
 }
 

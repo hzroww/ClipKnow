@@ -16,3 +16,5 @@ __pycache__/
 # 任何 SQLite 的 WAL 伴生文件（baseline.db 也会生成）
 *.db-wal
 *.db-shm
+# go build 在包目录里跑会留下一个和目录同名的二进制
+web/web

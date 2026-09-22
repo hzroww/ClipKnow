@@ -87,6 +87,10 @@ jobs:
         working-directory: web
         run: go build ./...
 
+      # 测试不在这个 job 里跑：它们要 target/release/clipknow（起真的子进程），
+      # 而这个 job 故意不编 Rust——它只有十几秒，是最快给出「代码写坏了没」的
+      # 那条反馈。测试在 e2e job 里跑，那边编了 Rust。
+
   # 离线端到端：Go → Rust 子进程 → SSE → 数据库 → 读回历史。
   # 靠一个本地假模型服务器（httptest）做到不花钱、不联网。
   #
@@ -130,8 +134,114 @@ jobs:
       #   实测：改了 Rust 重跑，go test 直接返回 "ok (cached)"，
       #   而那份代码其实是坏的。CI 上更危险，缓存会跨提交复用。
       #
-      # ★ -v 是故意的：这个测试只有一个，输出不多，
-      #   而失败时能直接看到是哪条断言炸的，不用再点开一层。
-      - name: 端到端
+      # ★ 跑**全部** Go 测试，不是只跑 -run TestChatEndToEnd。
+      #   之前那样写，15 个测试里 CI 只跑 1 个——注册登录的 10 个安全测试
+      #   和用户隔离测试写完之后一次都没在 CI 上跑过。测试不进 CI 等于没写。
+      #
+      # ★ -v 保留：失败时能直接看到是哪条断言炸的，不用再点开一层。
+      - name: Go 测试（含端到端）
         working-directory: web
-        run: go test -count=1 -v -run TestChatEndToEnd ./...
+        run: go test -count=1 -v ./...
+
+  # 升级路径：一个「邀请码时代」的老库，能不能一路升到现在的版本。
+  #
+  # 这条是给**已经在用的库**兜底的。前面那些任务全是从空库开始的——
+  # 全新安装能跑，不代表老库升级不会炸，而升级出事是不可逆的。
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 装 Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: 复用上次的编译产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: 编 Rust
+        run: cargo build --release --locked --bin clipknow
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: web/go.mod
+          cache-dependency-path: web/go.sum
+
+      - name: 编 web
+        working-directory: web
+        run: go build -o /tmp/ckweb .
+
+      - name: 造一个邀请码时代的老库
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/legacy
+          # 只建 baseline 那几张表，**不建** users/auth_sessions，
+          # 也不写 schema_migrations——这就是老库的样子。
+          sqlite3 /tmp/legacy/clipknow.db < migrations/001_init.sql
+          sqlite3 /tmp/legacy/clipknow.db < migrations/002_agent_loop.sql
+          sqlite3 /tmp/legacy/clipknow.db < migrations/003_compaction.sql
+          sqlite3 /tmp/legacy/clipknow.db < migrations/004_video_dossier.sql
+          sqlite3 /tmp/legacy/clipknow.db < migrations/005_video_staging.sql
+          sqlite3 /tmp/legacy/clipknow.db < migrations/006_vision_failure.sql
+          # 两个会话：一个有归属（网页建的），一个没有（命令行建的）
+          sqlite3 /tmp/legacy/clipknow.db "
+            INSERT INTO sessions(id,created_at,title) VALUES ('s-owned',1,'网页建的');
+            INSERT INTO sessions(id,created_at,title) VALUES ('s-cli',2,'命令行建的');"
+          # 用 printf 写，不用嵌套 heredoc——heredoc 的结束标记必须顶格，
+          # 而 YAML 的块标量要求整段有缩进，两个规则直接打架。
+          printf '%s\n' \
+            '{"users":{"ABCD1234":{"name":"老用户","quota":-1,"admin":true}},' \
+            ' "owner":{"s-owned":"ABCD1234"}}' \
+            > /tmp/legacy/access.json
+          echo "  老库造好，2 个会话"
+
+      - name: 升级前服务必须拒绝启动
+        run: |
+          set -euo pipefail
+          if ./target/release/clipknow sessions --db /tmp/legacy/clipknow.db 2>/tmp/err.txt; then
+            echo "FAIL 老库没升级就让用了"
+            exit 1
+          fi
+          grep -q "clipknow migrate" /tmp/err.txt \
+            || { echo "FAIL 报错里没告诉人该跑什么命令："; cat /tmp/err.txt; exit 1; }
+          echo "  OK  拒绝启动，并给出了补救命令"
+
+      - name: 升级
+        run: ./target/release/clipknow migrate --db /tmp/legacy/clipknow.db
+
+      - name: 导入账号
+        run: /tmp/ckweb -db /tmp/legacy/clipknow.db -import-accounts
+
+      - name: 认领会话
+        run: |
+          set -euo pipefail
+          admin=$(sqlite3 /tmp/legacy/clipknow.db "SELECT id FROM users WHERE is_admin=1")
+          ./target/release/clipknow claim-sessions \
+            --db /tmp/legacy/clipknow.db --access /tmp/legacy/access.json --unowned "$admin"
+
+      - name: 检查升级结果
+        run: |
+          set -euo pipefail
+          q() { sqlite3 /tmp/legacy/clipknow.db "$1"; }
+          expect() {
+            if [ "$2" = "$3" ]; then echo "  OK  $1: $2"
+            else echo "  FAIL  $1: 实际 $2，期望 $3"; exit 1; fi
+          }
+          expect "会话没丢"       "$(q 'SELECT count(*) FROM sessions')" 2
+          expect "全都有主"       "$(q 'SELECT count(*) FROM sessions WHERE user_id IS NOT NULL')" 2
+          expect "账号建出来了"   "$(q 'SELECT count(*) FROM users')" 1
+          expect "管理员标记搬过来了" "$(q 'SELECT is_admin FROM users')" 1
+          expect "密码是 argon2id" \
+            "$(q "SELECT substr(password_hash,1,9) FROM users")" '$argon2id'
+          # 重复跑一遍，什么都不该变
+          ./target/release/clipknow migrate --db /tmp/legacy/clipknow.db >/dev/null
+          /tmp/ckweb -db /tmp/legacy/clipknow.db -import-accounts >/dev/null
+          expect "重复导入不会建第二个账号" "$(q 'SELECT count(*) FROM users')" 1

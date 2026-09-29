@@ -6,9 +6,11 @@ package main
 // 真正的分析（工具循环、压缩、预算闸门、视频下载上传分析）全在 Rust 那边，
 // 这里一点都不碰。
 //
-// 进程模型：
-//   空闲时      这一个进程
-//   提问期间    这一个 + 一个临时的 clipknow turn 子进程（答完就退）
+// 进程模型（过渡期，下一个提交收尾）：
+//   查会话     这一个进程 + 常驻的 clipknow serve（HTTP）
+//   提问       这一个 + 一个临时的 clipknow turn 子进程（答完就退）
+//
+// 提问那条路还没搬到 HTTP 上，所以现在两条路并存。
 
 import (
 	"embed"
@@ -25,12 +27,17 @@ import (
 var staticFS embed.FS
 
 type Server struct {
+	// ⚠️ 过渡期残留：只用来做提问前的归属检查。提问改走 HTTP 之后
+	//    （下一个提交）整个删掉，见 store.go 顶部。
 	store   *Store
 	dbPath  string
 	binPath string
 	gate    turnGate
 
-	accounts *Accounts     // 账号与登录态（Go 拥有）
+	// 会话的增删查改全问它。Go 不再直接读 sessions / turns / items。
+	agent *AgentClient
+
+	accounts *Accounts     // 账号与登录态（Go 拥有，Rust 不碰）
 	limiter  *loginLimiter // 登录/注册的入口限速
 }
 
@@ -39,6 +46,8 @@ func main() {
 	addr := flag.String("addr", ":3000", "监听地址")
 	db := flag.String("db", "../clipknow.db", "数据库文件")
 	bin := flag.String("bin", "../target/release/clipknow", "clipknow 可执行文件")
+	agentAddr := flag.String("agent", "http://127.0.0.1:3100",
+		"常驻 agent 服务的地址（clipknow serve 监听的那个）")
 	importAcc := flag.Bool("import-accounts", false,
 		"一次性：把 access.json 里的邀请码变成真账号，打印初始密码后退出")
 	flag.Parse()
@@ -78,8 +87,26 @@ func main() {
 	}
 	defer acc.Close()
 
+	// ★ 密钥没配就直接起不来，不存在「没配就不校验」的降级路径。
+	signer, err := newTokenSigner()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	agent, err := NewAgentClient(*agentAddr, signer)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	// ★ 启动时就探一次，而不是等第一次请求。
+	//   配错地址、agent 没起、两边密钥不一致——这三样在这里报出来，
+	//   人还在终端前面；等到用户提问时才报，错误信息还会指向错误的方向
+	//   （401 在浏览器上长得像「登录过期」）。
+	if err := agent.Probe(); err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	s := &Server{
 		store: st, dbPath: dbAbs, binPath: binAbs,
+		agent:    agent,
 		accounts: acc, limiter: newLoginLimiter(),
 	}
 
@@ -126,12 +153,14 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request, u *Account) {
-	// 过滤在 SQL 里，不再查出来之后在这里筛
-	list, err := s.store.Sessions(u.ID, 200)
+	// 归属过滤发生在 Rust 那一侧的 SQL WHERE 里。Go 连表名都不需要知道。
+	list, err := s.agent.Sessions(u.ID, 200)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAgentError(w, err)
 		return
 	}
+	// 给浏览器的仍然是裸数组，前端一个字都不用改。
+	// （Rust 那边外面套了一层 {"sessions":[...]}，是为了以后能加分页游标。）
 	writeJSON(w, list)
 }
 
@@ -142,12 +171,15 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, u *Accoun
 		http.Error(w, "会话 id 不对", http.StatusBadRequest)
 		return
 	}
-	// ★ 归属检查在 History 的 SQL 里（join 回 sessions 比对 user_id）。
-	//   别人的会话返回空列表，和「不存在」表现一致——回 403 的话等于告诉
-	//   对方「有这么个会话，只是不给你看」，那本身就是信息泄漏。
-	msgs, err := s.store.History(u.ID, id)
+	// ★ 归属检查在 Rust 那一侧。不是自己的会话返回 **404**，和「不存在」
+	//   一个表现——回 403 等于告诉对方「有这么个会话，只是不给你看」，
+	//   那本身就是信息泄漏。
+	//
+	//   （改造前这里返回的是空列表 + 200，界面上显示成「这个会话是空的」。
+	//     同样不泄漏内容，但对方由此知道这个 id 确实存在。现在统一成 404。）
+	msgs, err := s.agent.Messages(u.ID, id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAgentError(w, err)
 		return
 	}
 	writeJSON(w, msgs)

@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -138,6 +139,7 @@ func startServer(t *testing.T, modelURL string) *httptest.Server {
 
 	s := &Server{
 		store: st, dbPath: db, binPath: bin,
+		agent:    startAgent(t, bin, db),
 		accounts: acc, limiter: newLoginLimiter(),
 	}
 	srv := httptest.NewServer(s.routes())
@@ -396,21 +398,25 @@ func TestUsersAreIsolated(t *testing.T) {
 		}
 	}
 
-	// ② 直接拼 URL 读别人的历史：拿不到内容
+	// ② 直接拼 URL 读别人的历史：404，而且响应体里不能有任何内容
 	//    列表过滤挡不住直接拼 id，所以这一条必须单独测。
+	//
+	//    ★ 期望从「空列表 + 200」改成了 404。空列表同样不泄漏内容，但对方
+	//      由此知道**这个 id 确实存在**——存在本身就是信息。
 	resp, err := bob.Get(srv.URL + "/api/sessions/" + aliceSession)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	var msgs []Message
-	_ = json.NewDecoder(resp.Body).Decode(&msgs)
-	if len(msgs) != 0 {
-		t.Errorf("bob 读到了 alice 的 %d 条历史：%v", len(msgs), msgs)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("bob 读 alice 的历史返回 %d，期望 404", resp.StatusCode)
 	}
-	for _, m := range msgs {
-		if strings.Contains(m.Text, "alice 的问题") {
-			t.Fatal("bob 看到了 alice 的提问内容")
+	raw, _ := io.ReadAll(resp.Body)
+	// 只看状态码不够：403 配一句「这是 alice 的会话」也是拒绝，但那句话
+	// 本身就泄漏了。整个响应体搜一遍。
+	for _, leak := range []string{"alice 的问题", "assistant", aliceSession} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("响应体里泄漏了 %q：%s", leak, raw)
 		}
 	}
 

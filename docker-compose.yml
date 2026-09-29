@@ -1,13 +1,29 @@
 # docker compose up -d
 #
+# 两个常驻服务，同一个镜像、同一个数据库卷、两条不同的命令：
+#
+#   agent   Rust。会话、执行、agent 循环、所有外部 API 调用。
+#           只在容器网络里监听，**不往宿主发布端口**。
+#   web     Go。账号、登录、静态页。对宿主发布 3000。
+#
+# 为什么拆开：Rust 以前是「每次提问起一个子进程、答完就死」。进程之间不共享
+# 任何状态，于是「现在有哪几个执行在跑」「能不能取消」这类东西无处安放。
+# 常驻之后这些才有地方待。
+#
 # key 从宿主的环境变量透传进来，不写进文件、不进镜像。
 services:
-  clipknow:
+  agent:
     build: .
-    ports:
-      - "3000:3000"
+    # ★ 只有它跑迁移。
+    #   两个服务都跑的话就是两个写者同时对同一个 SQLite 文件执行 DDL——
+    #   设计文档明确要求「服务启动只检查版本，不各自竞争执行 DDL」。
+    #   web 靠下面的 depends_on 等它做完。
     environment:
-      # 必需的两个：宿主没 export 就直接报错，不让容器带着半套配置起来
+      - CLIPKNOW_MIGRATE=1
+      # 两边必须一样。没设就直接起不来（不存在「没配就不校验」的降级路径）。
+      # 生成一个：openssl rand -base64 32
+      - CLIPKNOW_INTERNAL_SECRET=${CLIPKNOW_INTERNAL_SECRET:?先 export CLIPKNOW_INTERNAL_SECRET，用 openssl rand -base64 32 生成}
+      # 外部 API 的 key 只有 agent 需要——真正调模型和 ScrapeCreators 的是它。
       - SCRAPECREATORS_API_KEY=${SCRAPECREATORS_API_KEY:?先 export SCRAPECREATORS_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?先 export DEEPSEEK_API_KEY}
       # ★ 可选的写成「只有变量名」，宿主没设就**完全不传**。
@@ -22,8 +38,53 @@ services:
       - DEEPSEEK_MODEL
       - ANTHROPIC_API_KEY
       - ANTHROPIC_MODEL
+    # 绑 0.0.0.0 才能被同一个网络里的 web 访问到。
+    # **没有 ports:** —— 宿主和外网都访问不到它，只有 web 能。
+    # 这就是设计文档说的「生产环境关闭公开访问 Rust 的通道」。
+    command: ["/usr/local/bin/clipknow", "serve",
+              "--db", "/data/clipknow.db", "--addr", "0.0.0.0:3100"]
+    healthcheck:
+      # 镜像是 debian-slim，没有 curl 也没有 wget。clipknow 自己带了个
+      # HTTP 客户端，所以用它——为一句健康检查装个包不划算。
+      test: ["CMD", "/usr/local/bin/clipknow", "ping", "--addr", "http://127.0.0.1:3100"]
+      interval: 5s
+      timeout: 5s
+      # start_period 里失败不计入 retries：冷启动要跑迁移，可能要几秒。
+      start_period: 30s
+      retries: 3
     volumes:
-      # 库和 access.json 都在这个卷里，容器删了数据还在
+      - clipknow-data:/data
+    restart: unless-stopped
+
+  web:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      # 和 agent 同一个密钥。不一样的话 web 启动自检就会失败并说出原因。
+      - CLIPKNOW_INTERNAL_SECRET=${CLIPKNOW_INTERNAL_SECRET:?先 export CLIPKNOW_INTERNAL_SECRET，用 openssl rand -base64 32 生成}
+    # ★ 等 agent 真的健康，不是等它「启动了」。
+    #   service_started 只保证容器被创建，那时候迁移可能还没跑完——
+    #   web 开的是只读连接，表还没建出来就会 500「no such table: sessions」。
+    #   （这个 500 实测过，是全新安装最常见的那个报错。）
+    depends_on:
+      agent:
+        condition: service_healthy
+    # ⚠️ -bin 是**过渡期**还要的：提问那条路（/api/chat）目前仍然 exec 一个
+    #    `clipknow turn` 子进程，还没搬到 HTTP 上。下一个提交搬完就删掉它，
+    #    那时候 web 镜像里连 clipknow 这个二进制都不需要了。
+    #
+    #    这一行漏掉过一次：本地 docker compose up 之后 web 容器反复重启，
+    #    日志是「找不到 clipknow：/target/release/clipknow」。build 成功
+    #    完全看不出来。
+    command: ["/usr/local/bin/clipknow-web",
+              "-addr", ":3000",
+              "-db", "/data/clipknow.db",
+              "-bin", "/usr/local/bin/clipknow",
+              "-agent", "http://agent:3100"]
+    volumes:
+      # web 仍然要直接开库——它拥有 users / auth_sessions 两张账号表。
+      # 聊天表（sessions / turns / items）它一行 SQL 都不写了，全走 HTTP 问 agent。
       - clipknow-data:/data
     restart: unless-stopped
 

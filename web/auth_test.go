@@ -36,6 +36,7 @@ func authServer(t *testing.T) *httptest.Server {
 
 	s := &Server{
 		store: st, dbPath: db, binPath: bin,
+		agent:    startAgent(t, bin, db),
 		accounts: acc, limiter: newLoginLimiter(),
 	}
 	srv := httptest.NewServer(s.routes())

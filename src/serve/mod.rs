@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -191,6 +191,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 往下都要内部凭证。靠 handler 参数里的 `Principal` 提取器强制，
         // 不是靠中间件——见 auth.rs 里关于「忘了调」的说明。
         .route("/internal/whoami", get(whoami))
+        .route("/internal/sessions", get(list_sessions))
+        // axum 0.8 的路径参数是 {id}，不是老版本的 :id
+        .route("/internal/sessions/{id}/messages", get(session_messages))
         .fallback(fallback)
         .with_state(state)
 }
@@ -232,6 +235,71 @@ async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response
 async fn whoami(who: Principal) -> Response {
     axum::Json(json!({"user_id": who.user_id})).into_response()
 }
+
+/// `GET /internal/sessions?limit=200`
+///
+/// 返回 `{"sessions":[{id,title,created_at}]}` —— **只有这个用户的**。
+/// 过滤写在 SQL 的 WHERE 里（`SqliteStore::list_sessions_for_user`），
+/// 不是查出来再筛。
+///
+/// 外面套一层对象而不是直接返回数组：顶层是数组的话，以后想加
+/// `next_cursor` 分页游标就是破坏性变更。给浏览器的那一层形状由 Go 决定，
+/// 它现在仍然返回裸数组（前端没动）。
+async fn list_sessions(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+    Query(q): Query<ListQuery>,
+) -> std::result::Result<Response, ApiError> {
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_SESSION_LIMIT)
+        .clamp(1, MAX_SESSION_LIMIT);
+    let items = tokio::task::spawn_blocking(move || {
+        crate::app::sessions::list(&st.read(), &who.user_id, limit)
+    })
+    .await
+    .map_err(join_failed)??;
+    Ok(axum::Json(json!({"sessions": items})).into_response())
+}
+
+/// `GET /internal/sessions/{id}/messages`
+///
+/// 返回 `{"messages":[{role,text,seq,failed}]}`。
+///
+/// 不是自己的会话、不存在的会话、已软删的会话，**一律 404**，
+/// 不区分——区分开就等于告诉对方「有这么个会话，只是不给你看」。
+async fn session_messages(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    let found = tokio::task::spawn_blocking(move || {
+        crate::app::sessions::messages(&st.read(), &who.user_id, &session_id)
+    })
+    .await
+    .map_err(join_failed)??;
+    match found {
+        Ok(msgs) => Ok(axum::Json(json!({"messages": msgs})).into_response()),
+        Err(crate::app::sessions::NotFound) => Err(not_found_session()),
+    }
+}
+
+/// 会话相关的「没找到」。消息刻意含糊，见上面 handler 的说明。
+fn not_found_session() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "not_found", "没有这个会话")
+}
+
+/// 列表接口的 query 参数。
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+}
+
+/// 不传 limit 时返回多少条。和改造前 Go 那边写死的 200 保持一致。
+const DEFAULT_SESSION_LIMIT: usize = 200;
+/// 传得再大也就到这儿。没有上限的话，一个 `?limit=99999999` 就能让服务
+/// 去拼一个巨大的 JSON——不是攻击也可能是手滑。
+const MAX_SESSION_LIMIT: usize = 500;
 
 // ── 启动 ────────────────────────────────────────────────────
 
@@ -580,6 +648,159 @@ mod tests {
                 .status(),
             200
         );
+    }
+
+    // ── 会话读接口 ────────────────────────────────────────
+
+    /// 造两个用户，各一个会话，阿的那个里有一轮对话。
+    /// 返回 (state, 阿的会话 id)。
+    fn two_users() -> (Arc<AppState>, String) {
+        use crate::content::model::{Item, ItemKind, TurnStatus};
+        let mut store = SqliteStore::in_memory().expect("建内存库");
+        for id in ["u_alice", "u_bob"] {
+            store
+                .exec_for_test(&format!(
+                    "INSERT INTO users (id, username_normalized, display_name, password_hash,
+                                        status, created_at, updated_at)
+                     VALUES ('{id}','{id}','{id}','x','active',0,0)"
+                ))
+                .unwrap();
+        }
+        let sid = crate::app::sessions::create(&mut store, "u_alice", Some("阿的会话")).unwrap();
+        crate::app::sessions::create(&mut store, "u_bob", Some("波的会话")).unwrap();
+        store
+            .save_turn(
+                &sid,
+                "fake",
+                TurnStatus::Done,
+                &[
+                    Item {
+                        idx: 0,
+                        kind: ItemKind::UserMessage,
+                        iteration: None,
+                        call_id: None,
+                        payload: json!({"text": "阿问的问题"}),
+                        raw_json: None,
+                    },
+                    Item {
+                        idx: 1,
+                        kind: ItemKind::AssistantMessage,
+                        iteration: Some(1),
+                        call_id: None,
+                        payload: json!({"text": "给阿的答案"}),
+                        raw_json: None,
+                    },
+                ],
+            )
+            .unwrap();
+        (
+            Arc::new(AppState::new(
+                store,
+                ":memory:".into(),
+                auth::Verifier::new(TEST_SECRET),
+            )),
+            sid,
+        )
+    }
+
+    /// 带凭证发一个 GET。
+    fn get_as(srv: &testserver::TestServer, user: &str, path: &str) -> reqwest::blocking::Response {
+        reqwest::blocking::Client::new()
+            .get(srv.url(path))
+            .bearer_auth(token_for(user))
+            .send()
+            .unwrap()
+    }
+
+    #[test]
+    fn 会话列表只出自己的() {
+        let (st, _) = two_users();
+        let srv = testserver::spawn(st);
+
+        let v: serde_json::Value = get_as(&srv, "u_alice", "/internal/sessions")
+            .json()
+            .unwrap();
+        let ss = v["sessions"].as_array().unwrap();
+        assert_eq!(ss.len(), 1, "{v}");
+        assert_eq!(ss[0]["title"], "阿的会话");
+
+        let v: serde_json::Value = get_as(&srv, "u_bob", "/internal/sessions").json().unwrap();
+        assert_eq!(v["sessions"][0]["title"], "波的会话");
+    }
+
+    #[test]
+    fn 自己会话的聊天记录读得到() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        let r = get_as(
+            &srv,
+            "u_alice",
+            &format!("/internal/sessions/{sid}/messages"),
+        );
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = r.json().unwrap();
+        let ms = v["messages"].as_array().unwrap();
+        assert_eq!(ms.len(), 2, "{v}");
+        assert_eq!(ms[0]["role"], "user");
+        assert_eq!(ms[1]["text"], "给阿的答案");
+        assert_eq!(ms[1]["failed"], false);
+    }
+
+    /// ★ 越权读必须是 404，而且**响应体里不能有对方的任何内容**。
+    ///
+    /// 只断言状态码是不够的：403 加一句「这是阿的会话」同样是 403，
+    /// 而那句话本身就泄漏了。这里把整个响应体抓出来搜。
+    #[test]
+    fn 读别人的会话是_404_且不泄漏任何内容() {
+        let (st, alice_sid) = two_users();
+        let srv = testserver::spawn(st);
+        let r = get_as(
+            &srv,
+            "u_bob",
+            &format!("/internal/sessions/{alice_sid}/messages"),
+        );
+        assert_eq!(r.status(), 404);
+        let body = r.text().unwrap();
+        for leak in ["阿的会话", "阿问的问题", "给阿的答案", "u_alice"] {
+            assert!(!body.contains(leak), "响应体里泄漏了 {leak:?}: {body}");
+        }
+    }
+
+    #[test]
+    fn 不存在的会话也是_404() {
+        let (st, _) = two_users();
+        let srv = testserver::spawn(st);
+        assert_eq!(
+            get_as(&srv, "u_alice", "/internal/sessions/根本没有/messages").status(),
+            404
+        );
+    }
+
+    #[test]
+    fn 会话接口不带凭证一律_401() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        for path in [
+            "/internal/sessions".to_string(),
+            format!("/internal/sessions/{sid}/messages"),
+        ] {
+            let r = reqwest::blocking::get(srv.url(&path)).unwrap();
+            assert_eq!(r.status(), 401, "{path} 居然不用凭证就能读");
+        }
+    }
+
+    /// limit 要能被夹住。`?limit=99999999` 不该让服务去拼一个巨大的 JSON。
+    #[test]
+    fn limit_超范围会被夹住而不是报错() {
+        let (st, _) = two_users();
+        let srv = testserver::spawn(st);
+        for q in ["?limit=0", "?limit=99999999", "?limit=1"] {
+            let r = get_as(&srv, "u_alice", &format!("/internal/sessions{q}"));
+            assert_eq!(r.status(), 200, "limit={q} 时报错了");
+        }
+        // 非法的 limit（不是数字）是调用方的错，该 400 而不是 500
+        let r = get_as(&srv, "u_alice", "/internal/sessions?limit=abc");
+        assert_eq!(r.status(), 400);
     }
 
     /// 停机信号发出后，服务器线程必须真的收摊。

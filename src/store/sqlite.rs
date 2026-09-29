@@ -499,6 +499,92 @@ impl SqliteStore {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    // ── 按用户隔离的查询 ──────────────────────────────────
+    //
+    // 上面那批（list_sessions / latest_session）是命令行的视角：一台机器
+    // 一个人，没有归属可言。下面这批是**网页**的视角，每一条都必须先按
+    // user_id 过滤。
+    //
+    // ★ 过滤写在 SQL 里，不是查出来再在上层筛。
+    //   归属一旦变成「调用方记得检查一次」，就迟早有个新接口忘了检查，
+    //   而忘了的表现是越权读到别人的数据——不会报错，只会安静地出事。
+    //   写进 WHERE 之后，忘不掉。
+
+    /// 这个用户的会话，最近有活动的排前面。
+    pub fn list_sessions_for_user(&self, user_id: &str, limit: usize) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, created_at
+             FROM sessions
+             WHERE user_id = ?1 AND deleted_at IS NULL
+             ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![user_id, limit as i64], |r| {
+            Ok(Session {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                created_at: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 这个会话是不是这个用户的（且没被软删）。
+    ///
+    /// 「不存在」和「是别人的」返回同一个 false——调用方一律按未找到处理。
+    /// 区分开就等于告诉对方「有这么个会话，只是不给你看」，那本身就是泄漏。
+    pub fn session_owned_by(&self, user_id: &str, session_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sessions
+                 WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
+                params![session_id, user_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// 界面要显示的原始条目，**已经按 user_id 过滤过**。
+    ///
+    /// 只取 user_message 和 assistant_message 两种：中间的工具调用、工具
+    /// 结果是过程，不是对话。「同一个 turn 里最后一条 assistant 才是最终
+    /// 答案」这条投影规则不在这里做，在 app::sessions 里——那是业务规则，
+    /// 不是存储格式。
+    ///
+    /// 返回 `(seq, 这一轮是不是正常收场, 条目类型, 正文)`。
+    pub fn ui_items_for_user(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<(i64, bool, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.seq, t.status, i.item_type, i.payload_json
+             FROM turns t
+             JOIN items i ON i.turn_id = t.id
+             JOIN sessions se ON se.id = t.session_id
+             WHERE t.session_id = ?1
+               AND se.user_id = ?2 AND se.deleted_at IS NULL
+               AND i.item_type IN ('user_message', 'assistant_message')
+             ORDER BY t.seq, i.idx",
+        )?;
+        let rows = stmt.query_map(params![session_id, user_id], |r| {
+            let seq: i64 = r.get(0)?;
+            let status: String = r.get(1)?;
+            let kind: String = r.get(2)?;
+            let payload: String = r.get(3)?;
+            // payload 是 {"text": "..."}。解析失败不要把整条记录丢掉——
+            // 宁可显示空文本，也别让一条脏数据把整个会话变成打不开。
+            let text = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from))
+                .unwrap_or_default();
+            Ok((seq, status == TurnStatus::Done.as_str(), kind, text))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// 补一个标题。建会话时还不知道，要等第一个问题进来。
     pub fn set_session_title(&mut self, session_id: &str, title: &str) -> Result<()> {
         self.conn.execute(
@@ -558,6 +644,19 @@ impl SqliteStore {
                 ],
             )?;
         }
+        // ★ 顺手把会话的「最后活动时间」推到现在。
+        //
+        //   会话列表按 updated_at 倒序（migrations/agent/007 里那个
+        //   idx_sessions_user_updated 索引就是为它建的）。不更新的话，
+        //   updated_at 永远停在建会话那一刻——昨天建的会话今天聊了一下午，
+        //   在列表里还是排在今天刚建、一句没说的那个下面。
+        //
+        //   放在同一个事务里：turn 存进去了但活动时间没推，列表就是错的。
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session_id, ts],
+        )?;
+
         tx.commit()?;
         Ok(turn_id)
     }

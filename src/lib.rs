@@ -5,6 +5,8 @@
 //! （所以 main.rs 里写 `use clipknow::...`）。
 
 pub mod agent;
+/// 会话应用服务。见模块文档。
+pub mod app;
 pub mod content;
 pub mod error;
 pub mod ingest;

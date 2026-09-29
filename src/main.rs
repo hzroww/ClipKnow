@@ -171,6 +171,18 @@ enum Command {
         #[arg(long, default_value = clipknow::serve::DEFAULT_ADDR)]
         addr: String,
     },
+    /// 探一下常驻服务活着没。健康就退出码 0，否则非 0。
+    ///
+    /// 存在的理由是 **Docker 的 healthcheck**：运行镜像是 debian-slim，
+    /// 里面没有 curl 也没有 wget，而为了一句健康检查装一个 HTTP 客户端
+    /// 不划算——这个二进制自己就带着一个（reqwest）。
+    ///
+    /// 手查也方便：`clipknow ping` 比背一串 curl 参数省事。
+    Ping {
+        /// 服务地址
+        #[arg(long, default_value = "http://127.0.0.1:3100")]
+        addr: String,
+    },
     /// 列出已抓过的视频
     List {
         #[arg(long, default_value_t = 20)]
@@ -325,6 +337,13 @@ fn run(cli: Cli) -> Result<()> {
         return clipknow::serve::run(&cli.db, addr);
     }
 
+    // ping 根本不碰数据库——它问的是**另一个进程**健不健康。
+    // 放在 open 之前，这样库没迁移时 ping 照样能用（那时候正想知道
+    // 服务到底起没起来）。
+    if let Command::Ping { addr } = &cli.command {
+        return cmd_ping(addr);
+    }
+
     let mut store = SqliteStore::open(&cli.db)?;
     match cli.command {
         Command::Ask {
@@ -344,12 +363,45 @@ fn run(cli: Cli) -> Result<()> {
         Command::ClaimSessions { .. } => unreachable!("claim-sessions 在上面就返回了"),
         // 上面提前 return 了
         Command::Serve { .. } => unreachable!("serve 在 open 之前就返回了"),
+        Command::Ping { .. } => unreachable!("ping 在 open 之前就返回了"),
         Command::Sessions { limit } => cmd_sessions(&store, limit),
         Command::List { limit } => cmd_list(&store, limit),
     }
 }
 
 /// 把数据库升级到当前代码需要的版本。
+/// 探一下 `clipknow serve` 活着没。
+///
+/// 判据是 `/internal/health` 返回 200 **且** body 里 `ok` 为 true。
+/// 只看状态码不够：健康接口真的查了一次库，库读不了的时候它会报错而不是
+/// 回 200——而「端口通着但库读不了」恰恰是最需要被发现的那种半死状态。
+fn cmd_ping(addr: &str) -> Result<()> {
+    let url = format!("{}/internal/health", addr.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        // healthcheck 有自己的超时，但客户端这边也得有一个——不然对面
+        // 半死（accept 了连接但不回应）时这条命令会永远挂着。
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| ClipKnowError::BadRequest(format!("连不上 {url}: {e}")))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
+    if status.is_success() && body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        println!(
+            "OK  {addr}  库版本 {}",
+            body.get("schema_version")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".into())
+        );
+        return Ok(());
+    }
+    Err(ClipKnowError::BadRequest(format!(
+        "{addr} 不健康：HTTP {status} {body}"
+    )))
+}
+
 fn cmd_migrate(db: &str, dry_run: bool) -> Result<()> {
     use clipknow::store::migrate;
 

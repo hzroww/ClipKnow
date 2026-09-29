@@ -32,6 +32,9 @@ jobs:
     env:
       SCRAPECREATORS_API_KEY: ci-dummy
       DEEPSEEK_API_KEY: ci-dummy
+      # Go 和 Rust 之间的内部凭证密钥。两个服务都读它，必须一致。
+      # 至少 32 字符，短了两边都会拒绝启动。
+      CLIPKNOW_INTERNAL_SECRET: ci-dummy-internal-secret-32-chars-ok
     steps:
       - uses: actions/checkout@v5
 
@@ -40,6 +43,23 @@ jobs:
 
       - name: 起服务
         run: docker compose up -d
+
+      # ★ 现在是**两个**服务：agent（Rust，常驻）和 web（Go）。
+      #   web 的 depends_on 等的是 agent 的 healthcheck 变 healthy，
+      #   所以这一步通过就已经证明了：agent 起来了、库迁移跑完了、
+      #   /internal/health 能读到库。
+      - name: 两个容器都得在跑
+        run: |
+          set -euo pipefail
+          for svc in agent web; do
+            state=$(docker compose ps --format '{{.State}}' "$svc")
+            if [ "$state" != "running" ]; then
+              echo "FAIL $svc 的状态是 $state，不是 running"
+              docker compose logs "$svc"
+              exit 1
+            fi
+            echo "  OK  $svc 在跑"
+          done
 
       - name: 等它起来
         run: |
@@ -94,11 +114,27 @@ jobs:
                  -d '{"username":"smoketest","password":"wrongwrong"}')" 401
 
           # ★ 这一条就是「全新安装 500」那个 bug 的护栏。
-          #   库是空的、连表都还没建（建表在 Rust 子进程里，第一次提问才跑），
-          #   Go 只读打开，正确行为是返回空列表而不是报错。
+          #   库是空的（一条会话都没有），正确行为是返回空列表而不是报错。
+          #
+          #   ★ 它现在**同时验证了跨服务这条链**：Go 收到请求 → 签内部凭证
+          #     → HTTP 调 agent 的 /internal/sessions → agent 查库 → 回来。
+          #     两边密钥配不一致、agent 没起、路径写错，这条都会红。
           expect "登录后的会话列表" "$(code -b /tmp/jar http://localhost:3000/api/sessions)" 200
           body=$(curl -s -b /tmp/jar --max-time 10 http://localhost:3000/api/sessions)
           expect "空库时会话列表的内容" "$body" "[]"
+
+      # ★ agent 只在容器网络里监听，宿主和外网都不该碰得到。
+      #   compose 里它没有 ports:，这一条是把那件事钉住——
+      #   哪天有人手滑加上 ports，一个**不校验浏览器 Cookie、只认内部凭证**
+      #   的服务就暴露到公网上了。
+      - name: agent 不该对宿主开放
+        run: |
+          set -euo pipefail
+          if curl -fsS -o /dev/null --max-time 5 http://localhost:3100/internal/health; then
+            echo "FAIL agent 的 3100 端口被发布到宿主了"
+            exit 1
+          fi
+          echo "  OK  宿主访问不到 agent"
 
       - name: 日志里不该有这些
         run: |

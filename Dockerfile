@@ -55,11 +55,17 @@ VOLUME /data
 USER clipknow
 EXPOSE 3000
 
-# 入口脚本先跑迁移再起服务。建表只发生在这一个地方，服务启动只检查版本。
+# 入口脚本：设了 CLIPKNOW_MIGRATE=1 才跑迁移，然后 exec 传进来的命令。
+# 建表只发生在这一个地方，两个服务启动时都只检查版本。
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
-# -bin 指向 Rust 二进制：web 每次提问起一个子进程
+# ★ 一个镜像、两条命令。compose 里的 agent 和 web 两个服务各自覆盖 command。
+#
+#   这里的默认值是 web，纯粹为了「docker run 这个镜像」时有个合理行为；
+#   真正的部署走 docker-compose.yml，那里两条命令都写明了。
+#   它默认连 http://agent:3100 —— 单跑这个镜像是连不上的，会在启动自检
+#   那一步就明确报错，而不是跑起来之后每个请求 503。
 CMD ["/usr/local/bin/clipknow-web", \
-     "-addr", ":3000", \
-     "-db",   "/data/clipknow.db", \
-     "-bin",  "/usr/local/bin/clipknow"]
+     "-addr",  ":3000", \
+     "-db",    "/data/clipknow.db", \
+     "-agent", "http://agent:3100"]

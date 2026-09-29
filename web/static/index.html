@@ -680,7 +680,20 @@ async function openSession(id) {
   if (busy) return;                  // 跑着的时候不让切，不然进度会跑到别的会话里
   sessionId = id;
   log.textContent = '';
-  const msgs = await (await fetch('/api/sessions/' + encodeURIComponent(id))).json();
+  const res = await fetch('/api/sessions/' + encodeURIComponent(id));
+  // ★ 404 = 这个会话不存在，或者不是你的（两种情况服务端刻意不区分）。
+  //   以前这里返回空数组 + 200，界面上显示成「这个会话是空的」——而那会
+  //   让人知道「这个 id 确实存在」。现在统一成 404，这里也要接住：
+  //   不接的话 msgs 是个对象，下面的 .length 是 undefined、for..of 直接报错。
+  if (!res.ok) {
+    log.textContent = '';
+    addRow('assistant', res.status === 404
+      ? '这个会话不存在，或者不属于你。'
+      : '打不开这个会话：' + (await res.text()));
+    loadSessions();
+    return;
+  }
+  const msgs = await res.json();
   if (!msgs.length) showWelcome();   // 建了会话但还没问过
   for (const m of msgs) {
     const row = addRow(m.role, m.text);

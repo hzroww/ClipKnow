@@ -146,6 +146,35 @@ pub fn error_json(message: &str) -> Value {
     json!({"t": "error", "message": message})
 }
 
+/// 一次提问从头到尾要往外发的全部东西。
+///
+/// [`TurnObserver`] 只覆盖**循环内部**的事件（迭代、工具调用、token、答案）。
+/// 而 `hello` / `usage` / `done` / `error` 是循环之外的，所以这里是它的超集。
+///
+/// 存在的理由是**两条路共用一份执行代码**：
+///
+/// ```text
+/// clipknow turn（命令行 / 评测）  →  NdjsonSink   →  stdout 一行一个 JSON
+/// POST /internal/.../turns（网页）→  ChannelSink  →  有界队列 → SSE
+/// ```
+///
+/// 两边发出去的 JSON **完全一样**（都由这个模块里的那几个函数生成），
+/// 所以前端一个字都不用改，评测脚本也照常能跑。
+pub trait TurnSink: TurnObserver {
+    /// 发一条 wire 层的 JSON。
+    ///
+    /// 名字带 `_json` 是为了不和 `NdjsonSink` 自己那个 `emit` 撞——
+    /// 撞上的话，trait 方法里调 `self.emit(v)` 会解析到固有方法上，
+    /// 变成一个看不出来的无限递归。
+    fn emit_json(&self, v: &Value);
+}
+
+impl<W: Write> TurnSink for NdjsonSink<W> {
+    fn emit_json(&self, v: &Value) {
+        self.emit(v);
+    }
+}
+
 /// 把事件写成 NDJSON。
 ///
 /// `RefCell` 是因为 `TurnObserver::on` 拿的是 `&self`——观察者不能改循环的

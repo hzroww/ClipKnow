@@ -131,16 +131,10 @@ func startServer(t *testing.T, modelURL string) *httptest.Server {
 	}
 	t.Cleanup(func() { _ = acc.Close() })
 
-	st, err := OpenStore(db)
-	if err != nil {
-		t.Fatalf("开不了库: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
 	s := &Server{
-		store: st, dbPath: db, binPath: bin,
 		agent:    startAgent(t, bin, db),
-		accounts: acc, limiter: newLoginLimiter(),
+		accounts: acc,
+		limiter:  newLoginLimiter(),
 	}
 	srv := httptest.NewServer(s.routes())
 	t.Cleanup(srv.Close)

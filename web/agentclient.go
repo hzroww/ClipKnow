@@ -25,6 +25,7 @@ package main
 // 把运维问题说成用户的问题。
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,10 +44,21 @@ import (
 // 几分钟，见 commit 4 的 streamClient。
 const agentReadTimeout = 10 * time.Second
 
+// 提问时等**响应头**最多等多久。
+//
+// Rust 那边在接受请求的那一刻就发响应头（或者立刻拒绝），所以这个值只要
+// 覆盖「校验归属 + 申请名额 + 起 blocking 任务」，毫秒级。给 30 秒是留给
+// 撞上 SQLite 写锁要等满 busy_timeout 的情况。
+//
+// 拖过它说明 agent 卡住了——没有这一条的话，这个请求会永远挂着，浏览器那边
+// 是一个永远不结束的加载条。
+const agentHeaderTimeout = 30 * time.Second
+
 type AgentClient struct {
 	base   string // 形如 http://127.0.0.1:3100，末尾没有斜杠
 	signer *tokenSigner
-	read   *http.Client
+	read   *http.Client // 查询用，有 10 秒总超时
+	stream *http.Client // 提问用，没有总超时，见 StartTurn
 }
 
 func NewAgentClient(base string, signer *tokenSigner) (*AgentClient, error) {
@@ -58,6 +70,12 @@ func NewAgentClient(base string, signer *tokenSigner) (*AgentClient, error) {
 		base:   strings.TrimRight(base, "/"),
 		signer: signer,
 		read:   &http.Client{Timeout: agentReadTimeout},
+		stream: &http.Client{
+			// 没有 Timeout：那是**整个请求**的上限，而 SSE 要开着几分钟。
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: agentHeaderTimeout,
+			},
+		},
 	}, nil
 }
 
@@ -166,6 +184,98 @@ func (c *AgentClient) Messages(userID, sessionID string) ([]Message, error) {
 		out.Messages = []Message{}
 	}
 	return out.Messages, nil
+}
+
+// 新建一个属于这个用户的空会话，返回会话 id。
+//
+// ★ 归属在**创建那一刻**就写进库，不是事后认领。改造前是 Rust 子进程先建、
+//
+//	把 id 放在 hello 那一行报回来、Go 再认领一次——中间那一小段时间里会话
+//	是无主的，认领失败（进程被杀）就永远无主了。
+func (c *AgentClient) CreateSession(userID string) (string, error) {
+	tok, err := c.signer.sign(userID)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.base+"/internal/sessions",
+		strings.NewReader(`{}`))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.read.Do(req)
+	if err != nil {
+		return "", &agentDownError{err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return "", readAgentError(resp)
+	}
+	var out struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.SessionID == "" {
+		return "", fmt.Errorf("agent 建了会话但没回 id")
+	}
+	return out.SessionID, nil
+}
+
+// 提问。返回一个**还没读完**的响应，调用方负责把 body 读完并关掉。
+//
+// ## 超时怎么设
+//
+// 这条**不能**用 c.read 那个客户端——它有 10 秒总超时，而一次提问要跑几十秒
+// 到几分钟。这里用一个没有总超时的客户端，但设了 ResponseHeaderTimeout：
+//
+//	总超时（Timeout）        不设。设了就是给"一次提问最多跑多久"划线，
+//	                        而那条线该由 Rust 那边的闸门管，不是这里。
+//	ResponseHeaderTimeout   30 秒。Rust 在接受请求时就会发出响应头
+//	                        （或者立刻拒绝），拖过 30 秒说明它卡住了。
+//	                        没有这一条的话，agent 半死时这个请求会永远挂着。
+func (c *AgentClient) StartTurn(userID, sessionID, question, provider string) (*http.Response, error) {
+	tok, err := c.signer.sign(userID)
+	if err != nil {
+		return nil, err
+	}
+	// ★ provider 为空时**整个字段不传**，不传一个空字符串。
+	//
+	//   传空串的话，Rust 那边收到的是 Some("")，而它的白名单里没有空串，
+	//   于是一个「没指定模型」的正常请求变成 400「不认识的 provider: 」。
+	//   （和 docker-compose 那个 ${VAR:-} 传空串的坑是同一类：
+	//     "没给" 和 "给了个空的" 必须是两回事。）
+	payload := map[string]string{"question": question}
+	if strings.TrimSpace(provider) != "" {
+		payload["provider"] = provider
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	url := c.base + "/internal/sessions/" + url.PathEscape(sessionID) + "/turns"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := c.stream.Do(req)
+	if err != nil {
+		return nil, &agentDownError{err}
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		// 流还没开始，拒绝走 HTTP 状态码——400 参数错 / 404 不是你的会话 /
+		// 409 这个会话在跑 / 503 名额满。
+		return nil, readAgentError(resp)
+	}
+	return resp, nil
 }
 
 // ── 启动自检 ────────────────────────────────────────────────

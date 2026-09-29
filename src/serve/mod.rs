@@ -40,13 +40,16 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde_json::json;
+use tokio_stream::StreamExt;
 
 use crate::error::{ClipKnowError, Result};
 use crate::store::sqlite::SqliteStore;
+use crate::wire::TurnSink;
 
 pub mod auth;
+pub mod sink;
 use auth::Principal;
 
 /// 默认监听地址。
@@ -85,12 +88,17 @@ pub struct AppState {
 
     /// 内部凭证的校验器。见 [`auth`] 模块。
     pub verifier: auth::Verifier,
+
+    /// 执行准入登记表：现在有哪几次提问在跑。
+    /// 阶段 B 的策略是「全局最多 1 个」，和改造前 Go 那把 turnGate 一样。
+    pub registry: Arc<crate::app::registry::Registry>,
 }
 
 impl AppState {
     pub fn new(store: SqliteStore, db_path: String, verifier: auth::Verifier) -> Self {
         AppState {
             verifier,
+            registry: crate::app::registry::Registry::new(),
             read: Mutex::new(store),
             db_path,
         }
@@ -191,9 +199,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 往下都要内部凭证。靠 handler 参数里的 `Principal` 提取器强制，
         // 不是靠中间件——见 auth.rs 里关于「忘了调」的说明。
         .route("/internal/whoami", get(whoami))
-        .route("/internal/sessions", get(list_sessions))
+        .route(
+            "/internal/sessions",
+            get(list_sessions).post(create_session),
+        )
         // axum 0.8 的路径参数是 {id}，不是老版本的 :id
         .route("/internal/sessions/{id}/messages", get(session_messages))
+        .route("/internal/sessions/{id}/turns", post(create_turn))
         .fallback(fallback)
         .with_state(state)
 }
@@ -215,10 +227,19 @@ async fn fallback() -> ApiError {
 ///   写死的常量。「进程活着」和「进程能用」是两回事：库文件被删了、权限
 ///   不对、被别的写者锁死超过 busy_timeout，进程都还活得好好的。
 async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response, ApiError> {
+    let (running, accepting) = (st.registry.running_count(), st.registry.is_accepting());
     let version = tokio::task::spawn_blocking(move || st.read().schema_version())
         .await
         .map_err(join_failed)??;
-    Ok(axum::Json(json!({"ok": true, "schema_version": version})).into_response())
+    Ok(axum::Json(json!({
+        "ok": true,
+        "schema_version": version,
+        "running_turns": running,
+        // 停机过程中变 false。healthcheck 不看它——那时候该让在跑的
+        // 跑完，而不是让编排系统立刻重启容器。
+        "accepting": accepting,
+    }))
+    .into_response())
 }
 
 /// `GET /internal/whoami`
@@ -284,6 +305,153 @@ async fn session_messages(
     }
 }
 
+/// `POST /internal/sessions`
+///
+/// 请求体 `{"title": null}`，返回 `201 {"session_id":"..."}`。
+///
+/// ★ 归属在**创建那一刻**就写进 `sessions.user_id`，不是事后认领。
+///   这是设计文档第 12 节的第 2 条不变量。改造前的做法是 Rust 先建会话、
+///   把 id 放在 hello 那一行报给 Go、Go 再回头认领一次——中间那一小段时间
+///   里会话是无主的，而且认领失败（进程被杀）就永远无主了。
+async fn create_session(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+    body: Option<axum::Json<CreateSessionBody>>,
+) -> std::result::Result<Response, ApiError> {
+    // body 可有可无：`POST` 一个空请求体就是「建一个没标题的会话」。
+    let title = body.and_then(|axum::Json(b)| b.title);
+    let id = tokio::task::spawn_blocking(move || {
+        crate::app::sessions::create(&mut st.read(), &who.user_id, title.as_deref())
+    })
+    .await
+    .map_err(join_failed)??;
+    Ok((StatusCode::CREATED, axum::Json(json!({"session_id": id}))).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct CreateSessionBody {
+    title: Option<String>,
+}
+
+/// `POST /internal/sessions/{id}/turns`
+///
+/// 请求体 `{"question":"...","provider":"deepseek"}`。
+/// 成功返回 `200 text/event-stream`，事件体和改造前 `clipknow turn` 打到
+/// stdout 的 NDJSON **一模一样**——前端一个字都不用改。
+///
+/// ## 流开始之前的拒绝走 HTTP 状态码
+///
+/// 400 参数错 / 404 不是你的会话 / 409 这个会话在跑 / 503 全局名额满。
+/// 设计文档第 6.2 节：「HTTP 头发出前的拒绝使用 HTTP 状态码；开始流之后
+/// 用事件报告错误」。混着来的话，Go 和前端都得同时处理两套错误路径。
+///
+/// ## 浏览器断了怎么办
+///
+/// **什么都不做，执行照常跑完并落库。** 那一轮已经花了 SC 配额、模型 token、
+/// 可能还有一次视频分析的钱，为了「你关了页面」把这些扔掉是最亏的。
+/// 事件发不出去时 [`sink::ChannelSink`] 会丢掉它们，循环不受影响。
+async fn create_turn(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+    Path(session_id): Path<String>,
+    axum::Json(body): axum::Json<TurnBody>,
+) -> std::result::Result<Response, ApiError> {
+    let question = body.question.trim().to_string();
+    if question.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "问题是空的",
+        ));
+    }
+    // provider 来自浏览器，是外部输入。parse_provider 只认白名单里那两个，
+    // 拼错直接报错而不是悄悄用默认那家。
+    let provider = crate::app::turn::parse_provider(body.provider.as_deref())?;
+
+    // ★ 归属校验在申请名额**之前**。
+    //   反过来的话，拿别人的会话 id 乱发请求就能把名额占掉——
+    //   一个不用登录成别人就能做到的拒绝服务。
+    let owns = {
+        let st = Arc::clone(&st);
+        let (uid, sid) = (who.user_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || st.read().session_owned_by(&uid, &sid))
+            .await
+            .map_err(join_failed)??
+    };
+    if !owns {
+        return Err(not_found_session());
+    }
+
+    // 申请名额。拿不到就**立刻拒绝，不排队**——排队的话用户点了发送、
+    // 界面一动不动，分不清是卡了还是坏了。
+    let permit = st.registry.admit(&session_id).map_err(|r| {
+        let status = match r {
+            crate::app::registry::Reject::SessionBusy { .. } => StatusCode::CONFLICT,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        ApiError::new(status, r.code(), r.message())
+    })?;
+
+    let (chan, rx) = sink::ChannelSink::new();
+    let db_path = st.db_path.clone();
+    let sid = session_id.clone();
+
+    // ★ 真正干活的在 blocking 线程上。
+    //
+    //   一次提问是几十秒到几分钟的**同步**代码（reqwest::blocking 打模型
+    //   和 ScrapeCreators，rusqlite 写库）。放在 async worker 线程上会把
+    //   整个 HTTP 服务占死，而且不报任何错——表现就是"卡住"。
+    //
+    //   名额（permit）move 进闭包：闭包结束时 Drop，名额归还。panic 也走
+    //   Drop，所以"每条退出路径都释放"是类型系统保证的。
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // ★ 这个执行**自己开一条连接**，不用 AppState 里那条只读的。
+        //   它要 &mut SqliteStore 并且一占几分钟，占那条的话会话列表就
+        //   打不开了。WAL 模式下读不挡写、写不挡读。
+        let mut store = match SqliteStore::open(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                chan.emit_json(&crate::wire::error_json(&format!("开库失败: {e}")));
+                return;
+            }
+        };
+        let cfg = crate::agent::runner::LoopConfig::default();
+        let req = crate::app::turn::TurnRequest {
+            session_id: &sid,
+            question: &question,
+            provider,
+            config: &cfg,
+        };
+        // execute 出错时已经往 sink 推过 error 事件了，这里只补一条服务端
+        // 日志——浏览器那边不需要再来一遍。
+        if let Err(e) = crate::app::turn::execute(&mut store, &req, &chan) {
+            eprintln!("会话 {sid} 这一轮失败: {e}");
+        }
+    });
+
+    // 事件从有界队列流出来，一条一行。
+    //
+    // keep_alive 每 15 秒发一个 SSE 注释行（`:`）。一次提问里下载视频那段
+    // 可能一分钟没有任何事件，中间的反向代理会把空闲连接掐掉。
+    // 注释行不是 `data:` 开头，前端本来就跳过它。
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| {
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(line))
+    });
+    Ok(axum::response::sse::Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+        )
+        .into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct TurnBody {
+    question: String,
+    /// 不给就按环境变量里配了谁的 key 自动挑。
+    provider: Option<String>,
+}
+
 /// 会话相关的「没找到」。消息刻意含糊，见上面 handler 的说明。
 fn not_found_session() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", "没有这个会话")
@@ -328,8 +496,9 @@ pub fn run(db_path: &str, addr: &str) -> Result<()> {
         // 的不变量，见 wire.rs），这里不写 stdout 是为了不破坏它。
         eprintln!("ClipKnow agent 服务  →  http://{bound}");
         eprintln!("  库 {db_path}");
+        let reg = Arc::clone(&state.registry);
         axum::serve(listener, router(state))
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move { drain_then_stop(reg).await })
             .await?;
         eprintln!("已停止");
         Ok(())
@@ -380,7 +549,41 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
-    eprintln!("收到停机信号，不再接受新请求");
+}
+
+/// 在跑的执行最多等多久。
+///
+/// 一次提问本来就可能跑几分钟，硬杀掉等于把已经花掉的 SC 配额、模型 token
+/// 和视频分析钱全扔了，而且那一轮不会落库。300 秒是给「正常的一轮跑完」
+/// 留的余量；真等满说明它卡住了，那时候退出比继续等有用。
+///
+/// ⚠️ Docker 默认的停机宽限期是 **10 秒**，到点就 SIGKILL。要让这个等待
+/// 真正生效，部署时得把 `stop_grace_period` 调到比这个数大。
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 收到停机信号之后：先不收新的，再等在跑的跑完。
+async fn drain_then_stop(registry: Arc<crate::app::registry::Registry>) {
+    shutdown_signal().await;
+    // 第一步：立刻停止接受新的提问。这一步是瞬时的，所以即使下面等满了，
+    // 也不会有新的执行在这期间挤进来。
+    registry.stop_accepting();
+    let n = registry.running_count();
+    if n == 0 {
+        eprintln!("收到停机信号，没有在跑的执行，直接退出");
+        return;
+    }
+    eprintln!("收到停机信号，不再接受新提问；等 {n} 个在跑的执行结束（最多 {DRAIN_TIMEOUT:?}）");
+
+    // ★ wait_until_idle 是**阻塞**的（里面 sleep 轮询），不能直接在 async
+    //   里调——会把一条 worker 线程占住整整 5 分钟。丢给 blocking 池。
+    let left = tokio::task::spawn_blocking(move || registry.wait_until_idle(DRAIN_TIMEOUT))
+        .await
+        .unwrap_or(0);
+    if left > 0 {
+        eprintln!("⚠️  还有 {left} 个执行没跑完就被中断了，它们那一轮不会落库");
+    } else {
+        eprintln!("在跑的都收干净了");
+    }
 }
 
 // ── 测试用的服务器 ──────────────────────────────────────────
@@ -801,6 +1004,164 @@ mod tests {
         // 非法的 limit（不是数字）是调用方的错，该 400 而不是 500
         let r = get_as(&srv, "u_alice", "/internal/sessions?limit=abc");
         assert_eq!(r.status(), 400);
+    }
+
+    // ── 提问接口：流开始**之前**的那些拒绝 ────────────────
+    //
+    // 正常路径（真跑一轮）在 Go 那边的端到端测试里，那边有假模型。
+    // 这里只测拒绝——它们全都在 spawn_blocking 之前返回，不需要模型。
+
+    fn post_turn(
+        srv: &testserver::TestServer,
+        user: &str,
+        session: &str,
+        body: &str,
+    ) -> reqwest::blocking::Response {
+        reqwest::blocking::Client::new()
+            .post(srv.url(&format!("/internal/sessions/{session}/turns")))
+            .bearer_auth(token_for(user))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .unwrap()
+    }
+
+    /// ★ 拿别人的会话 id 来提问：404，而且**不占用执行名额**。
+    ///
+    /// 名额的申请必须排在归属校验后面。反过来的话，随便拼一串别人的会话 id
+    /// 狂发请求就能把名额占光——一个不用登录成别人就能做到的拒绝服务。
+    #[test]
+    fn 拿别人的会话提问是_404_且不占名额() {
+        let (st, alice_sid) = two_users();
+        let reg = Arc::clone(&st.registry);
+        let srv = testserver::spawn(st);
+
+        let r = post_turn(&srv, "u_bob", &alice_sid, r#"{"question":"偷看"}"#);
+        assert_eq!(r.status(), 404);
+        assert_eq!(reg.running_count(), 0, "被拒的请求占住了执行名额");
+    }
+
+    #[test]
+    fn 对不存在的会话提问是_404() {
+        let (st, _) = two_users();
+        let srv = testserver::spawn(st);
+        assert_eq!(
+            post_turn(&srv, "u_alice", "根本没有", r#"{"question":"喂"}"#).status(),
+            404
+        );
+    }
+
+    #[test]
+    fn 空问题是_400() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        for body in [r#"{"question":""}"#, r#"{"question":"   "}"#] {
+            assert_eq!(
+                post_turn(&srv, "u_alice", &sid, body).status(),
+                400,
+                "{body}"
+            );
+        }
+    }
+
+    /// provider 来自浏览器，是外部输入。必须走白名单。
+    #[test]
+    fn 不认识的_provider_是_400_但空的当作没给() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        let bad = post_turn(
+            &srv,
+            "u_alice",
+            &sid,
+            r#"{"question":"喂","provider":"--db"}"#,
+        );
+        assert_eq!(bad.status(), 400);
+
+        // ★ 空串当作「没给」，不能变成「不认识的 provider: 」。
+        //   传空串是调用方最容易犯的错（Go 那边就犯过一次），而报错
+        //   「不认识的 provider: 」跟真实原因一个字都不沾。
+        let empty = post_turn(&srv, "u_alice", &sid, r#"{"question":"喂","provider":""}"#);
+        assert_ne!(
+            empty.status(),
+            400,
+            "空 provider 被当成了非法值：{}",
+            empty.text().unwrap()
+        );
+    }
+
+    #[test]
+    fn 提问接口不带凭证是_401() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        let r = reqwest::blocking::Client::new()
+            .post(srv.url(&format!("/internal/sessions/{sid}/turns")))
+            .header("content-type", "application/json")
+            .body(r#"{"question":"喂"}"#)
+            .send()
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+
+    #[test]
+    fn 建会话时归属在创建那一刻就写进去() {
+        let (st, _) = two_users();
+        let srv = testserver::spawn(st);
+        let r = reqwest::blocking::Client::new()
+            .post(srv.url("/internal/sessions"))
+            .bearer_auth(token_for("u_bob"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .unwrap();
+        assert_eq!(r.status(), 201);
+        let id = r.json::<serde_json::Value>().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 波能看到它
+        let mine: serde_json::Value = get_as(&srv, "u_bob", "/internal/sessions").json().unwrap();
+        assert!(
+            mine["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == id),
+            "刚建的会话不在自己列表里：{mine}"
+        );
+        // 阿看不到
+        let other: serde_json::Value = get_as(&srv, "u_alice", "/internal/sessions")
+            .json()
+            .unwrap();
+        assert!(
+            !other["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == id),
+            "别人的会话出现在了阿的列表里：{other}"
+        );
+    }
+
+    #[test]
+    fn health_会报现在有几个在跑() {
+        let (st, _) = two_users();
+        let reg = Arc::clone(&st.registry);
+        let srv = testserver::spawn(st);
+
+        let v: serde_json::Value = reqwest::blocking::get(srv.url("/internal/health"))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(v["running_turns"], 0);
+        assert_eq!(v["accepting"], true);
+
+        let _p = reg.admit("s-x").unwrap();
+        let v: serde_json::Value = reqwest::blocking::get(srv.url("/internal/health"))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(v["running_turns"], 1, "health 报的在跑数不对: {v}");
     }
 
     /// 停机信号发出后，服务器线程必须真的收摊。

@@ -70,21 +70,15 @@ services:
     depends_on:
       agent:
         condition: service_healthy
-    # ⚠️ -bin 是**过渡期**还要的：提问那条路（/api/chat）目前仍然 exec 一个
-    #    `clipknow turn` 子进程，还没搬到 HTTP 上。下一个提交搬完就删掉它，
-    #    那时候 web 镜像里连 clipknow 这个二进制都不需要了。
-    #
-    #    这一行漏掉过一次：本地 docker compose up 之后 web 容器反复重启，
-    #    日志是「找不到 clipknow：/target/release/clipknow」。build 成功
-    #    完全看不出来。
+    # ★ 没有 -bin 了：web 再也不起 clipknow 子进程，提问也走 HTTP 问 agent。
     command: ["/usr/local/bin/clipknow-web",
               "-addr", ":3000",
               "-db", "/data/clipknow.db",
-              "-bin", "/usr/local/bin/clipknow",
               "-agent", "http://agent:3100"]
     volumes:
       # web 仍然要直接开库——它拥有 users / auth_sessions 两张账号表。
-      # 聊天表（sessions / turns / items）它一行 SQL 都不写了，全走 HTTP 问 agent。
+      # 聊天表（sessions / turns / items）它**一行 SQL 都没有**了，
+      # 全走 HTTP 问 agent。web/agentclient_test.go 里有条 grep 守卫钉着这件事。
       - clipknow-data:/data
     restart: unless-stopped
 

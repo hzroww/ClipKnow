@@ -91,8 +91,13 @@ jobs:
       # 而这个 job 故意不编 Rust——它只有十几秒，是最快给出「代码写坏了没」的
       # 那条反馈。测试在 e2e job 里跑，那边编了 Rust。
 
-  # 离线端到端：Go → Rust 子进程 → SSE → 数据库 → 读回历史。
-  # 靠一个本地假模型服务器（httptest）做到不花钱、不联网。
+  # 离线端到端：Go → 内部 HTTP → 常驻的 Rust serve → agent 循环 → 假模型
+  # → SSE → 数据库 → 读回历史。靠一个本地假模型服务器（httptest）做到
+  # 不花钱、不联网。
+  #
+  # ★ 测试自己会起 `clipknow serve` 子进程（web/agenttest_test.go），
+  #   所以这个 job 除了「编出二进制」不需要额外做什么。端口是 127.0.0.1:0
+  #   让系统挑，从它的 stderr 里读回来——写死端口的话并行的测试会撞。
   #
   # 单独一个 job 而不是塞进上面的 go：它要先编 Rust release，
   # 会把那个 15 秒的 job 拖成几分钟。分开就能和别人并行。
@@ -118,6 +123,7 @@ jobs:
 
       # 测试里找的是 ../target/release/clipknow，找不到会 t.Skip 而不是失败。
       # 所以这一步必须真的成功，否则下面会"通过"但什么都没测。
+      # （现在这个二进制既是被测对象，也是测试要拉起来的那个常驻服务。）
       - name: 编 Rust
         run: cargo build --release --locked --bin clipknow
 

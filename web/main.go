@@ -2,15 +2,16 @@ package main
 
 // ClipKnow 的 web 服务。
 //
-// 它只做三件事：发页面、只读地查会话、把提问转给 Rust 子进程。
+// 它只做三件事：发页面、管账号和登录、把会话相关的一切转给 Rust。
 // 真正的分析（工具循环、压缩、预算闸门、视频下载上传分析）全在 Rust 那边，
 // 这里一点都不碰。
 //
-// 进程模型（过渡期，下一个提交收尾）：
-//   查会话     这一个进程 + 常驻的 clipknow serve（HTTP）
-//   提问       这一个 + 一个临时的 clipknow turn 子进程（答完就退）
+// 进程模型：
+//   两个常驻进程。这一个（Go，管账号和页面）+ clipknow serve（Rust，管
+//   会话和执行）。中间走本机 HTTP，身份用短命的签名凭证传递。
 //
-// 提问那条路还没搬到 HTTP 上，所以现在两条路并存。
+// 这个进程**直接读写的只有 users / auth_sessions 两张账号表**。
+// sessions / turns / items 三张聊天表它一行 SQL 都不碰。
 
 import (
 	"embed"
@@ -18,7 +19,6 @@ import (
 	"flag"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -27,14 +27,8 @@ import (
 var staticFS embed.FS
 
 type Server struct {
-	// ⚠️ 过渡期残留：只用来做提问前的归属检查。提问改走 HTTP 之后
-	//    （下一个提交）整个删掉，见 store.go 顶部。
-	store   *Store
-	dbPath  string
-	binPath string
-	gate    turnGate
-
-	// 会话的增删查改全问它。Go 不再直接读 sessions / turns / items。
+	// 会话、聊天记录、提问，全问它。
+	// ★ Go 这边已经**没有任何一条**聊天表的 SQL 了。
 	agent *AgentClient
 
 	accounts *Accounts     // 账号与登录态（Go 拥有，Rust 不碰）
@@ -45,7 +39,6 @@ func main() {
 	// 默认路径按「在 web/ 目录里 go run .」算。
 	addr := flag.String("addr", ":3000", "监听地址")
 	db := flag.String("db", "../clipknow.db", "数据库文件")
-	bin := flag.String("bin", "../target/release/clipknow", "clipknow 可执行文件")
 	agentAddr := flag.String("agent", "http://127.0.0.1:3100",
 		"常驻 agent 服务的地址（clipknow serve 监听的那个）")
 	importAcc := flag.Bool("import-accounts", false,
@@ -64,22 +57,6 @@ func main() {
 		}
 		return
 	}
-
-	binAbs, err := filepath.Abs(*bin)
-	if err != nil {
-		log.Fatalf("可执行文件路径不对: %v", err)
-	}
-	// 在启动时就检查，而不是等第一次提问才发现——那时用户已经等了半天，
-	// 还以为是模型慢
-	if _, err := os.Stat(binAbs); err != nil {
-		log.Fatalf("找不到 clipknow：%s\n先跑一次 cargo build --release", binAbs)
-	}
-
-	st, err := OpenStore(dbAbs)
-	if err != nil {
-		log.Fatalf("%v\n库还不存在的话，先用命令行问一次把它建出来", err)
-	}
-	defer st.Close()
 
 	acc, err := OpenAccounts(dbAbs)
 	if err != nil {
@@ -105,16 +82,15 @@ func main() {
 	}
 
 	s := &Server{
-		store: st, dbPath: dbAbs, binPath: binAbs,
 		agent:    agent,
-		accounts: acc, limiter: newLoginLimiter(),
+		accounts: acc,
+		limiter:  newLoginLimiter(),
 	}
 
 	mux := s.routes()
 
 	log.Printf("ClipKnow web  →  http://localhost%s", *addr)
-	log.Printf("  库   %s", dbAbs)
-	log.Printf("  程序 %s", binAbs)
+	log.Printf("  账号库 %s", dbAbs)
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatal(err)
 	}

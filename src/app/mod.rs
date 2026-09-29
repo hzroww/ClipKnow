@@ -17,4 +17,6 @@
 //!      deleted_at、creation_request_id，这些不该出现在给浏览器的 JSON 里。
 //!      这一层负责把行翻译成 DTO，让表结构改动不会直接漏到接口上。
 
+pub mod registry;
 pub mod sessions;
+pub mod turn;

@@ -14,8 +14,9 @@
 | 评测 | 36 用例 × 3 次 + 一条 12 轮追问,最近一次 **91/108** |
 | 闸门 | 四层十二道,含不变量 `max_video_analyses < max_tool_calls` |
 | 上下文压缩 | 12 轮触发 5 次,窗口 8,983 → 2,879 token,压缩后仍答对 9 轮 |
-| 单元测试 | **382 个**,不联网不花钱(夹具是真实响应) |
-| 代码 | Rust 约 11,000 行 + Go 约 900 行 + 前端 1 个文件 |
+| 自动测试 | Rust **459 个** + Go **31 个**,全部不联网不花钱(夹具是真实响应) |
+| 代码 | Rust 约 6,200 行 + 测试 9,700 行；Go 约 1,500 行 + 测试 1,100 行；前端 1 个文件 |
+| CI | 每次 push 跑 5 个任务：Rust / Go / 端到端 / 老库升级 / Docker 从零起 |
 
 ---
 
@@ -27,16 +28,21 @@ flowchart TB
         UI["index.html<br/>流式渲染 · Markdown · 会话切换"]
     end
 
-    subgraph G["Go 进程（常驻，只转发不理解）"]
+    subgraph G["Go 进程（常驻，:3000）"]
         RT["main.go　路由 / go:embed 前端"]
-        AC["auth.go / users.go　注册 · 登录 · 会话归属"]
-        ST["store.go　只读打开库 query_only(1)"]
-        CH["chat.go　起子进程 · NDJSON→SSE · 全局串行锁"]
+        AU["auth.go / users.go / password.go<br/>注册 · 登录 · Argon2id · Cookie"]
+        TK["internaltoken.go　签内部凭证（HS256 JWT）"]
+        AG["agentclient.go　调 agent · SSE 原样转发"]
     end
 
-    subgraph R["Rust 子进程（一次提问起一个，答完就退）"]
-        WI["wire.rs　NDJSON 协议"]
-        RU["runner.rs　agent 循环 + 闸门"]
+    subgraph R["Rust 进程（常驻，127.0.0.1:3100）"]
+        HT["serve/mod.rs　内部 HTTP · SSE · 优雅停机"]
+        VF["serve/auth.rs　验凭证 → Principal"]
+        SK["serve/sink.rs　有界队列：阻塞线程 → SSE"]
+        AP["app/sessions.rs　归属 · 列表 · 历史投影"]
+        RG["app/registry.rs　执行准入登记表"]
+        TU["app/turn.rs　跑一轮（网页和 CLI 共用）"]
+        RU["runner.rs　agent 循环 + 十二道闸门"]
         CO["compaction.rs　历史压缩"]
         TO["tools.rs　五个工具的定义/校验/分发"]
         CX["context.rs　库里的条目 ↔ 消息数组"]
@@ -51,12 +57,18 @@ flowchart TB
 
     DB[("clipknow.db<br/>WAL + busy_timeout 5s")]
 
-    UI -- "POST /api/chat" --> RT
-    RT --> AC
-    RT --> ST
-    RT --> CH
-    CH -- "spawn: clipknow turn" --> WI
-    WI --> RU
+    UI -- "POST /api/chat（Cookie）" --> RT
+    RT --> AU
+    RT --> AG
+    AU --> TK
+    TK --> AG
+    AG -- "内部 HTTP + Bearer 凭证<br/>POST /internal/sessions/…/turns" --> HT
+    HT --> VF
+    VF --> AP
+    HT --> RG
+    RG --> TU
+    AP --> TU
+    TU --> RU
     RU --> CO
     RU --> TO
     RU --> CX
@@ -65,26 +77,52 @@ flowchart TB
     TO --> VC
     CX --> SS
     CO --> SS
+    TU -. "事件" .-> SK
+    SK -. "SSE" .-> AG
+    AG -. "SSE data:" .-> UI
     SS -- 读写 --> DB
-    ST -- 只读 --> DB
-    WI -. "stdout NDJSON" .-> CH
-    CH -. "SSE data:" .-> UI
+    AU -- "只有 users / auth_sessions" --> DB
+    AP -- 读 --> DB
 ```
 
-### 为什么是两个进程
+### 为什么是两个常驻进程
 
 ```
-空闲    只有 Go 这一个进程
-提问期  Go + 一个临时的 clipknow turn 子进程，答完就退
+Go     账号、登录、Cookie、静态页。直接读写的只有 users / auth_sessions
+Rust   会话、执行、agent 循环、所有外部 API。独占 sessions / turns / items
 ```
 
-按 turn 起子进程而不是让 Rust 常驻:进程启动约 10 毫秒,而一次 turn 是 15–275 秒,
-这点开销是噪声;换来**崩溃隔离**(视觉管线 panic 只死掉这一次提问)和「不用在 Rust
-里写常驻服务」。历史不靠进程内存传,**每次都从库里读**,所以子进程是无状态的。
+**边界是按「谁拥有哪张表」划的,不是按语言划的。** 共用一个 SQLite 文件只是
+部署选择,不是绕过接口的理由——`web/agentclient_test.go` 里有条守卫测试,
+web/ 目录下出现任何一条聊天表的 SQL 就会红。
+
+一开始不是这样。改造前 Rust 是**按提问起的子进程**,答完就退,Go 直接只读那三
+张聊天表。那样有两个问题:
+
+```
+状态无处安放   「现在哪几个执行在跑」「能不能取消」这类东西，
+               在一个答完就死的进程里没有地方待
+两份真相       Rust 写、Go 读，两边都得懂表结构，
+               改一列要改两处，漏一处就是线上 bug
+```
+
+换成常驻服务之后,准入、归属、历史投影全在 Rust 一处,Go 只管把浏览器的身份
+翻译成一张短命的内部凭证。
+
+**身份怎么过去:** Go 验完 `ck_session` Cookie,现签一张 2 分钟有效的 HS256
+JWT,`sub` 是 `users.id`。Rust 只认这个凭证,完全不碰浏览器 Cookie。密钥来自
+`CLIPKNOW_INTERNAL_SECRET`,没配两边都拒绝启动——不存在「没配就不校验」的
+降级路径。Rust 默认只绑 `127.0.0.1`,Docker 里也**不对宿主发布端口**。
+
+**同步代码怎么塞进 async 服务:** 这个项目的核心全是同步的(`reqwest::blocking`
+打模型、`rusqlite` 读写库,一次提问几十秒到几分钟)。做法是**凡是碰库碰网络的
+活一律 `spawn_blocking`**,blocking 池上限显式设成 8 而不是 tokio 默认的 512
+——512 的意思是把拒绝的时机从「立刻」推迟到「内存耗尽」。事件从阻塞线程经一个
+1024 深的**有界**队列流到 SSE:队列满了丢进度事件(正文在最后的 `answer` 里
+还有完整一份),但 `done` / `error` 会有限重试最多 5 秒,丢了它浏览器会一直转圈。
 
 两个进程访问同一个 SQLite 文件靠 **WAL + busy_timeout(5s)**。实测两进程抢写锁:
 旧的 rollback 模式立刻报 `database is locked`,WAL 模式下等 2.19 秒拿到锁。
-注意 WAL 那句「读不阻塞写」对 `init()` **不成立**——它要跑迁移,那是写。
 
 ### 三层职责
 
@@ -95,7 +133,12 @@ Go    只转发，不理解 JSON 的内容
 ```
 
 所以 Rust 加新事件类型,Go 一个字都不用改,前端加一个 `case` 就行(认不出的事件
-被忽略,不会崩)。**流式输出那次改动,Go 侧改了 0 行。**
+被忽略,不会崩)。**流式输出那次改动,Go 侧改了 0 行**;后来把 Rust 从子进程改成
+常驻服务,事件的 JSON 形状也一个字节都没变,前端同样没动。
+
+Go 只有两处需要看懂 JSON 内容,都只认协议里最稳定的那点东西:判断流有没有以
+`done`/`error` 收尾(收不到就补一条错误事件,否则「跑完了但没答案」和「崩了」
+在界面上长得一模一样),以及把 agent 的错误码翻译成浏览器该看到的状态。
 
 ### 四个隔离边界
 
@@ -125,6 +168,16 @@ DASHSCOPE_API_KEY=...        # 画面分析要，https://bailian.console.aliyun.
 DASHSCOPE_VISION_MODEL=...   # 可选，默认 qwen3-vl-plus
 ```
 
+再加一个**不是 key** 的环境变量：Go 和 Rust 之间的内部凭证密钥。两个进程读的是
+同一个名字，值必须一样，少于 32 字符两边都拒绝启动。
+
+```bash
+export CLIPKNOW_INTERNAL_SECRET=$(openssl rand -base64 32)
+```
+
+没有「没配就不校验」的降级路径——那种默认是最典型的上线事故：开发时一路顺畅，
+上线忘了配，于是一个谁都能调的服务挂在那里，而且不报任何错。
+
 三家都是**付费**服务,先知道大概花多少:
 
 | | 计费 | 实测 |
@@ -135,24 +188,45 @@ DASHSCOPE_VISION_MODEL=...   # 可选，默认 qwen3-vl-plus
 
 ### 本地
 
+**要开两个终端**——网页版是两个常驻进程。
+
 ```bash
-# ① Rust 核心（工具链要 1.88+，代码里用了 let-chains）
+# ① 编 Rust 核心（工具链要 1.88+，代码里用了 let-chains）
 brew install rustup && rustup toolchain install stable
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 cargo build --release
 
-# ② key 放进 .env（已在 .gitignore 里）或 ~/.zshrc
+# ② key 放进 .env（已在 .gitignore 里）或 ~/.zshrc，
+#    再生成一个内部凭证密钥（两个终端里都要有）
+export CLIPKNOW_INTERNAL_SECRET=$(openssl rand -base64 32)
 
-# ③ 网页（需要 Go 1.25+，这个门槛来自 modernc.org/sqlite 而不是本项目代码）
-cd web && go run .
+# ③ 建库。这是**唯一**执行建表语句的地方，服务启动只检查版本不升级——
+#    两个服务会同时启动，各自跑 DDL 就是两个写者抢锁
+./target/release/clipknow migrate --db clipknow.db
+```
+
+```bash
+# 终端 A：agent（会话、执行、agent 循环）
+./target/release/clipknow serve --db clipknow.db
+```
+
+```bash
+# 终端 B：网页（需要 Go 1.25+，这个门槛来自 modernc.org/sqlite，不是本项目代码）
+cd web && go run . -db ../clipknow.db
 ```
 
 打开 <http://localhost:3000>,注册一个账号就能用(第一版不限制谁能注册)。
 
-每个人只看得见自己的会话——过滤写在 SQL 的 `WHERE user_id = ?` 里,不是查出来
-之后在代码里筛,所以加接口时忘不掉。
+**起不来的话先看终端 B 的第一行。** 它启动时会探一次 agent：连不上、或者两边
+`CLIPKNOW_INTERNAL_SECRET` 配得不一样，都会在这里直接报出来并说清是哪个问题，
+而不是等你问第一个问题才报一个看起来像「登录过期」的 401。
 
-也可以完全不开网页,直接用命令行:
+每个人只看得见自己的会话——过滤写在 SQL 的 `WHERE user_id = ?` 里,不是查出来
+之后在代码里筛,所以加接口时忘不掉。归属在**创建会话那一刻**就写进库,不是事后
+认领。
+
+也可以完全不开网页,直接用命令行(这条路**不需要** agent 常驻,也不需要那个
+内部密钥):
 
 ```bash
 ./target/release/clipknow ask "https://www.youtube.com/watch?v=xxx" "这视频在讲什么？"
@@ -161,18 +235,42 @@ cd web && go run .
 ./target/release/clipknow find --continue       # 接着最近一次会话
 ./target/release/clipknow sessions              # 历史会话
 ./target/release/clipknow show "https://..." --raw
-./target/release/clipknow turn --json ...       # 跑一次提问，进度按 NDJSON 打到 stdout
+./target/release/clipknow migrate               # 升级数据库（唯一执行建表语句的地方）
+./target/release/clipknow serve                 # 起常驻服务，给网页用
+./target/release/clipknow ping                  # 探一下常驻服务活着没
+./target/release/clipknow turn "问题"           # 跑一次提问，进度按 NDJSON 打到 stdout
 ```
+
+`turn` 和网页那条路调的是**同一个函数**（`app::turn::execute`），区别只在事件
+往哪送：一个写 stdout，一个塞进队列转成 SSE。评测脚本（`evals/run.py`）用的就是
+`turn`。
 
 ### Docker
 
 ```bash
 export SCRAPECREATORS_API_KEY=... DEEPSEEK_API_KEY=... DASHSCOPE_API_KEY=...
+export CLIPKNOW_INTERNAL_SECRET=$(openssl rand -base64 32)
 docker compose up -d --build
-docker compose logs -f            # 看启动日志（会先自动跑一次数据库迁移）
+docker compose logs -f            # 看启动日志
 ```
 
 打开 <http://localhost:3000>,注册账号即可。
+
+**两个服务，一个镜像，两条命令：**
+
+```
+agent   Rust。会话、执行、agent 循环、所有外部 API 调用。
+        跑迁移的也是它（CLIPKNOW_MIGRATE=1）——两个服务都跑就是两个写者
+        同时对同一个 SQLite 执行建表语句。
+        ★ 没有 ports:，宿主和外网都访问不到它。
+web     Go。账号、登录、静态页。对宿主发布 3000。
+        用 depends_on: service_healthy 等 agent，不是等它"启动了"——
+        service_started 时迁移可能还没跑完，web 只读打开会 500
+        「no such table: sessions」。这个 500 实测过，是全新安装最常见的报错。
+```
+
+healthcheck 用的是 `clipknow ping`，不是 curl：运行镜像是 debian-slim，里面
+既没有 curl 也没有 wget，而这个二进制自己就带着一个 HTTP 客户端。
 
 镜像分三段:Rust 编核心 → Go 编 web → 只留两个二进制。**运行镜像只额外装了
 根证书**,因为:
@@ -185,9 +283,14 @@ reqwest 链 rustls            不依赖 OpenSSL（Cargo.lock 里没有 openssl-s
 modernc.org/sqlite 是纯 Go   CGO_ENABLED=0 能静态编
 ```
 
-库和 `access.json` 都在 `/data` 卷里(`access.json` 的路径是「库所在目录 +
-access.json」,所以一个卷两样都覆盖到),容器删了数据还在。key 从宿主环境变量
+库在 `/data` 卷里，两个容器挂同一个，容器删了数据还在。key 从宿主环境变量
 透传,不写进镜像;`.dockerignore` 里挡掉了 `.env` 和 `access.json`。
+
+**停机时正在跑的那一轮不会被扔掉。** agent 收到 SIGTERM 之后先停止接受新提问，
+再等在跑的执行跑完（最多 300 秒）——硬杀掉等于把已经花掉的抓取配额、模型 token
+和视频分析钱全扔了，而且那一轮不会落库。Docker 默认只给 **10 秒**就 SIGKILL，
+所以 compose 里给 agent 写了 `stop_grace_period: 320s`。代价是正好有提问在跑时，
+`docker compose down` 最久要等 5 分钟。
 
 ---
 
@@ -553,15 +656,20 @@ pointless_vision_call      带着 question 调 fetch_video 但视觉额度已尽
 
 **④ 一个进程里跑不完的东西,框架帮不上。**
 
-架构上真正的约束是 web 层用 Go、核心用 Rust,中间是 NDJSON 子进程协议。这个决定
-和框架无关,是「学 SSE 时不想同时学新语法」的取舍。
+架构上真正的约束是 web 层用 Go、核心用 Rust,中间跨进程。这个决定和框架无关,
+是「学 SSE 时不想同时学新语法」的取舍。
+
+这条边界后来自己长出了第二层含义:**谁拥有哪张表**。一开始 Rust 是按提问起的
+子进程、Go 直接读聊天表,于是表结构的知识存在两处。改成两个常驻服务、中间走内部
+HTTP 之后,Go 那边一行聊天表的 SQL 都没有了。框架在这件事上帮不上忙——它管的是
+循环里怎么调模型,不管你的两个服务谁写哪张表。
 
 ### 代价说清楚
 
 自己写的代价是真实的,不装作没有:
 
 ```
-约 11,000 行 Rust 要自己维护、自己测（382 个单测就是这个代价的一部分）
+约 6,200 行 Rust + 9,700 行测试要自己维护（459 个单测就是这个代价的一部分）
 provider 的每个怪癖都得自己踩：流式增量重组、finish_reason 映射、
   content_filter → 拒答、参数不是合法 JSON 时怎么报错、重复 call_id
 换 provider 没有现成适配器——所以 Anthropic 那个至今带工具用不了
@@ -581,9 +689,15 @@ provider 的每个怪癖都得自己踩：流式增量重组、finish_reason 映
 - **只有一个模型供应商能跑完整循环。** `AnthropicClient` 在入口就拒绝带工具的
   请求。「换供应商只改一个文件」还没被第二个实现验证过。后果真实发生过:DeepSeek
   余额耗尽,整个服务没有降级路径,直接全挂。
-- **执行是全局串行的。** 一次只跑一个 turn,第二个人点发送直接 409。要多人并发
-  得做:每个会话一把锁、总并发上限、**视频下载改成流式写临时文件**(现在是整个
-  512MB 进内存,几个人同时跑就爆)。
+- **执行仍然是全局串行的。** 一次只跑一个 turn,第二个人点发送直接 409(同一个
+  会话是 409「上一个问题还在跑」,别人的会话是 503「服务正忙」)。
+
+  机制已经搬到 Rust 的 `app::registry` 了——那是一张内存登记表，记着哪几个会话
+  正在跑。**放开并发要改的只有 `MAX_CONCURRENT_TURNS` 这个数字**和加一张
+  「每个用户几个」的表。之所以还没改，是因为并发真正要的是另外三样东西：
+  `turns` 表上的部分唯一索引（内存登记表挡不住进程重启）、取消信号、
+  以及**视频下载改成流式写临时文件**（现在是整个 512MB 进内存，几个人同时跑就爆）。
+  这三样是下一阶段的活。
 - **没有跨视频检索。** 文字稿超过 40,000 字就砍尾巴(实测遇到过 45,035 字的),
   丢掉的可能正好是答案。
 
@@ -594,7 +708,10 @@ provider 的每个怪癖都得自己踩：流式增量重组、finish_reason 映
   48 小时走完之前每次都会拿它去试一遍。
 - `videos.fetched_at` 写了但从来不读,所以播放/点赞/评论数停在第一次抓取的值。
 - `turns.status` 只存 done/failed,`TurnStatus::Failed(String)` 里的原因被丢掉了。
-- 签名字符串在 Rust 和前端各存了一份,改一处会不一致。
+- 签名字符串在 Rust、前端和 Go 的测试里各存了一份,改一处会不一致(测试里那份
+  是故意留的——三处不一致时它是唯一会喊出来的地方)。
+- **进程崩溃时正在跑的那一轮会丢。** 现在只在整轮结束时落一次库，所以库里根本
+  没有「跑到一半」的记录可恢复。正常停机（SIGTERM）不受影响，会等它跑完。
 - **人设那段还没过评测。** 加了之后只跑了 6 个用例(全过),没跑全量对比,所以
   「没有损害证据标准」目前只是设计意图,不是实测结论。
 
@@ -619,7 +736,9 @@ provider 的每个怪癖都得自己踩：流式增量重组、finish_reason 映
    体验过关键词在哪失灵,才能理解 embedding 在解决什么。**这一步不是为了凑一个
    RAG**,是上面那条 45,035 字硬截断自己长出来的需求。
 5. **评测进 CI。** 把「我写了评测」变成「我有回归闸门」。
-6. 多人并发(上面那三件事)。真要放公网才需要。
+6. **多人并发。** 机制已经就位（准入登记表、两个常驻服务、内部凭证），剩下的是
+   策略和兜底：会话互斥落到数据库、取消、启动时把遗留的「跑到一半」标成中断、
+   视频下载改流式。真要放公网才需要。
 
 ---
 

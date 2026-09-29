@@ -55,6 +55,15 @@ services:
     volumes:
       - clipknow-data:/data
     restart: unless-stopped
+    # ★ 停机宽限期。Docker 默认只给 10 秒就 SIGKILL。
+    #
+    #   agent 收到 SIGTERM 之后会先停止接受新提问，再等在跑的执行跑完
+    #   （Rust 那边 DRAIN_TIMEOUT = 300 秒）。硬杀掉等于把已经花掉的抓取
+    #   配额、模型 token 和视频分析钱全扔了，而且那一轮不会落库。
+    #
+    #   320 > 300，留一点余量让它把「还剩 N 个没跑完」那句话打出来。
+    #   代价：正好有提问在跑时，docker compose down 最久要等 5 分钟。
+    stop_grace_period: 320s
 
   web:
     build: .

@@ -9,6 +9,14 @@ rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0.104"
+# ── 常驻 HTTP 服务（阶段 B）─────────────────────────────
+# axum 负责路由和 SSE；tokio 是它底下的异步运行时。
+#
+# ⚠️ 这个项目的核心是**同步**代码：reqwest::blocking 打模型和 ScrapeCreators，
+#    rusqlite 读写库，一次执行几十秒到几分钟。这种代码放进 tokio 的 worker
+#    线程会把整个 HTTP 服务卡死。所以凡是碰库、碰网络的活一律走
+#    spawn_blocking，见 src/serve/mod.rs 顶部的说明。
+axum = "0.8.9"
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
@@ -19,4 +27,8 @@ rustyline = "18.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time"] }
+# ReceiverStream：把 mpsc 的接收端包成 axum SSE 要的 Stream。
+# 阶段 B 靠它把阻塞线程产生的事件送出去。
+tokio-stream = "0.1.19"
 uuid = { version = "1.24.1", features = ["v7"] }

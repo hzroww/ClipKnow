@@ -8,6 +8,8 @@ pub mod agent;
 pub mod content;
 pub mod error;
 pub mod ingest;
+/// 常驻 HTTP 服务。见模块文档。
+pub mod serve;
 pub mod store;
 /// Rust ↔ Go 的线格式。见模块文档。
 pub mod wire;

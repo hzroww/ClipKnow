@@ -159,6 +159,18 @@ enum Command {
         #[arg(long)]
         compaction_target: Option<usize>,
     },
+    /// 起常驻服务，等 web 那边通过内部 HTTP 来调。
+    ///
+    /// 这是**网页那条路**唯一的执行入口。在这之前，Go 每收到一次提问就
+    /// 起一个 `clipknow turn` 子进程、答完就死；进程之间什么都不共享，
+    /// 所以「现在有哪几个执行在跑」「能不能取消」这类状态无处安放。
+    ///
+    /// 跑之前库必须是最新版（先 `clipknow migrate`）——这里只检查，不升级。
+    Serve {
+        /// 监听地址。默认只绑回环，外网连不上。
+        #[arg(long, default_value = clipknow::serve::DEFAULT_ADDR)]
+        addr: String,
+    },
     /// 列出已抓过的视频
     List {
         #[arg(long, default_value_t = 20)]
@@ -307,6 +319,12 @@ fn run(cli: Cli) -> Result<()> {
         return cmd_claim_sessions(&cli.db, access, unowned.as_deref());
     }
 
+    // serve 自己开库（它要把连接交给 AppState 长期持有），所以放在
+    // 下面那句 open 之前——不然会白开一条连接。
+    if let Command::Serve { addr } = &cli.command {
+        return clipknow::serve::run(&cli.db, addr);
+    }
+
     let mut store = SqliteStore::open(&cli.db)?;
     match cli.command {
         Command::Ask {
@@ -324,6 +342,8 @@ fn run(cli: Cli) -> Result<()> {
         // 上面提前 return 了
         Command::Migrate { .. } => unreachable!("migrate 在 open 之前就返回了"),
         Command::ClaimSessions { .. } => unreachable!("claim-sessions 在上面就返回了"),
+        // 上面提前 return 了
+        Command::Serve { .. } => unreachable!("serve 在 open 之前就返回了"),
         Command::Sessions { limit } => cmd_sessions(&store, limit),
         Command::List { limit } => cmd_list(&store, limit),
     }

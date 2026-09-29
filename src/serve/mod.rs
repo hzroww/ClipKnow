@@ -1,0 +1,442 @@
+//! 常驻 HTTP 服务。**给 Go 那边的 web 服务调用的，不对外网开放。**
+//!
+//! ## 为什么要这个东西
+//!
+//! 在这之前，Go 每收到一次提问就 `exec.Command` 起一个 `clipknow turn`
+//! 子进程，答完进程就死。三件事因此做不了：
+//!
+//!   1. **并发。** 「现在有哪几个执行在跑、属于哪个会话、取消信号发给谁」
+//!      这些状态必须和执行待在一起，而进程之间什么都不共享。
+//!   2. **一份真相。** `sessions` / `turns` / `items` 三张表 Rust 写、Go 读，
+//!      两边都得懂表结构，改一列要改两个地方。
+//!   3. **问状态。** 进程死了就问不到「跑到哪一步了」「能不能取消」。
+//!
+//! 常驻之后，会话的增删查改和执行管理全在这一个进程里，Go 只管账号和登录。
+//!
+//! ## 线程模型（重要）
+//!
+//! ```text
+//! tokio 多线程 runtime
+//!  ├─ worker 线程（= CPU 核数）   只收发 HTTP、推 SSE，永远不阻塞
+//!  └─ blocking 线程池（上限 8）   真正干活的地方
+//! ```
+//!
+//! 这个项目的核心是**同步**代码：`reqwest::blocking` 打模型和 ScrapeCreators，
+//! `rusqlite` 读写 SQLite。同步代码在 async 函数里直接调用会把那条 worker
+//! 线程占住——worker 只有几条，占满之后整个服务连 `/internal/health` 都答不了，
+//! 而且**不会报任何错**，表现就是「卡住」。
+//!
+//! 所以规矩是：**凡是碰库、碰网络的活，一律 `spawn_blocking`。**
+//! 包括下面那两个亚毫秒级的会话查询——它们看着快，但 SQLite 撞锁时会等到
+//! `busy_timeout`（5 秒），那就不是「快」了。
+//!
+//! blocking 池上限**显式设成 8**，而不是用 tokio 默认的 512。512 的意思是
+//! 「积压 512 个请求也照单全收」，那是把拒绝的时机从「立刻」推迟到「内存耗尽」。
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use serde_json::json;
+
+use crate::error::{ClipKnowError, Result};
+use crate::store::sqlite::SqliteStore;
+
+/// 默认监听地址。
+///
+/// **绑 127.0.0.1 而不是 0.0.0.0**：这个服务信任的是「凭证签对了」，
+/// 而凭证的密钥是共享的，泄漏一次全完。多一道「外网根本连不上」的物理
+/// 隔离，代价是零。
+///
+/// 端口选 3100 而不是 3001：3000 是 Go 那边的 web 服务，3001 太容易和
+/// 别的开发服务撞（Next.js 一被占就自动挪到 3001）。
+pub const DEFAULT_ADDR: &str = "127.0.0.1:3100";
+
+/// blocking 线程池上限。见模块文档最后一段。
+const MAX_BLOCKING_THREADS: usize = 8;
+
+/// 服务的共享状态。所有 handler 通过 `State<Arc<AppState>>` 拿到它。
+pub struct AppState {
+    /// **只读查询共用的那一条连接。**
+    ///
+    /// `rusqlite::Connection` 不是 `Sync`，多个线程不能同时用同一条。
+    /// 三个选择：连接池、`Mutex` 串起来、每次现开一条。选了 `Mutex`：
+    ///
+    ///   - 一次会话列表查询是亚毫秒级，串起来的排队代价可以忽略；
+    ///   - 连接池要多一个依赖（r2d2_sqlite），而它跟 rusqlite 的版本
+    ///     经常对不上（这里用的 0.40 很新）；
+    ///   - 每次现开一条要重跑 `PRAGMA foreign_keys` / `journal_mode` /
+    ///     `busy_timeout`，开销比查询本身还大。
+    ///
+    /// ⚠️ **正在跑的那次提问不用这条连接。** 它要 `&mut SqliteStore` 并且
+    /// 一占几分钟，占的是这条的话，会话列表就打不开了。执行任务在自己的
+    /// blocking 线程里另开一条——WAL 模式下读不挡写、写不挡读。
+    read: Mutex<SqliteStore>,
+
+    /// 数据库文件路径。执行任务要拿它自己开连接。
+    pub db_path: String,
+}
+
+impl AppState {
+    pub fn new(store: SqliteStore, db_path: String) -> Self {
+        AppState {
+            read: Mutex::new(store),
+            db_path,
+        }
+    }
+
+    /// 借用只读连接。
+    ///
+    /// **中毒了也照常继续**（`into_inner`）。`Mutex` 中毒的意思是「上一个
+    /// 持有者 panic 了」；对一条只读的 SQLite 连接来说，那不会留下半截事务
+    /// 或者坏掉的状态。而默认行为（`unwrap` 直接 panic）会让**一次**读查询
+    /// 的 panic 永久废掉整个服务的所有读——那个后果比原来的 bug 严重得多。
+    ///
+    /// ★ 调用方必须在 `spawn_blocking` 里用它，不能在 async 函数里直接拿。
+    pub fn read(&self) -> MutexGuard<'_, SqliteStore> {
+        self.read
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+// ── 统一的错误响应 ──────────────────────────────────────────
+//
+// 所有 /internal/* 出错时都长这样：
+//
+//   {"code": "session_busy", "message": "上一个问题还在跑（已经 23 秒）"}
+//
+// `code` 是给程序 match 的稳定标识，`message` 是给人看的。两个都给，是因为
+// Go 那边要按 code 决定 HTTP 状态，而浏览器上要显示 message——只给一个的话，
+// 另一边就得自己编，那就成了两份真相。
+
+/// 一个错误响应。
+pub struct ApiError {
+    pub status: StatusCode,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        ApiError {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// 服务端自己的问题（开库失败、写库失败）。
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+    }
+
+    /// 路由没匹配上。
+    fn not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", "没有这个接口")
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = json!({"code": self.code, "message": self.message});
+        (self.status, axum::Json(body)).into_response()
+    }
+}
+
+/// `spawn_blocking` 的 join 失败 = 那个闭包 panic 了。
+///
+/// 单独一个构造函数是为了让这句话只写一遍——每个走 blocking 的 handler
+/// 都要处理它，而 `JoinError` 的默认 Display（"task panicked"）在浏览器上
+/// 是句废话。
+fn join_failed(e: tokio::task::JoinError) -> ApiError {
+    ApiError::internal(format!("内部任务异常退出: {e}"))
+}
+
+impl From<ClipKnowError> for ApiError {
+    fn from(e: ClipKnowError) -> Self {
+        match e {
+            // 调用方传的参数不对，不是服务端的问题
+            ClipKnowError::BadRequest(m) => {
+                ApiError::new(StatusCode::BAD_REQUEST, "bad_request", m)
+            }
+            other => ApiError::internal(other.to_string()),
+        }
+    }
+}
+
+// ── 路由 ────────────────────────────────────────────────────
+
+/// 路由表。
+///
+/// 抽成函数（而不是在 `run` 里内联）是为了让测试能起一个**一模一样**的服务。
+/// 测试里自己再列一遍路由的话，这里加了接口那边忘了加，测试就会悄悄漏掉它。
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/internal/health", get(health))
+        .fallback(fallback)
+        .with_state(state)
+}
+
+async fn fallback() -> ApiError {
+    ApiError::not_found()
+}
+
+/// `GET /internal/health`
+///
+/// 返回 `{"ok":true,"schema_version":3}`。
+///
+/// 三个用处：
+///   1. Go 启动时探一次——配错地址在第一秒就说清楚，不用等第一次提问；
+///   2. Docker 的 healthcheck，让 web 容器能 `depends_on` 它；
+///   3. 测试里等服务起来。
+///
+/// ★ 它**真的查一次库**（读 `schema_migrations` 的当前版本），不是返回一个
+///   写死的常量。「进程活着」和「进程能用」是两回事：库文件被删了、权限
+///   不对、被别的写者锁死超过 busy_timeout，进程都还活得好好的。
+async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response, ApiError> {
+    let version = tokio::task::spawn_blocking(move || st.read().schema_version())
+        .await
+        .map_err(join_failed)??;
+    Ok(axum::Json(json!({"ok": true, "schema_version": version})).into_response())
+}
+
+// ── 启动 ────────────────────────────────────────────────────
+
+/// 起服务并一直跑，直到收到停机信号。`clipknow serve` 调它。
+pub fn run(db_path: &str, addr: &str) -> Result<()> {
+    // open 只检查迁移版本，不执行 DDL——版本不对会在这里就报错并告诉人
+    // 该跑 `clipknow migrate`，而不是等到第一次查询才炸。
+    let store = SqliteStore::open(db_path)?;
+    let state = Arc::new(AppState::new(store, db_path.to_string()));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_name("clipknow")
+        .build()?;
+
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        warn_if_public(bound);
+        // 人看的信息一律 stderr。stdout 留给 NDJSON（`clipknow turn` 那条路
+        // 的不变量，见 wire.rs），这里不写 stdout 是为了不破坏它。
+        eprintln!("ClipKnow agent 服务  →  http://{bound}");
+        eprintln!("  库 {db_path}");
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        eprintln!("已停止");
+        Ok(())
+    })
+}
+
+/// 绑到非回环地址时在 stderr 上喊一声。
+///
+/// 不直接拒绝，是因为 Docker 里两个容器要互相访问，必须绑 0.0.0.0。
+/// 但开发机上绑错（比如手滑写成 `0.0.0.0:3100`）就等于把这个**不验证
+/// 浏览器 Cookie、只认内部凭证**的服务挂到局域网上，值得一句显眼的警告。
+fn warn_if_public(addr: SocketAddr) {
+    if !addr.ip().is_loopback() {
+        eprintln!(
+            "⚠️  监听在 {} —— 不是回环地址，局域网里能直接访问。",
+            addr.ip()
+        );
+        eprintln!("    这个服务不校验浏览器 Cookie，只认内部凭证；");
+        eprintln!("    只有在容器网络这类受控环境里才该这么绑。");
+    }
+}
+
+/// 等一个停机信号。
+///
+/// 两个都要接：`Ctrl-C`（开发机上手动停）和 `SIGTERM`（`docker stop` 和
+/// systemd 发的那个）。只接 Ctrl-C 的话，容器会在 10 秒宽限期后被
+/// `SIGKILL` 硬杀，正在跑的执行连落库的机会都没有。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            // 注册不上就永远不触发，让 Ctrl-C 那条路自己等
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("收到停机信号，不再接受新请求");
+}
+
+// ── 测试用的服务器 ──────────────────────────────────────────
+
+#[cfg(test)]
+pub(crate) mod testserver {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// 一个跑在后台线程上的真服务器。
+    ///
+    /// ★ 为什么是**真的监听端口**，而不是用 tower 的 `oneshot` 直接喂请求：
+    ///   oneshot 绕过了 listener、HTTP 解析和响应序列化，而这三处正是
+    ///   「本地全绿、一上线就 400」的高发地带。代价是多一个端口和一个线程，
+    ///   一次测试几毫秒，买得起。
+    ///
+    /// ★ 为什么服务器在**另一条线程**上：测试线程用的是 `reqwest::blocking`
+    ///   （项目已有的依赖，不用为测试再引一个 async HTTP 客户端），而在
+    ///   tokio runtime 里调 blocking 客户端会直接 panic。分开两条线程，
+    ///   两边都用自己最顺手的写法。
+    pub struct TestServer {
+        pub addr: SocketAddr,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        /// 服务器线程跑完 `block_on` 之后往这里发一声。
+        /// 用它而不是 `JoinHandle::join()`，见 `Drop` 里的说明。
+        done: mpsc::Receiver<()>,
+    }
+
+    impl TestServer {
+        pub fn url(&self, path: &str) -> String {
+            format!("http://{}{}", self.addr, path)
+        }
+    }
+
+    /// 等服务器线程收摊最多等多久。
+    ///
+    /// 正常停机是毫秒级；这个数只是用来把「卡死」变成「几秒后继续」。
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            // 发停机信号，然后等线程收摊。不等的话，一次 cargo test 会攒下
+            // 几十个还在监听的端口，后面的测试随机撞端口失败。
+            if let Some(tx) = self.stop.take() {
+                let _ = tx.send(());
+            }
+            // ★ 这里**不能**用 `JoinHandle::join()`。
+            //
+            //   join 没有超时。优雅停机一旦写坏（实测：把
+            //   `.with_graceful_shutdown(...)` 去掉），服务器线程永远不返回，
+            //   于是整个测试**卡死**——CI 上那是六小时超时，不是一个红叉。
+            //   故障注入的时候就是这么发现的。
+            //
+            //   换成「等一个完成通知，最多 5 秒」：坏掉时 5 秒后继续往下走，
+            //   由测试自己的断言（端口还连得上 = 没停成）把它判红。
+            //   判红这件事留给测试，不在 Drop 里 panic——Drop 里 panic
+            //   会盖掉真正的失败原因，而且和别的 panic 撞上会直接 abort。
+            if self.done.recv_timeout(STOP_TIMEOUT).is_err() {
+                eprintln!(
+                    "⚠️  测试服务器 {} 在 {STOP_TIMEOUT:?} 内没停下来",
+                    self.addr
+                );
+            }
+        }
+    }
+
+    /// 起一个监听随机空闲端口的服务器，等它真的在听了才返回。
+    pub fn spawn(state: Arc<AppState>) -> TestServer {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        // 端口要从服务器线程回传给测试线程——bind 之前不知道系统分了哪个
+        let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("测试 runtime 起不来");
+            rt.block_on(async move {
+                // 端口给 0 = 让系统挑一个空闲的。写死端口的话，
+                // 并行跑的测试会互相撞。
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("绑不上端口");
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                let _ = axum::serve(listener, router(state))
+                    .with_graceful_shutdown(async {
+                        let _ = stop_rx.await;
+                    })
+                    .await;
+            });
+            // 跑到这里说明 serve 真的返回了 = 停机成功。通知 Drop。
+            let _ = done_tx.send(());
+        });
+
+        // recv 会一直等到服务器线程发来地址，那时候 listener 已经在听了——
+        // 不需要 sleep 一个「应该够了吧」的时长。
+        let addr = addr_rx.recv().expect("服务器线程没起来");
+        TestServer {
+            addr,
+            stop: Some(stop_tx),
+            done: done_rx,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> Arc<AppState> {
+        let store = SqliteStore::in_memory().expect("建内存库");
+        Arc::new(AppState::new(store, ":memory:".into()))
+    }
+
+    #[test]
+    fn health_报告库的真实迁移版本() {
+        let srv = testserver::spawn(state());
+        let r = reqwest::blocking::get(srv.url("/internal/health")).unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = r.json().unwrap();
+        assert_eq!(v["ok"], true);
+        // 写死的常量会让这条测试永远通过。对着 migrate 里的期望版本比，
+        // 以后加一条迁移忘了跑，这里就会红。
+        assert_eq!(
+            v["schema_version"],
+            crate::store::migrate::expected_version(),
+            "health 报的版本和代码期望的对不上: {v}"
+        );
+    }
+
+    #[test]
+    fn 不认识的路径回_404_而且是同一种错误形状() {
+        let srv = testserver::spawn(state());
+        let r = reqwest::blocking::get(srv.url("/internal/nope")).unwrap();
+        assert_eq!(r.status(), 404);
+        // 形状必须和别的错误一致：Go 那边只写一条解析路径。
+        // 默认的 fallback 返回空 body，Go 解析会拿到一堆 null。
+        let v: serde_json::Value = r.json().unwrap();
+        assert_eq!(v["code"], "not_found");
+        assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()), "{v}");
+    }
+
+    /// 停机信号发出后，服务器线程必须真的收摊。
+    ///
+    /// 钉这条是因为「优雅停机」写错了的表现是**进程退不掉**——
+    /// 容器 stop 要等 10 秒宽限期然后被 SIGKILL，而日志上什么都看不出来。
+    #[test]
+    fn 停机之后端口就不再接受连接了() {
+        let srv = testserver::spawn(state());
+        let url = srv.url("/internal/health");
+        assert!(reqwest::blocking::get(&url).is_ok());
+        drop(srv); // Drop 里发停机信号并 join
+        assert!(
+            reqwest::blocking::get(&url).is_err(),
+            "停机之后还能连上，说明 graceful shutdown 没生效"
+        );
+    }
+}

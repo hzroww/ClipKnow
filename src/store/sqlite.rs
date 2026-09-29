@@ -51,6 +51,16 @@ impl SqliteStore {
         Ok((Self::init(conn)?, applied))
     }
 
+    /// 当前库的迁移版本。`GET /internal/health` 用它。
+    ///
+    /// 不是返回一个写死的常量：这条查询会真的读一次 `schema_migrations` 表，
+    /// 所以「库文件被删了」「权限不对」「被别的写者锁死超过 busy_timeout」
+    /// 这三种情况都会在健康检查里暴露出来，而进程本身在这三种情况下
+    /// 都还活得好好的。
+    pub fn schema_version(&self) -> Result<i64> {
+        crate::store::migrate::current_version(&self.conn)
+    }
+
     /// 撞锁时等多久再报错。
     ///
     /// **不设的话是「立刻返回 SQLITE_BUSY」**，不是「等一会儿」——这是 SQLite

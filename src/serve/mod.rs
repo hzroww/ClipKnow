@@ -46,6 +46,9 @@ use serde_json::json;
 use crate::error::{ClipKnowError, Result};
 use crate::store::sqlite::SqliteStore;
 
+pub mod auth;
+use auth::Principal;
+
 /// 默认监听地址。
 ///
 /// **绑 127.0.0.1 而不是 0.0.0.0**：这个服务信任的是「凭证签对了」，
@@ -79,11 +82,15 @@ pub struct AppState {
 
     /// 数据库文件路径。执行任务要拿它自己开连接。
     pub db_path: String,
+
+    /// 内部凭证的校验器。见 [`auth`] 模块。
+    pub verifier: auth::Verifier,
 }
 
 impl AppState {
-    pub fn new(store: SqliteStore, db_path: String) -> Self {
+    pub fn new(store: SqliteStore, db_path: String, verifier: auth::Verifier) -> Self {
         AppState {
+            verifier,
             read: Mutex::new(store),
             db_path,
         }
@@ -115,6 +122,7 @@ impl AppState {
 // 另一边就得自己编，那就成了两份真相。
 
 /// 一个错误响应。
+#[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
@@ -177,7 +185,12 @@ impl From<ClipKnowError> for ApiError {
 /// 测试里自己再列一遍路由的话，这里加了接口那边忘了加，测试就会悄悄漏掉它。
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        // 不设防：Docker 的 healthcheck 调它，那时候没有密钥可用。
+        // 它也确实什么都不泄漏——只说库的迁移版本。
         .route("/internal/health", get(health))
+        // 往下都要内部凭证。靠 handler 参数里的 `Principal` 提取器强制，
+        // 不是靠中间件——见 auth.rs 里关于「忘了调」的说明。
+        .route("/internal/whoami", get(whoami))
         .fallback(fallback)
         .with_state(state)
 }
@@ -205,14 +218,33 @@ async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response
     Ok(axum::Json(json!({"ok": true, "schema_version": version})).into_response())
 }
 
+/// `GET /internal/whoami`
+///
+/// 返回 `{"user_id":"..."}` —— 就是凭证里的 `sub`。不查库。
+///
+/// 存在的理由是**让「密钥配错了」在启动时就暴露**。`/internal/health` 不设防，
+/// 所以它通了只说明「端口通、库能读」；密钥两边不一致要等到第一次提问才
+/// 报 401，那时候用户已经在等答案了。Go 启动时探一次这个接口，配错就直接
+/// 起不来（web/main.go）。
+///
+/// 顺带也是 `Principal` 提取器的唯一真实消费者，让它被真的 HTTP 请求走一遍，
+/// 而不只是单元测试里直接调 `verify()`。
+async fn whoami(who: Principal) -> Response {
+    axum::Json(json!({"user_id": who.user_id})).into_response()
+}
+
 // ── 启动 ────────────────────────────────────────────────────
 
 /// 起服务并一直跑，直到收到停机信号。`clipknow serve` 调它。
 pub fn run(db_path: &str, addr: &str) -> Result<()> {
     // open 只检查迁移版本，不执行 DDL——版本不对会在这里就报错并告诉人
     // 该跑 `clipknow migrate`，而不是等到第一次查询才炸。
+    // ★ 凭证密钥在**开库之前**读。
+    //   没配密钥是最常见的启动失败，而它和数据库一点关系都没有——排在后面
+    //   的话，一个没迁移的库会先报「版本落后」，把真正的原因盖住。
+    let verifier = auth::Verifier::from_env()?;
     let store = SqliteStore::open(db_path)?;
-    let state = Arc::new(AppState::new(store, db_path.to_string()));
+    let state = Arc::new(AppState::new(store, db_path.to_string(), verifier));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -391,9 +423,38 @@ pub(crate) mod testserver {
 mod tests {
     use super::*;
 
+    /// 测试用的密钥。够长，且和黄金样例那个不一样。
+    const TEST_SECRET: &[u8] = b"serve-tests-secret-at-least-32-chars";
+
     fn state() -> Arc<AppState> {
         let store = SqliteStore::in_memory().expect("建内存库");
-        Arc::new(AppState::new(store, ":memory:".into()))
+        Arc::new(AppState::new(
+            store,
+            ":memory:".into(),
+            auth::Verifier::new(TEST_SECRET),
+        ))
+    }
+
+    /// 签一张这个测试服务器认得的凭证。
+    fn token_for(user_id: &str) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = json!({
+            "sub": user_id,
+            "iss": auth::ISSUER,
+            "aud": auth::AUDIENCE,
+            "iat": now,
+            "exp": now + 120,
+        });
+        jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(TEST_SECRET),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -422,6 +483,103 @@ mod tests {
         let v: serde_json::Value = r.json().unwrap();
         assert_eq!(v["code"], "not_found");
         assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()), "{v}");
+    }
+
+    // ── 内部凭证在**真实 HTTP 请求**上的行为 ──────────────
+    //
+    // auth.rs 里那批单测直接调 verify()，走不到 header 解析和 axum 的
+    // 提取器拒绝路径。下面这几条走完整条链：真 TCP → 真 HTTP 头 →
+    // 提取器 → 响应码和响应体。
+
+    #[test]
+    fn 带对凭证能拿到自己的_user_id() {
+        let srv = testserver::spawn(state());
+        let r = reqwest::blocking::Client::new()
+            .get(srv.url("/internal/whoami"))
+            .bearer_auth(token_for("u_alice"))
+            .send()
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.json::<serde_json::Value>().unwrap()["user_id"], "u_alice");
+    }
+
+    #[test]
+    fn 不带凭证的请求一律_401() {
+        let srv = testserver::spawn(state());
+        let r = reqwest::blocking::get(srv.url("/internal/whoami")).unwrap();
+        assert_eq!(r.status(), 401);
+        // 错误形状要和别的一致，Go 那边只写一条解析路径
+        let v: serde_json::Value = r.json().unwrap();
+        assert_eq!(v["code"], "unauthorized");
+    }
+
+    /// 各种形状不对的 Authorization 头。
+    ///
+    /// 挨个列出来是因为**解析失败被当成「没带凭证」**和**被当成「带了个
+    /// 空凭证」**是两回事，后者有可能走进一条把空串当合法身份的路径。
+    #[test]
+    fn 头的形状不对也是_401() {
+        let srv = testserver::spawn(state());
+        let c = reqwest::blocking::Client::new();
+        let good = token_for("u_alice");
+        for bad in [
+            String::new(),                  // 空头
+            "Bearer".into(),                // 只有关键字
+            "Bearer ".into(),               // 关键字加空格，没有令牌
+            format!("Basic {good}"),        // 认证方式不对
+            format!("Bearer {good} extra"), // 后面多了东西
+            format!("Bearer {good}x"),      // 签名被改了一个字符
+            "Bearer not.a.jwt".into(),
+        ] {
+            let r = c
+                .get(srv.url("/internal/whoami"))
+                .header("authorization", &bad)
+                .send()
+                .unwrap();
+            assert_eq!(r.status(), 401, "这个头本该被拒: {bad:?}");
+        }
+    }
+
+    /// ★ 换个密钥签的凭证必须被拒。
+    ///
+    /// 这条钉的是**两边密钥配错时的表现**：401，不是「校验没跑」。
+    /// 校验没跑的表现是 200，而 200 意味着任何人都能冒充任意用户。
+    #[test]
+    fn 别的密钥签的凭证被拒() {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        let srv = testserver::spawn(state());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // 除了密钥，其它字段全对——所以拒绝的原因只能是签名
+        let forged = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "sub": "u_alice", "iss": auth::ISSUER, "aud": auth::AUDIENCE,
+                "iat": now, "exp": now + 120,
+            }),
+            &EncodingKey::from_secret(b"a-completely-different-32-byte-key!!!"),
+        )
+        .unwrap();
+        let r = reqwest::blocking::Client::new()
+            .get(srv.url("/internal/whoami"))
+            .bearer_auth(forged)
+            .send()
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+
+    /// health 不设防 —— Docker 的 healthcheck 没有密钥可用。
+    #[test]
+    fn health_不需要凭证() {
+        let srv = testserver::spawn(state());
+        assert_eq!(
+            reqwest::blocking::get(srv.url("/internal/health"))
+                .unwrap()
+                .status(),
+            200
+        );
     }
 
     /// 停机信号发出后，服务器线程必须真的收摊。

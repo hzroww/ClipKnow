@@ -7,13 +7,26 @@
 //! 4 条不变量——**只有一个执行入口定义准入规则，网页和 CLI 不各写一套**。
 //! 留在 Go 那边的话，命令行绕过 web 直接跑就不受任何约束。
 //!
-//! ## 阶段 B 的策略：全局最多 1 个
+//! ## 策略
 //!
-//! 和改造前**完全一样**的行为。这一步只搬机制，不放宽策略——放宽是阶段 C
-//! 的事，那时候要先有会话互斥的数据库兜底、取消、崩溃恢复。
+//! ```text
+//! 同一个会话    最多 1 个在跑      第二个 → 409「上一个问题还在跑」
+//! 全局          最多 max_total 个  满了   → 503「服务正忙」
+//! 每个用户      不限               （见下）
+//! ```
 //!
-//! 阶段 C 要改的只有两处：`max_total` 这个数字，和加一张
-//! `per_user: HashMap<user_id, usize>`。数据结构和调用点都不用动。
+//! `max_total` 默认 [`DEFAULT_MAX_TURNS`]，`clipknow serve --max-turns N` 可改。
+//!
+//! **没有「每个用户最多几个」。** 所以同一个人开两个会话可以同时问。要加的话
+//! 是一张 `per_user: HashMap<user_id, usize>`，在 `admit` 里多检查一项——
+//! 数据结构和调用点都不用动。
+//!
+//! ## 放开之前修掉的那个坑
+//!
+//! 一开始这里是 1（和改造前 Go 里那把锁一样）。改大之前先写了并发落库的
+//! 测试，结果 180 次落库失败了 159~174 次，全是 `database is locked`——
+//! 读后写的事务用了 SQLite 默认的 DEFERRED 模式。见 `store::sqlite::write_tx`。
+//! 只改这个数字的话，两个提问差不多同时答完时，后落库的那个几乎必定白跑。
 //!
 //! ## 为什么名额是个 guard 而不是一对 acquire/release
 //!
@@ -28,11 +41,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// 阶段 B 的全局并发上限。**保持改造前的行为：一次只跑一个。**
+/// 默认最多同时跑几个提问（全局）。`clipknow serve --max-turns` 可改。
 ///
-/// 这个数字就是阶段 C 要动的地方。动之前必须先有：会话互斥的数据库兜底
-/// （turns 表的部分唯一索引）、取消、启动时的崩溃恢复。
-pub const MAX_CONCURRENT_TURNS: usize = 1;
+/// 4 不是算出来的，是「够测并发、又不至于一不小心把内存吃光」的折中：
+/// 分析视频时整个文件读进内存，单个最大 512MB（`ingest::download`）。
+pub const DEFAULT_MAX_TURNS: usize = 4;
 
 /// 没拿到名额的原因。
 #[derive(Debug, PartialEq, Eq)]
@@ -86,7 +99,12 @@ pub struct Registry {
 
 impl Registry {
     pub fn new() -> Arc<Self> {
-        Self::with_capacity(MAX_CONCURRENT_TURNS)
+        Self::with_capacity(DEFAULT_MAX_TURNS)
+    }
+
+    /// 全局上限是多少。`/internal/health` 报给外面看。
+    pub fn max_total(&self) -> usize {
+        self.max_total
     }
 
     /// 指定上限。测试用它造出「多个会话能同时跑」的场景，
@@ -256,14 +274,30 @@ mod tests {
         }
     }
 
-    /// 阶段 B 的策略就是改造前那个全局串行锁：一次只跑一个。
-    /// 这条钉住默认值，免得哪天有人"顺手"把它调大而没做阶段 C 的功课。
+    /// 默认就允许不同会话同时跑，满了才拒。
     #[test]
-    fn 默认上限是一() {
-        assert_eq!(MAX_CONCURRENT_TURNS, 1);
+    fn 默认允许不同会话同时跑() {
+        let reg = Registry::new();
+        let permits: Vec<_> = (0..DEFAULT_MAX_TURNS)
+            .map(|i| reg.admit(&format!("s{i}")).expect("还没满却被拒了"))
+            .collect();
+        assert_eq!(reg.running_count(), DEFAULT_MAX_TURNS);
+        assert!(matches!(
+            reg.admit("one-more"),
+            Err(Reject::Capacity { .. })
+        ));
+        drop(permits);
+    }
+
+    /// 同一个人开几个会话都能同时跑——现在没有「每个用户最多几个」。
+    /// 登记表只认会话 id，根本不知道谁是谁，这条钉住这件事，
+    /// 以后加每用户上限时这条会提醒你改。
+    #[test]
+    fn 同会话仍然互斥_不同会话不互斥() {
         let reg = Registry::new();
         let _a = reg.admit("s1").unwrap();
-        assert!(matches!(reg.admit("s2"), Err(Reject::Capacity { .. })));
+        let _b = reg.admit("s2").expect("不同会话不该互相挡");
+        assert!(matches!(reg.admit("s1"), Err(Reject::SessionBusy { .. })));
     }
 
     /// ★ 执行 panic 了，名额也必须还回去。

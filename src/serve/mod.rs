@@ -65,6 +65,18 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:3100";
 /// blocking 线程池上限。见模块文档最后一段。
 const MAX_BLOCKING_THREADS: usize = 8;
 
+/// `--max-turns` 最多能设多少。
+///
+/// ★ 必须比 blocking 线程池**小**，而且要留出余量。
+///
+///   每个在跑的提问会占住一条 blocking 线程**整整几分钟**。而会话列表、
+///   聊天记录、归属校验、健康检查这些查询也走 blocking 线程。提问把池子
+///   占满的话，这些查询就得排在「某个提问答完」之后——表现是网页的会话
+///   列表转圈几分钟，健康检查超时，Docker 把容器判成 unhealthy。
+///
+///   留 2 条给查询：它们都是亚毫秒级的，2 条绰绰有余。
+pub const MAX_TURNS_LIMIT: usize = MAX_BLOCKING_THREADS - 2;
+
 /// 服务的共享状态。所有 handler 通过 `State<Arc<AppState>>` 拿到它。
 pub struct AppState {
     /// **只读查询共用的那一条连接。**
@@ -90,7 +102,7 @@ pub struct AppState {
     pub verifier: auth::Verifier,
 
     /// 执行准入登记表：现在有哪几次提问在跑。
-    /// 阶段 B 的策略是「全局最多 1 个」，和改造前 Go 那把 turnGate 一样。
+    /// 策略：同一个会话一次一个，全局最多 `--max-turns` 个（默认 4）。
     pub registry: Arc<crate::app::registry::Registry>,
 }
 
@@ -102,6 +114,12 @@ impl AppState {
             read: Mutex::new(store),
             db_path,
         }
+    }
+
+    /// 改全局并发上限。`clipknow serve --max-turns` 用它。
+    pub fn with_max_turns(mut self, n: usize) -> Self {
+        self.registry = crate::app::registry::Registry::with_capacity(n);
+        self
     }
 
     /// 借用只读连接。
@@ -227,7 +245,11 @@ async fn fallback() -> ApiError {
 ///   写死的常量。「进程活着」和「进程能用」是两回事：库文件被删了、权限
 ///   不对、被别的写者锁死超过 busy_timeout，进程都还活得好好的。
 async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response, ApiError> {
-    let (running, accepting) = (st.registry.running_count(), st.registry.is_accepting());
+    let (running, max_turns, accepting) = (
+        st.registry.running_count(),
+        st.registry.max_total(),
+        st.registry.is_accepting(),
+    );
     let version = tokio::task::spawn_blocking(move || st.read().schema_version())
         .await
         .map_err(join_failed)??;
@@ -235,6 +257,7 @@ async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response
         "ok": true,
         "schema_version": version,
         "running_turns": running,
+        "max_turns": max_turns,
         // 停机过程中变 false。healthcheck 不看它——那时候该让在跑的
         // 跑完，而不是让编排系统立刻重启容器。
         "accepting": accepting,
@@ -472,7 +495,14 @@ const MAX_SESSION_LIMIT: usize = 500;
 // ── 启动 ────────────────────────────────────────────────────
 
 /// 起服务并一直跑，直到收到停机信号。`clipknow serve` 调它。
-pub fn run(db_path: &str, addr: &str) -> Result<()> {
+pub fn run(db_path: &str, addr: &str, max_turns: usize) -> Result<()> {
+    if !(1..=MAX_TURNS_LIMIT).contains(&max_turns) {
+        return Err(ClipKnowError::BadRequest(format!(
+            "--max-turns 是 {max_turns}，得在 1 到 {MAX_TURNS_LIMIT} 之间。\n\
+             上限卡在 blocking 线程池（{MAX_BLOCKING_THREADS} 条）减 2：每个在跑的提问占一条\n\
+             好几分钟，全占满的话会话列表和健康检查就排不上队了。"
+        )));
+    }
     // open 只检查迁移版本，不执行 DDL——版本不对会在这里就报错并告诉人
     // 该跑 `clipknow migrate`，而不是等到第一次查询才炸。
     // ★ 凭证密钥在**开库之前**读。
@@ -480,7 +510,8 @@ pub fn run(db_path: &str, addr: &str) -> Result<()> {
     //   的话，一个没迁移的库会先报「版本落后」，把真正的原因盖住。
     let verifier = auth::Verifier::from_env()?;
     let store = SqliteStore::open(db_path)?;
-    let state = Arc::new(AppState::new(store, db_path.to_string(), verifier));
+    let state =
+        Arc::new(AppState::new(store, db_path.to_string(), verifier).with_max_turns(max_turns));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -496,6 +527,7 @@ pub fn run(db_path: &str, addr: &str) -> Result<()> {
         // 的不变量，见 wire.rs），这里不写 stdout 是为了不破坏它。
         eprintln!("ClipKnow agent 服务  →  http://{bound}");
         eprintln!("  库 {db_path}");
+        eprintln!("  最多同时跑 {max_turns} 个提问（同一个会话仍然一次一个）");
         let reg = Arc::clone(&state.registry);
         axum::serve(listener, router(state))
             .with_graceful_shutdown(async move { drain_then_stop(reg).await })
@@ -1154,6 +1186,7 @@ mod tests {
             .json()
             .unwrap();
         assert_eq!(v["running_turns"], 0);
+        assert_eq!(v["max_turns"], crate::app::registry::DEFAULT_MAX_TURNS);
         assert_eq!(v["accepting"], true);
 
         let _p = reg.admit("s-x").unwrap();
@@ -1162,6 +1195,16 @@ mod tests {
             .json()
             .unwrap();
         assert_eq!(v["running_turns"], 1, "health 报的在跑数不对: {v}");
+    }
+
+    /// 并发上限必须给查询留出 blocking 线程。
+    ///
+    /// 提问会把一条 blocking 线程占住好几分钟；上限等于池子大小的话，
+    /// 所有提问一起跑时会话列表和健康检查就排不上队了。
+    #[test]
+    fn 并发上限给查询留了线程() {
+        const { assert!(MAX_TURNS_LIMIT < MAX_BLOCKING_THREADS) };
+        const { assert!(crate::app::registry::DEFAULT_MAX_TURNS <= MAX_TURNS_LIMIT) };
     }
 
     /// 停机信号发出后，服务器线程必须真的收摊。

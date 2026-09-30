@@ -116,6 +116,32 @@ impl SqliteStore {
 ///
 /// `ALTER TABLE ADD COLUMN` 在 SQLite 里不支持 IF NOT EXISTS，所以先查 PRAGMA。
 /// 和 001 那批不一样——那些是 CREATE TABLE IF NOT EXISTS，重复跑没事。
+/// 开一个**要写**的事务。凡是「先读、再写」的事务都必须用它。
+///
+/// ## 为什么不能用默认的 `transaction()`
+///
+/// 默认模式（DEFERRED）是「先不拿锁，第一次读的时候拿一份快照，第一次写的
+/// 时候再去拿写锁」。两个连接同时这么干：
+///
+/// ```text
+/// A  BEGIN → 读（拿到快照 1）
+/// B  BEGIN → 读（拿到快照 1）
+/// A  写 → 拿到写锁 → 提交          ← 库变成了版本 2
+/// B  写 → 要写锁，但自己的快照还是 1，已经过期了
+///       → SQLite 直接返回 SQLITE_BUSY，**不走 busy_timeout 的等待**
+///         （等多久都没用：快照过期是回不去的）
+/// ```
+///
+/// 实测：6 个会话同时各落库 30 次，180 次里失败 159~174 次，全是
+/// `database is locked`。以前全局一次只跑一个提问，这个问题永远碰不到。
+///
+/// IMMEDIATE 是「BEGIN 那一刻就拿写锁」。拿不到就按 busy_timeout 正常排队，
+/// 拿到之后读到的一定是最新的，不存在过期快照这回事。代价是写事务之间
+/// 完全串行——但每个事务都是毫秒级的，串起来无所谓。
+fn write_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
 /// 一行 → Item。`off` 是列偏移（分组查询多了一列 seq）。
 fn row_to_item(r: &rusqlite::Row, off: usize) -> rusqlite::Result<Item> {
     let kind_str: String = r.get(off + 1)?;
@@ -261,7 +287,11 @@ impl Store for SqliteStore {
     fn save(&mut self, fetched: &FetchedVideo) -> Result<String> {
         // 用事务：要么三张表全写成功，要么一张都不写。
         // 否则可能出现「有视频没文字稿」的半截数据。
-        let tx = self.conn.transaction()?;
+        //
+        // ★ IMMEDIATE：两个人同时抓同一条视频时，第二个会**排队等**第一个写完，
+        //   然后查到已有的 id 并复用它。用默认模式的话第二个直接报
+        //   「database is locked」，原因见 `write_tx` 的说明。
+        let tx = write_tx(&mut self.conn)?;
         let v = &fetched.video;
 
         // 已经抓过就复用原来的 id，避免外键指向一个新 id 而老数据还挂在旧 id 上
@@ -614,7 +644,9 @@ impl SqliteStore {
     ) -> Result<String> {
         let turn_id = new_id();
         let ts = now_ts();
-        let tx = self.conn.transaction()?;
+        // ★ IMMEDIATE，不是默认模式。见 `write_tx` 的说明——不这么做的话，
+        //   两个会话差不多同时答完，后落库的那个几乎必定失败。
+        let tx = write_tx(&mut self.conn)?;
 
         let seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE session_id = ?1",
@@ -1017,6 +1049,178 @@ impl SqliteStore {
         )?;
         let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    //! 多个提问**同时**写库。
+    //!
+    //! 以前全局一次只跑一个提问，这里的问题根本碰不到。放开并发之前必须先
+    //! 有这组测试——内存库（`in_memory`）测不出来，因为它只有一条连接；
+    //! 必须是**真文件 + 多条连接**，和生产环境一样。
+
+    use super::*;
+    use crate::content::model::{Item, ItemKind, TurnStatus};
+    use std::sync::{Arc, Barrier};
+
+    /// 一个真文件库，测试结束自动删掉（连 -wal / -shm 一起）。
+    struct TempDb(std::path::PathBuf);
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "clipknow-conc-{tag}-{}-{}.db",
+                std::process::id(),
+                new_id()
+            ));
+            SqliteStore::open_and_migrate(p.to_str().unwrap()).unwrap();
+            TempDb(p)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path()));
+            }
+        }
+    }
+
+    fn one_item(text: &str) -> Vec<Item> {
+        vec![Item {
+            idx: 0,
+            kind: ItemKind::UserMessage,
+            iteration: None,
+            call_id: None,
+            payload: serde_json::json!({ "text": text }),
+            raw_json: None,
+        }]
+    }
+
+    /// ★ 几个提问在**不同会话**里同时收尾、同时落库，一个都不能失败。
+    ///
+    /// 这是放开并发之后最常见的情况：两个人各问各的，差不多同时答完。
+    #[test]
+    fn 不同会话同时落库都能成功() {
+        const WRITERS: usize = 6;
+        const ROUNDS: usize = 30;
+        let db = TempDb::new("turns");
+
+        // 先建好各自的会话
+        let sessions: Vec<String> = {
+            let mut s = SqliteStore::open(db.path()).unwrap();
+            (0..WRITERS)
+                .map(|_| s.create_session(None, None).unwrap())
+                .collect()
+        };
+
+        // Barrier：让所有线程**同一时刻**开始写。没有它的话，线程启动时间
+        // 的先后差就足以把写入错开，测不出竞争。
+        let gate = Arc::new(Barrier::new(WRITERS));
+        let handles: Vec<_> = sessions
+            .into_iter()
+            .map(|sid| {
+                let path = db.path().to_string();
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    // 每个线程自己一条连接——和 serve 里每个执行自己开库一样
+                    let mut store = SqliteStore::open(&path).unwrap();
+                    gate.wait();
+                    let mut errors = Vec::new();
+                    for i in 0..ROUNDS {
+                        if let Err(e) = store.save_turn(
+                            &sid,
+                            "fake",
+                            TurnStatus::Done,
+                            &one_item(&format!("第{i}轮")),
+                        ) {
+                            errors.push(e.to_string());
+                        }
+                    }
+                    errors
+                })
+            })
+            .collect();
+
+        let errors: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{} 次落库失败（共 {} 次），第一条：{}",
+            errors.len(),
+            WRITERS * ROUNDS,
+            errors[0]
+        );
+
+        // 每个会话的序号必须是连续的 1..=ROUNDS，不能有重号或跳号
+        let store = SqliteStore::open(db.path()).unwrap();
+        let n = store.count_for_test("SELECT count(*) FROM turns").unwrap();
+        assert_eq!(n as usize, WRITERS * ROUNDS);
+        let bad = store
+            .count_for_test(
+                "SELECT count(*) FROM (SELECT session_id, MAX(seq) m, COUNT(*) c
+                 FROM turns GROUP BY session_id) WHERE m != c",
+            )
+            .unwrap();
+        assert_eq!(bad, 0, "有会话的 seq 不连续");
+    }
+
+    /// ★ 两个人同时分析**同一条视频**：都往 videos 表里写同一条。
+    ///
+    /// 必须：一个都不报错，而且库里最后只有**一条**这个视频——不能因为两边
+    /// 都「查了一下没有」就各插一条（唯一约束会让后一个炸），也不能因为
+    /// 后写的覆盖了 id 而让先写的那边的外键悬空。
+    #[test]
+    fn 同一条视频被同时抓取_只留一条且都不报错() {
+        const WRITERS: usize = 6;
+        let db = TempDb::new("video");
+        let gate = Arc::new(Barrier::new(WRITERS));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let path = db.path().to_string();
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    let mut store = SqliteStore::open(&path).unwrap();
+                    // 每个线程各自造一份（id 各不相同），就像两次独立的抓取
+                    let v = super::tests::sample("same-video", &format!("第{i}次抓的标题"));
+                    gate.wait();
+                    store.save(&v)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let errors: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(
+            errors.is_empty(),
+            "{} 次保存失败，第一条：{}",
+            errors.len(),
+            errors[0]
+        );
+
+        // 所有人拿回来的必须是同一个 id
+        let ids: std::collections::HashSet<_> = results.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(ids.len(), 1, "同一条视频被存成了 {} 个不同的 id", ids.len());
+
+        let store = SqliteStore::open(db.path()).unwrap();
+        assert_eq!(
+            store.count_for_test("SELECT count(*) FROM videos").unwrap(),
+            1
+        );
+        // 评论挂在唯一那条视频上，没有悬空的
+        assert_eq!(
+            store
+                .count_for_test(
+                    "SELECT count(*) FROM comments WHERE video_id NOT IN (SELECT id FROM videos)"
+                )
+                .unwrap(),
+            0,
+            "有评论指向了一个不存在的视频"
+        );
     }
 }
 
@@ -1577,7 +1781,8 @@ mod tests {
         ]
     }
 
-    fn sample(native_id: &str, title: &str) -> FetchedVideo {
+    // pub(super)：concurrency_tests 那组也要用它造数据
+    pub(super) fn sample(native_id: &str, title: &str) -> FetchedVideo {
         let vid = new_id();
         FetchedVideo {
             video: Video {

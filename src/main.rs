@@ -170,6 +170,9 @@ enum Command {
         /// 监听地址。默认只绑回环，外网连不上。
         #[arg(long, default_value = clipknow::serve::DEFAULT_ADDR)]
         addr: String,
+        /// 全局最多同时跑几个提问。同一个会话不管这个值，永远一次一个。
+        #[arg(long, default_value_t = clipknow::app::registry::DEFAULT_MAX_TURNS)]
+        max_turns: usize,
     },
     /// 探一下常驻服务活着没。健康就退出码 0，否则非 0。
     ///
@@ -321,8 +324,8 @@ fn run(cli: Cli) -> Result<()> {
 
     // serve 自己开库（它要把连接交给 AppState 长期持有），所以放在
     // 下面那句 open 之前——不然会白开一条连接。
-    if let Command::Serve { addr } = &cli.command {
-        return clipknow::serve::run(&cli.db, addr);
+    if let Command::Serve { addr, max_turns } = &cli.command {
+        return clipknow::serve::run(&cli.db, addr, *max_turns);
     }
 
     // ping 根本不碰数据库——它问的是**另一个进程**健不健康。

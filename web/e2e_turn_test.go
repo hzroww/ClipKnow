@@ -7,6 +7,7 @@ package main
 // **正常路径**。这个文件验的是改成常驻服务之后才存在的几件事：
 //
 //	同一会话被并发提问   → 只接受一个，另一个 409（准入登记表）
+//	不同会话同时提问     → 真的同时在跑（两个请求同时停在假模型里）
 //	浏览器中途断开       → 执行照样跑完并落库（有界队列丢事件，循环不受影响）
 //	模型要求调工具       → 工具结果能跨服务传回去，模型据此再答一次
 //
@@ -274,6 +275,129 @@ func TestToolCallRoundTripCrossesServices(t *testing.T) {
 	last := evs[len(evs)-1]
 	if last.T != "done" {
 		t.Errorf("最后一条事件是 %s，期望 done", last.T)
+	}
+}
+
+// 一个会**数人头**的假模型：每进来一个请求就报一声，然后卡住等 release。
+//
+// 用它证明「真的同时在跑」：两个提问都停在模型这里 = 两个执行确实同时
+// 存在。只看「两个请求都返回 200」是不够的——串行执行也能都返回 200，
+// 只是第二个等了第一个。
+func countingModel(t *testing.T, release <-chan struct{}, arrived chan<- int) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	inside := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		inside++
+		n := inside
+		mu.Unlock()
+		arrived <- n
+		<-release
+		writeFakeAnswer(t, w)
+	}))
+}
+
+// 等 want 个请求同时停在假模型里。超时就说明被串行化了。
+func waitAllInside(t *testing.T, arrived <-chan int, want int) {
+	t.Helper()
+	deadline := time.After(30 * time.Second)
+	for {
+		select {
+		case n := <-arrived:
+			if n >= want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("30 秒内没等到 %d 个提问同时进到模型里——它们被串行化了", want)
+		}
+	}
+}
+
+// ★ 两个人同时提问，两个执行**真的同时在跑**。
+//
+// 设计文档第 11 节验收表里那一行：「A、B 不同会话并发 → 能同时进入假模型，
+// 不被全局单任务锁串行化」。
+func TestTwoUsersAskAtTheSameTime(t *testing.T) {
+	release := make(chan struct{})
+	arrived := make(chan int, 8)
+	model := countingModel(t, release, arrived)
+	defer model.Close()
+
+	srv := startServer(t, model.URL)
+	alice := register(t, srv, "alice2")
+	bob := register(t, srv, "bobby2")
+
+	ra := postChat(t, alice, srv, "", "alice 的问题")
+	defer ra.Body.Close()
+	rb := postChat(t, bob, srv, "", "bob 的问题")
+	defer rb.Body.Close()
+	for name, r := range map[string]*http.Response{"alice": ra, "bob": rb} {
+		if r.StatusCode != http.StatusOK {
+			b, _ := readAll(r)
+			t.Fatalf("%s 的提问返回 %d，期望 200：%s", name, r.StatusCode, b)
+		}
+	}
+
+	waitAllInside(t, arrived, 2)
+	close(release)
+
+	// 两个都要正常收尾、都要落库，而且各自只看得到自己的
+	for name, c := range map[string]struct {
+		cli  *http.Client
+		resp *http.Response
+		q    string
+	}{"alice": {alice, ra, "alice 的问题"}, "bob": {bob, rb, "bob 的问题"}} {
+		evs := drain(c.resp)
+		if len(evs) == 0 || evs[len(evs)-1].T != "done" {
+			t.Errorf("%s 的流没有以 done 收尾：%+v", name, evs)
+			continue
+		}
+		var list []Session
+		getJSON(t, c.cli, srv.URL+"/api/sessions", &list)
+		if len(list) != 1 || list[0].Title != c.q {
+			t.Errorf("%s 的会话列表不对（并发时串台了？）：%+v", name, list)
+		}
+	}
+}
+
+// ★ 同一个人开两个会话同时问——现在也允许。
+//
+// 登记表只认会话 id，没有「每个用户最多几个」。要加的话在 app::registry
+// 的 admit 里多检查一项，这条测试会提醒你改。
+func TestOneUserTwoSessionsAtTheSameTime(t *testing.T) {
+	release := make(chan struct{})
+	arrived := make(chan int, 8)
+	model := countingModel(t, release, arrived)
+	defer model.Close()
+
+	srv := startServer(t, model.URL)
+	me := register(t, srv, "multitab")
+
+	r1 := postChat(t, me, srv, "", "第一个会话的问题")
+	defer r1.Body.Close()
+	r2 := postChat(t, me, srv, "", "第二个会话的问题")
+	defer r2.Body.Close()
+	if r1.StatusCode != http.StatusOK || r2.StatusCode != http.StatusOK {
+		t.Fatalf("两个会话同时提问：%d / %d，期望都是 200", r1.StatusCode, r2.StatusCode)
+	}
+	s1, s2 := readUntilHello(t, r1), readUntilHello(t, r2)
+	if s1 == s2 {
+		t.Fatal("两个新会话拿到了同一个 id")
+	}
+
+	waitAllInside(t, arrived, 2)
+	close(release)
+	drain(r1)
+	drain(r2)
+
+	// 两轮都落库了，各在各的会话里
+	for sid, want := range map[string]string{s1: "第一个会话的问题", s2: "第二个会话的问题"} {
+		var msgs []Message
+		getJSON(t, me, srv.URL+"/api/sessions/"+sid, &msgs)
+		if len(msgs) != 2 || msgs[0].Text != want || !strings.Contains(msgs[1].Text, fakeAnswer) {
+			t.Errorf("会话 %s 的记录不对：%+v", sid[:8], msgs)
+		}
 	}
 }
 

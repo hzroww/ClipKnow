@@ -32,6 +32,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -99,7 +100,35 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, u *Account) 
 		return
 	}
 	defer upstream.Body.Close()
+	pipeSSE(w, flusher, upstream.Body)
+}
 
+// GET /api/sessions/{id}/events —— 接着看一个正在跑的提问。
+//
+// 刷新页面、或者在另一个标签页打开同一个会话时，前端调这个。agent 那边
+// 会先把这一轮已经发过的事件从第一条补发一遍，再接着实时推，直到结束。
+//
+// 没在跑（多半是刚答完）时 agent 回 404，原样转给前端；前端看到非 200
+// 就去拉一遍聊天记录——答案那时已经在库里了。
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, u *Account) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "这个环境不支持流式响应", http.StatusInternalServerError)
+		return
+	}
+	upstream, err := s.agent.StreamEvents(u.ID, r.PathValue("id"))
+	if err != nil {
+		writeAgentError(w, err)
+		return
+	}
+	defer upstream.Body.Close()
+	pipeSSE(w, flusher, upstream.Body)
+}
+
+// 把 agent 的 SSE 一行一行原样转给浏览器。提问和「接着看」共用。
+//
+// 调用前**还没有**写任何响应头——拒绝要用 HTTP 状态码表达，只能在这之前。
+func pipeSSE(w http.ResponseWriter, flusher http.Flusher, upstream io.Reader) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -108,10 +137,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, u *Account) 
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	sc := bufio.NewScanner(upstream.Body)
+	sc := bufio.NewScanner(upstream)
 	sc.Buffer(make([]byte, 0, 64<<10), maxLine)
 
-	clientGone := false
 	// 最后一条 **data** 行。流结束后解析它一次，看是不是正常收尾。
 	//
 	// ★ 只记 data 行，不是"最后一行"：SSE 里还有心跳注释行（`:`，Rust 每
@@ -124,26 +152,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, u *Account) 
 		if payload, ok := strings.CutPrefix(line, "data: "); ok {
 			lastData = payload
 		}
-		if clientGone {
-			// ★ 浏览器断了也要**继续读**上游。
-			//   不读的话 TCP 接收窗口很快满，Rust 那边的 SSE 写入被堵住，
-			//   有界队列跟着满，进度事件开始被丢——那一轮还是会跑完落库，
-			//   但白白丢了一堆进度。读完它成本几乎为零。
-			continue
-		}
 		// 原样转发，包括心跳注释行——前端本来就只认 `data: ` 开头的行。
 		if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
-			clientGone = true
-			log.Printf("浏览器断开，agent 那边继续跑完")
-			continue
+			// ★ 浏览器断了就直接走，**不再**替它把上游读完。
+			//
+			//   以前必须读完：事件是 Rust 边产生边塞进一个有界队列发给这一个
+			//   连接的，这边不读，那边队列满了就开始丢进度。现在事件先记在
+			//   Rust 那边的事件记录里（app::live），和有没有人在读完全无关——
+			//   这边一关，Rust 那边负责这个连接的转发任务就退出了，agent 循环
+			//   照跑、照落库，刷新后的页面还能从头补发。
+			log.Printf("浏览器断开，agent 那边继续跑完（刷新后可以接着看）")
+			return
 		}
 		flusher.Flush()
 	}
 	if err := sc.Err(); err != nil {
 		log.Printf("读 agent 的流出错: %v", err)
-		if !clientGone {
-			emitError(w, flusher, "读分析服务的输出出错: "+err.Error())
-		}
+		emitError(w, flusher, "读分析服务的输出出错: "+err.Error())
 		return
 	}
 
@@ -151,7 +176,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, u *Account) 
 	//
 	//   原来的行为实测过：接口返回 200 OK、响应体 0 字节，页面只是把进度
 	//   收起来，什么都不说——「跑完了但没答案」和「崩了」长得一模一样。
-	if !clientGone && !endedProperly(lastData) {
+	if !endedProperly(lastData) {
 		emitError(w, flusher, "分析服务的响应中断了，这一轮没有正常结束")
 	}
 }

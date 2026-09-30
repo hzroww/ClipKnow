@@ -116,6 +116,51 @@ impl SqliteStore {
 ///
 /// `ALTER TABLE ADD COLUMN` 在 SQLite 里不支持 IF NOT EXISTS，所以先查 PRAGMA。
 /// 和 001 那批不一样——那些是 CREATE TABLE IF NOT EXISTS，重复跑没事。
+/// 把一轮的条目写进 items 表。`skip_user` 为真时跳过用户的问题——
+/// finish_turn 用：问题已经在 begin_turn 里写过了，再写一遍会撞唯一约束。
+fn insert_items(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    items: &[Item],
+    ts: i64,
+    skip_user: bool,
+) -> Result<()> {
+    for it in items {
+        if skip_user && it.kind == ItemKind::UserMessage {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO items
+             (id, turn_id, idx, item_type, iteration, call_id, payload_json, raw_json, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                new_id(),
+                turn_id,
+                it.idx,
+                it.kind.as_str(),
+                it.iteration,
+                it.call_id,
+                it.payload.to_string(),
+                it.raw_json,
+                ts
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// 把会话的「最后活动时间」推到现在。会话列表按它倒序。
+///
+/// 放在写 turn 的**同一个事务**里：turn 存进去了但活动时间没推，列表顺序
+/// 就是错的——昨天建、今天聊了一下午的会话会排在今天刚建的空会话下面。
+fn touch_session(tx: &rusqlite::Transaction<'_>, session_id: &str, ts: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+        params![session_id, ts],
+    )?;
+    Ok(())
+}
+
 /// 开一个**要写**的事务。凡是「先读、再写」的事务都必须用它。
 ///
 /// ## 为什么不能用默认的 `transaction()`
@@ -559,6 +604,23 @@ impl SqliteStore {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// 这个用户的会话里，哪些有一轮正在跑。会话列表上打个标记用。
+    ///
+    /// 查的是库里的 status='running'，不是进程内存里的登记表：库是持久的
+    /// 真相，命令行跑的、别的浏览器标签页发起的都算进去。
+    pub fn running_sessions_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT t.session_id FROM turns t
+             JOIN sessions s ON s.id = t.session_id
+             WHERE s.user_id = ?1 AND t.status = 'running'",
+        )?;
+        let rows = stmt.query_map(params![user_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// 这个会话是不是这个用户的（且没被软删）。
     ///
     /// 「不存在」和「是别人的」返回同一个 false——调用方一律按未找到处理。
@@ -583,12 +645,13 @@ impl SqliteStore {
     /// 答案」这条投影规则不在这里做，在 app::sessions 里——那是业务规则，
     /// 不是存储格式。
     ///
-    /// 返回 `(seq, 这一轮是不是正常收场, 条目类型, 正文)`。
+    /// 返回 `(seq, 这一轮的状态, 条目类型, 正文)`。状态是库里的原样字符串：
+    /// done / failed / running / interrupted。
     pub fn ui_items_for_user(
         &self,
         user_id: &str,
         session_id: &str,
-    ) -> Result<Vec<(i64, bool, String, String)>> {
+    ) -> Result<Vec<(i64, String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.seq, t.status, i.item_type, i.payload_json
              FROM turns t
@@ -610,7 +673,7 @@ impl SqliteStore {
                 .ok()
                 .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from))
                 .unwrap_or_default();
-            Ok((seq, status == TurnStatus::Done.as_str(), kind, text))
+            Ok((seq, status, kind, text))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -658,39 +721,119 @@ impl SqliteStore {
              VALUES (?1,?2,?3,?4,?5,?6)",
             params![turn_id, session_id, seq, model, status.as_str(), ts],
         )?;
-        for it in items {
-            tx.execute(
-                "INSERT INTO items
-                 (id, turn_id, idx, item_type, iteration, call_id, payload_json, raw_json, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![
-                    new_id(),
-                    turn_id,
-                    it.idx,
-                    it.kind.as_str(),
-                    it.iteration,
-                    it.call_id,
-                    it.payload.to_string(),
-                    it.raw_json,
-                    ts
-                ],
-            )?;
-        }
-        // ★ 顺手把会话的「最后活动时间」推到现在。
-        //
-        //   会话列表按 updated_at 倒序（migrations/agent/007 里那个
-        //   idx_sessions_user_updated 索引就是为它建的）。不更新的话，
-        //   updated_at 永远停在建会话那一刻——昨天建的会话今天聊了一下午，
-        //   在列表里还是排在今天刚建、一句没说的那个下面。
-        //
-        //   放在同一个事务里：turn 存进去了但活动时间没推，列表就是错的。
-        tx.execute(
-            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-            params![session_id, ts],
-        )?;
-
+        insert_items(&tx, &turn_id, items, ts, false)?;
+        touch_session(&tx, session_id, ts)?;
         tx.commit()?;
         Ok(turn_id)
+    }
+
+    // ── 两段式落库：网页那条路用 ─────────────────────────────
+    //
+    // `save_turn` 是一轮答完之后一次性写进去。问题是**跑的过程中库里什么
+    // 都没有**：实测跑到一半刷新页面，连自己问的问题都看不到，会话连标题
+    // 都没有——看起来像「问题全丢了」，其实只是还没写。
+    //
+    // 拆成两段：
+    //   begin_turn   提问一被接受就写：一行 status='running' + 用户的问题 + 标题
+    //   finish_turn  答完再写：其余条目追加进去，状态改成终态
+    //
+    // 给模型拼历史的查询**只认 status='done'**（load_turns_with_items 等），
+    // 所以 running 的这一轮不会混进下一次提问的上下文。
+
+    /// 提问被接受时调用。写一行 running 的 turn 和用户的问题，返回 (turn_id, seq)。
+    ///
+    /// `title` 只在会话还没有标题时写——也就是第一次提问。
+    pub fn begin_turn(
+        &mut self,
+        session_id: &str,
+        model: &str,
+        question: &str,
+        title: &str,
+    ) -> Result<(String, i64)> {
+        let turn_id = new_id();
+        let ts = now_ts();
+        let tx = write_tx(&mut self.conn)?;
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO turns (id, session_id, seq, model, status, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                turn_id,
+                session_id,
+                seq,
+                model,
+                TurnStatus::Running.as_str(),
+                ts
+            ],
+        )?;
+        // ★ 和循环里 `Item::user_message(1, question)` 那一条**完全一样**
+        //   （同一个构造函数、同一个 idx）。finish_turn 追加时会跳过
+        //   UserMessage，所以不会存两遍。
+        insert_items(&tx, &turn_id, &[Item::user_message(1, question)], ts, false)?;
+        tx.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1 AND (title IS NULL OR title = '')",
+            params![session_id, title],
+        )?;
+        touch_session(&tx, session_id, ts)?;
+        tx.commit()?;
+        Ok((turn_id, seq))
+    }
+
+    /// 一轮跑完时调用。把其余条目追加进去，状态从 running 改成终态。
+    ///
+    /// ★ `WHERE status = 'running'` 是保护：这一轮如果已经被改成别的状态
+    ///   （比如服务重启时被标成 interrupted），这里**不覆盖**，直接报错。
+    ///   两个终态互相覆盖的话，库里的状态就不可信了。
+    pub fn finish_turn(
+        &mut self,
+        turn_id: &str,
+        session_id: &str,
+        status: TurnStatus,
+        items: &[Item],
+    ) -> Result<()> {
+        let ts = now_ts();
+        let tx = write_tx(&mut self.conn)?;
+        let n = tx.execute(
+            "UPDATE turns SET status = ?2 WHERE id = ?1 AND status = 'running'",
+            params![turn_id, status.as_str()],
+        )?;
+        if n != 1 {
+            // 事务没提交，Drop 时自动回滚
+            return Err(crate::error::ClipKnowError::BadRequest(format!(
+                "这一轮已经不在 running 状态了（turn {turn_id}），不覆盖"
+            )));
+        }
+        insert_items(&tx, turn_id, items, ts, true)?;
+        touch_session(&tx, session_id, ts)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 把还停在 running 的轮次改成 interrupted，返回改了几条。
+    ///
+    /// 两个用处：
+    ///   - `session = None`：`clipknow serve` 启动时。上一次进程没正常收尾
+    ///     （崩溃、被 kill -9）留下的 running 就是这么来的。
+    ///   - `session = Some(id)`：一次执行 panic 或者落库失败之后收拾残局，
+    ///     免得界面上永远显示「正在回答」。
+    ///
+    /// ⚠️ 假设同一个库只有一个 `serve` 在跑。两个的话，一个启动时会把另一个
+    ///    正在跑的标成中断——设计文档第 8 节说过，那得先有单实例锁。
+    pub fn interrupt_running(&mut self, session: Option<&str>) -> Result<usize> {
+        let n = match session {
+            Some(sid) => self.conn.execute(
+                "UPDATE turns SET status = 'interrupted' WHERE status = 'running' AND session_id = ?1",
+                params![sid],
+            )?,
+            None => self
+                .conn
+                .execute("UPDATE turns SET status = 'interrupted' WHERE status = 'running'", [])?,
+        };
+        Ok(n)
     }
 
     /// 重建对话历史。跨 turn 按 `(turns.seq, items.idx)` 接起来。
@@ -777,6 +920,30 @@ impl SqliteStore {
     /// 真实代码里没有「让上传引用提前过期」或「改 provider」这种操作——
     /// 那是时间和配置的产物。但要测「引用死了之后会怎样」，必须能造出
     /// 那个状态。`cfg(test)` 保证它不会漏进生产路径。
+    /// 测试用：不管归属，直接读界面条目（字段同 ui_items_for_user）。
+    #[cfg(test)]
+    pub(crate) fn ui_items_for_user_unchecked_for_test(
+        &self,
+        session_id: &str,
+    ) -> Vec<(i64, String, String, String)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT t.seq, t.status, i.item_type, json_extract(i.payload_json, '$.text')
+                 FROM turns t JOIN items i ON i.turn_id = t.id
+                 WHERE t.session_id = ?1
+                   AND i.item_type IN ('user_message', 'assistant_message')
+                 ORDER BY t.seq, i.idx",
+            )
+            .unwrap();
+        stmt.query_map(params![session_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    }
+
     #[cfg(test)]
     pub(crate) fn exec_for_test(&mut self, sql: &str) -> Result<()> {
         self.conn.execute(sql, [])?;
@@ -1019,11 +1186,7 @@ impl SqliteStore {
                 id: r.get(0)?,
                 seq: r.get(1)?,
                 model: r.get(2)?,
-                status: if st == "done" {
-                    TurnStatus::Done
-                } else {
-                    TurnStatus::Failed(st)
-                },
+                status: TurnStatus::from_db(&st),
                 created_at: r.get(4)?,
             })
         })?;
@@ -1049,6 +1212,162 @@ impl SqliteStore {
         )?;
         let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+}
+
+#[cfg(test)]
+mod two_phase_tests {
+    //! 两段式落库：提问一被接受就写问题，答完再补其余的。
+
+    use super::*;
+    use crate::content::model::{Item, ItemKind, TurnStatus};
+
+    fn store_with_session() -> (SqliteStore, String) {
+        let mut s = SqliteStore::in_memory().unwrap();
+        let sid = s.create_session(None, None).unwrap();
+        (s, sid)
+    }
+
+    /// 循环跑完之后交回来的那一串条目：问题 + 最终答案。
+    fn loop_items(q: &str, a: &str) -> Vec<Item> {
+        vec![Item::user_message(1, q), Item::assistant_message(2, 1, a)]
+    }
+
+    /// ★ 刚开始跑，库里就已经有问题了——这是「刷新后问题全不见了」的修法。
+    #[test]
+    fn 开始跑时问题和标题就已经在库里() {
+        let (mut s, sid) = store_with_session();
+        s.begin_turn(&sid, "m", "这条视频讲什么", "这条视频讲什么")
+            .unwrap();
+
+        let turns = s.list_turns(&sid).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert!(matches!(turns[0].status, TurnStatus::Running));
+        let ui = s.ui_items_for_user_unchecked_for_test(&sid);
+        assert_eq!(
+            ui,
+            vec![(
+                1,
+                "running".into(),
+                "user_message".into(),
+                "这条视频讲什么".into()
+            )]
+        );
+        assert_eq!(
+            s.count_for_test("SELECT count(*) FROM sessions WHERE title = '这条视频讲什么'")
+                .unwrap(),
+            1,
+            "标题没在开始时写上"
+        );
+    }
+
+    /// ★ 跑着的这一轮绝不能混进**给模型的**历史里。
+    ///
+    /// 否则同一个会话接下来那一问（或者并发的另一问），会看到一个没有答案
+    /// 的问题，模型会以为自己漏答了。
+    #[test]
+    fn 跑着的一轮不进模型的历史() {
+        let (mut s, sid) = store_with_session();
+        s.save_turn(&sid, "m", TurnStatus::Done, &loop_items("老问题", "老答案"))
+            .unwrap();
+        s.begin_turn(&sid, "m", "新问题", "t").unwrap();
+        let h = s.load_turns_with_items(&sid).unwrap();
+        assert_eq!(h.turns.len(), 1, "running 的那一轮混进了给模型的历史");
+        assert_eq!(s.load_history(&sid).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn 答完后补上其余条目_问题不重复() {
+        let (mut s, sid) = store_with_session();
+        let (tid, seq) = s.begin_turn(&sid, "m", "问", "问").unwrap();
+        assert_eq!(seq, 1);
+        s.finish_turn(&tid, &sid, TurnStatus::Done, &loop_items("问", "答"))
+            .unwrap();
+
+        let n_user = s
+            .count_for_test("SELECT count(*) FROM items WHERE item_type = 'user_message'")
+            .unwrap();
+        assert_eq!(n_user, 1, "用户的问题被存了两遍");
+        let h = s.load_turns_with_items(&sid).unwrap();
+        assert_eq!(h.turns.len(), 1, "答完之后该进历史了");
+        assert_eq!(h.turns[0].items.len(), 2);
+    }
+
+    /// ★ 已经被标成中断的一轮，不能再被「答完」覆盖回 done。
+    ///
+    /// 两个终态互相覆盖，库里的状态就不可信了。
+    #[test]
+    fn 已中断的一轮不能再被收尾覆盖() {
+        let (mut s, sid) = store_with_session();
+        let (tid, _) = s.begin_turn(&sid, "m", "问", "问").unwrap();
+        assert_eq!(s.interrupt_running(None).unwrap(), 1);
+        let e = s
+            .finish_turn(&tid, &sid, TurnStatus::Done, &loop_items("问", "答"))
+            .unwrap_err();
+        assert!(e.to_string().contains("不在 running"), "{e}");
+        // 事务回滚了：答案没被写进去
+        assert_eq!(
+            s.count_for_test("SELECT count(*) FROM items WHERE item_type = 'assistant_message'")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn 收拾残局只动指定会话() {
+        let mut s = SqliteStore::in_memory().unwrap();
+        let a = s.create_session(None, None).unwrap();
+        let b = s.create_session(None, None).unwrap();
+        s.begin_turn(&a, "m", "a", "a").unwrap();
+        s.begin_turn(&b, "m", "b", "b").unwrap();
+        assert_eq!(s.interrupt_running(Some(&a)).unwrap(), 1);
+        assert_eq!(
+            s.count_for_test("SELECT count(*) FROM turns WHERE status = 'running'")
+                .unwrap(),
+            1,
+            "别的会话正在跑的那一轮被误伤了"
+        );
+    }
+
+    #[test]
+    fn 标题只在第一次写() {
+        let (mut s, sid) = store_with_session();
+        let (t1, _) = s.begin_turn(&sid, "m", "第一问", "第一问").unwrap();
+        s.finish_turn(&t1, &sid, TurnStatus::Done, &loop_items("第一问", "答"))
+            .unwrap();
+        s.begin_turn(&sid, "m", "第二问", "第二问").unwrap();
+        assert_eq!(
+            s.count_for_test("SELECT count(*) FROM sessions WHERE title = '第一问'")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn 会话列表知道哪个会话在跑() {
+        let mut s = SqliteStore::in_memory().unwrap();
+        s.exec_for_test(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash,
+                                status, created_at, updated_at)
+             VALUES ('u','u','u','x','active',0,0)",
+        )
+        .unwrap();
+        let a = s.create_session(None, Some("u")).unwrap();
+        let _b = s.create_session(None, Some("u")).unwrap();
+        s.begin_turn(&a, "m", "q", "q").unwrap();
+        let running = s.running_sessions_for_user("u").unwrap();
+        assert_eq!(running.len(), 1);
+        assert!(running.contains(&a));
+    }
+
+    #[test]
+    fn 用户问题的条目和循环里建的那条一模一样() {
+        // begin_turn 写的那条，和循环自己建的 Item::user_message(1, q) 必须
+        // 一致——finish_turn 靠「跳过 UserMessage」去重，两边对不上的话，
+        // 下次读历史时模型看到的问题会和存进去的不一样。
+        let it = Item::user_message(1, "q");
+        assert_eq!(it.kind, ItemKind::UserMessage);
+        assert_eq!(it.idx, 1);
     }
 }
 

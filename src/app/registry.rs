@@ -41,6 +41,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use super::live::LiveTurn;
+
 /// 默认最多同时跑几个提问（全局）。`clipknow serve --max-turns` 可改。
 ///
 /// 4 不是算出来的，是「够测并发、又不至于一不小心把内存吃光」的折中：
@@ -84,10 +86,17 @@ impl Reject {
     }
 }
 
+/// 一个正在跑的执行。
+struct Running {
+    started: Instant,
+    /// 这一轮发过的全部事件。刷新后的页面从这里补发、接着看。
+    live: Arc<LiveTurn>,
+}
+
 #[derive(Default)]
 struct Inner {
-    /// session_id → 这次执行是什么时候开始的
-    running: HashMap<String, Instant>,
+    /// session_id → 正在跑的那一轮
+    running: HashMap<String, Running>,
     /// 收到停机信号之后变 false，之后一律拒绝。
     accepting: bool,
 }
@@ -140,16 +149,16 @@ impl Registry {
         if !inner.accepting {
             return Err(Reject::ShuttingDown);
         }
-        if let Some(started) = inner.running.get(session_id) {
+        if let Some(r) = inner.running.get(session_id) {
             return Err(Reject::SessionBusy {
-                elapsed: started.elapsed(),
+                elapsed: r.started.elapsed(),
             });
         }
         if inner.running.len() >= self.max_total {
             let oldest = inner
                 .running
                 .values()
-                .map(|t| t.elapsed())
+                .map(|r| r.started.elapsed())
                 .max()
                 .unwrap_or_default();
             return Err(Reject::Capacity {
@@ -157,11 +166,29 @@ impl Registry {
                 elapsed: oldest,
             });
         }
-        inner.running.insert(session_id.to_string(), Instant::now());
+        let live = LiveTurn::new();
+        inner.running.insert(
+            session_id.to_string(),
+            Running {
+                started: Instant::now(),
+                live: Arc::clone(&live),
+            },
+        );
         Ok(Permit {
             registry: Arc::clone(self),
             session_id: session_id.to_string(),
+            live,
         })
+    }
+
+    /// 这个会话正在跑的那一轮的事件记录。没在跑返回 None。
+    ///
+    /// 刷新后的页面靠它「接着看」：拿到之后从第一条开始补发。
+    pub fn live(&self, session_id: &str) -> Option<Arc<LiveTurn>> {
+        self.lock()
+            .running
+            .get(session_id)
+            .map(|r| Arc::clone(&r.live))
     }
 
     /// 现在有几个在跑。`/internal/health` 用它。
@@ -206,11 +233,17 @@ impl Registry {
 pub struct Permit {
     registry: Arc<Registry>,
     session_id: String,
+    live: Arc<LiveTurn>,
 }
 
 impl Permit {
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// 这一轮的事件记录。执行过程把事件写进这里，订阅者从这里读。
+    pub fn live(&self) -> Arc<LiveTurn> {
+        Arc::clone(&self.live)
     }
 }
 
@@ -232,6 +265,10 @@ impl Eq for Permit {}
 
 impl Drop for Permit {
     fn drop(&mut self) {
+        // ★ 兜底收尾：执行任务正常会自己调 finish，但它要是 panic 了，
+        //   订阅者会永远等下一条事件。名额归还的那一刻一定是这一轮彻底
+        //   结束了，在这里再收一次尾（finish 调多次没关系）。
+        self.live.finish();
         self.registry.lock().running.remove(&self.session_id);
     }
 }
@@ -298,6 +335,28 @@ mod tests {
         let _a = reg.admit("s1").unwrap();
         let _b = reg.admit("s2").expect("不同会话不该互相挡");
         assert!(matches!(reg.admit("s1"), Err(Reject::SessionBusy { .. })));
+    }
+
+    #[test]
+    fn 在跑的会话能拿到事件记录_跑完就没了() {
+        let reg = Registry::with_capacity(4);
+        assert!(reg.live("s1").is_none());
+        let p = reg.admit("s1").unwrap();
+        let live = reg.live("s1").expect("在跑却拿不到事件记录");
+        assert!(Arc::ptr_eq(&live, &p.live()), "拿到的不是同一份记录");
+        drop(p);
+        assert!(reg.live("s1").is_none());
+    }
+
+    /// 名额还回去的时候，事件记录一定被标成结束——不然订阅者会一直等。
+    #[test]
+    fn 名额归还时事件记录跟着收尾() {
+        let reg = Registry::with_capacity(4);
+        let p = reg.admit("s1").unwrap();
+        let live = p.live();
+        assert!(!live.read_from(0).1);
+        drop(p);
+        assert!(live.read_from(0).1, "名额还了，订阅者却还会等下去");
     }
 
     /// ★ 执行 panic 了，名额也必须还回去。

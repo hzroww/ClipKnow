@@ -145,6 +145,7 @@ type Session struct {
 	ID        string `json:"id"`
 	Title     string `json:"title"`
 	CreatedAt int64  `json:"created_at"`
+	Running   bool   `json:"running"` // 这个会话里有一轮正在跑
 }
 
 // 聊天记录里的一条。对应 app::sessions::UiMessage。
@@ -153,6 +154,10 @@ type Message struct {
 	Text   string `json:"text"`
 	Seq    int64  `json:"seq"`
 	Failed bool   `json:"failed"` // 这一轮是失败收场的
+	// 下面两个只出现在**占位**的 assistant 消息上（text 为空）：
+	// 这一轮还在跑 / 跑到一半服务停了。前端看到 running 就去订阅事件流接着看。
+	Running     bool `json:"running"`
+	Interrupted bool `json:"interrupted"`
 }
 
 // 这个用户的会话，最近有活动的排前面。
@@ -273,6 +278,33 @@ func (c *AgentClient) StartTurn(userID, sessionID, question, provider string) (*
 		defer resp.Body.Close()
 		// 流还没开始，拒绝走 HTTP 状态码——400 参数错 / 404 不是你的会话 /
 		// 409 这个会话在跑 / 503 名额满。
+		return nil, readAgentError(resp)
+	}
+	return resp, nil
+}
+
+// 接着看一个正在跑的提问。返回一个**还没读完**的 SSE 响应，调用方负责读完并关掉。
+//
+// 和 StartTurn 用同一个没有总超时的客户端：一轮可能还要跑好几分钟。
+// 没在跑时 agent 回 404（code = no_running_turn），这里转成 agentError。
+func (c *AgentClient) StreamEvents(userID, sessionID string) (*http.Response, error) {
+	tok, err := c.signer.sign(userID)
+	if err != nil {
+		return nil, err
+	}
+	u := c.base + "/internal/sessions/" + url.PathEscape(sessionID) + "/events"
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := c.stream.Do(req)
+	if err != nil {
+		return nil, &agentDownError{err}
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
 		return nil, readAgentError(resp)
 	}
 	return resp, nil

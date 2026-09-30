@@ -108,6 +108,8 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/me", s.handleMe)
 	mux.HandleFunc("/api/sessions", s.needAuth(s.handleSessions))
 	mux.HandleFunc("/api/sessions/", s.needAuth(s.handleHistory))
+	// 比上面那条前缀更具体，所以 /api/sessions/<id>/events 会落到这里
+	mux.HandleFunc("GET /api/sessions/{id}/events", s.needAuth(s.handleEvents))
 	mux.HandleFunc("/api/chat", s.needAuth(s.handleChat))
 	// 登录页本身不设防——它就是那个输用户名密码的地方
 	mux.HandleFunc("/", s.handleIndex)

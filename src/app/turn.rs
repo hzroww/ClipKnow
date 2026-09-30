@@ -74,11 +74,27 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
         vision_ref.map(|v| v.model_name()),
     ));
 
+    // ★ 历史在 begin_turn **之前**读。反过来也不会出错（读历史只认
+    //   status='done'，running 的这一轮本来就进不去），但先读后写让「这一轮
+    //   看不到它自己」这件事不依赖那个过滤条件。
     let history = match store.load_turns_with_items(req.session_id) {
         Ok(h) => h,
         Err(e) => bail!(e),
     };
-    let is_first_turn = history.is_empty();
+
+    // ★ 提问一被接受就先写库：一行 running 的 turn + 用户的问题 + 标题。
+    //
+    //   以前是整轮答完才写。实测：跑到一半刷新页面，连自己问的问题都看不到，
+    //   会话连标题都没有——看起来像「问题全丢了」，其实只是还没写。
+    let (turn_id, _seq) = match store.begin_turn(
+        req.session_id,
+        llm.model_name(),
+        req.question,
+        &truncate_chars(req.question, 40),
+    ) {
+        Ok(t) => t,
+        Err(e) => bail!(e),
+    };
 
     let res = run_turn_observed(
         TurnDeps {
@@ -93,16 +109,19 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
         sink,
     );
 
-    // ★ 落库在推 usage/done **之前**：收到 done 的那一方（Go / 前端 / evals）
-    //   会立刻去刷会话历史，那时候这一轮必须已经在库里了。
-    if let Err(e) = persist_turn(
-        store,
-        llm.model_name(),
-        req.session_id,
-        req.question,
-        is_first_turn,
-        &res,
-    ) {
+    // ★ 收尾落库在推 usage/done **之前**：收到 done 的那一方（Go / 前端 /
+    //   evals）会立刻去刷会话历史，那时候这一轮必须已经是终态了。
+    //
+    //   和 persist_turn 的一处不同：上下文闸门那一轮（ContextBudget）
+    //   persist_turn 什么都不落，这里**标成失败**。因为问题已经在 begin_turn
+    //   里写进去了，不收尾的话它会永远显示「正在回答」。
+    let finished = store
+        .finish_turn(&turn_id, req.session_id, final_status(&res), &res.items)
+        .and_then(|()| match &res.pending_summary {
+            Some((text, upto)) => store.save_compaction(req.session_id, text, *upto),
+            None => Ok(()),
+        });
+    if let Err(e) = finished {
         sink.emit_json(&error_json(&format!("写库失败: {e}")));
         return Err(e);
     }
@@ -134,9 +153,27 @@ pub fn parse_provider(s: Option<&str>) -> Result<Option<Provider>> {
     }
 }
 
+/// 一轮的结局 → 库里的终态。两条落库路径（persist_turn 和 execute）共用。
+///
+/// 除了 Done 以外全算失败：残缺的答案不能标成成功，不然下一次提问的
+/// 历史里会带着半句话。
+fn final_status(res: &TurnResult) -> TurnStatus {
+    match &res.outcome {
+        TurnOutcome::Done => TurnStatus::Done,
+        TurnOutcome::IterationCap => TurnStatus::Failed("超过迭代上限".into()),
+        TurnOutcome::Truncated => TurnStatus::Failed("回答被长度上限截断".into()),
+        TurnOutcome::ProtocolError(e) => TurnStatus::Failed(format!("协议异常: {e}")),
+        TurnOutcome::ContextBudget { .. } => TurnStatus::Failed("上下文预算不足".into()),
+        TurnOutcome::ModelError(e) => TurnStatus::Failed(format!("模型调用失败: {e}")),
+    }
+}
+
 /// 把一次 turn 的结果落库。
 ///
-/// CLI（`one_turn`）和 web 子进程（`cmd_turn_json`）共用**同一份**。两处各写
+/// **命令行交互模式（`clipknow find` / `ask`）用。** 网页和 `clipknow turn`
+/// 走的是 [`execute`] 里的两段式落库（begin_turn / finish_turn）。
+///
+/// 两处各写
 /// 一遍必然漂移，而这里的规则都是有不变量的：
 ///   - 失败的 turn 也要落库（`load_history` 那边会跳过它，但历史本身要完整）
 ///   - 摘要必须在 `save_turn` **之后**写：它挂在最新那个 turn 上，
@@ -150,20 +187,10 @@ pub fn persist_turn(
     is_first_turn: bool,
     res: &TurnResult,
 ) -> Result<()> {
-    let status = match &res.outcome {
-        TurnOutcome::Done => TurnStatus::Done,
-        TurnOutcome::IterationCap => TurnStatus::Failed("超过迭代上限".into()),
-        // 残缺的答案不能标成成功：下次 --continue 时历史里会带着半句话
-        TurnOutcome::Truncated => TurnStatus::Failed("回答被长度上限截断".into()),
-        TurnOutcome::ProtocolError(e) => TurnStatus::Failed(format!("协议异常: {e}")),
-        TurnOutcome::ContextBudget { .. } => TurnStatus::Failed("上下文预算不足".into()),
-        TurnOutcome::ModelError(e) => TurnStatus::Failed(format!("模型调用失败: {e}")),
-    };
-
     if matches!(res.outcome, TurnOutcome::ContextBudget { .. }) {
         return Ok(());
     }
-    store.save_turn(session_id, model, status, &res.items)?;
+    store.save_turn(session_id, model, final_status(res), &res.items)?;
     if let Some((text, upto)) = &res.pending_summary {
         store.save_compaction(session_id, text, *upto)?;
     }

@@ -333,6 +333,15 @@ impl ItemKind {
 pub enum TurnStatus {
     Done,
     Failed(String),
+    /// 已经被接受、正在跑。提问一被接受就先写一行这个状态（连同用户的问题），
+    /// 这样跑到一半刷新页面也能看到问题，而不是一片空白。
+    ///
+    /// ★ 给模型拼历史的查询**只认 `done`**，所以跑着的这一轮不会混进
+    ///   别的提问的上下文里。
+    Running,
+    /// 跑到一半服务停了（崩溃、被杀）。重启时由 `running` 改成这个。
+    /// 问题还在，答案没有；不自动重跑——外部调用可能已经花过钱了。
+    Interrupted,
 }
 
 impl TurnStatus {
@@ -340,6 +349,19 @@ impl TurnStatus {
         match self {
             TurnStatus::Done => "done",
             TurnStatus::Failed(_) => "failed",
+            TurnStatus::Running => "running",
+            TurnStatus::Interrupted => "interrupted",
+        }
+    }
+
+    /// 库里的字符串 → 状态。认不出的一律当失败——宁可把一轮错标成失败
+    /// （界面上多一句提示），也不能把它错当成成功塞进模型的上下文。
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "done" => TurnStatus::Done,
+            "running" => TurnStatus::Running,
+            "interrupted" => TurnStatus::Interrupted,
+            other => TurnStatus::Failed(other.to_string()),
         }
     }
 }

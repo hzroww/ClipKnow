@@ -50,6 +50,7 @@
   .sess:hover { background: var(--line-soft); }
   .sess.on { background: var(--line-soft); color: var(--ink); font-weight: 500; }
   .sess .when { display: block; font-size: 11px; color: var(--soft); font-weight: 400; }
+  .sess .busy { display: block; font-size: 11px; color: var(--soft); font-weight: 400; }
 
   /* ── 右：聊天 ─────────────────────────── */
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -307,8 +308,24 @@ const ANSWER_SIGNATURE = '你好呀 我叫王浩宇 是个扫0 很开心为你�
 const $ = s => document.querySelector(s);
 const log = $('#log'), qBox = $('#q'), sendBtn = $('#send'), hint = $('#hint');
 
-let sessionId = null;   // null = 下一次提问会新建一个会话
-let busy = false;
+let sessionId = null;   // 当前**显示着**的会话。null = 新会话（下一次提问会新建一个）
+
+// ── 一轮一个「运行」──────────────────────
+//
+// 以前整个页面只有一个全局的「正在忙」开关：一个问题在跑，就不让切会话、
+// 不让开新会话。原因是所有画东西的代码都往「当前显示的会话」里画——
+// 切走了，A 会话的答案会一个字一个字冒到 B 会话的屏幕上。
+//
+// 现在每一轮提问有自己的「运行」（run）：它的全部显示（问题、进度、流式
+// 气泡、用量）都画在它自己的 run.box 里。
+//   正在看这个会话   → run.box 挂在 #log 里，看得见
+//   切走了           → run.box 从页面上摘下来，但还在后台继续收事件、继续画
+//   切回来           → 把 run.box 重新挂上
+// 于是切会话、开新会话都随时可以；只有「当前看着的这个会话正在跑」时，
+// 发送按钮才变灰（同一个会话一次只能问一个，后端也会拒）。
+const runs = new Map();    // 会话 id → 这个标签页里正在收事件的 run
+const active = new Set();  // 所有还没结束的 run（包括还没收到 hello、不知道会话 id 的）
+let navSeq = 0;            // 快速连点两个会话时，作废先点的那个还没回来的请求
 
 // ── 事件 → 人话 ──────────────────────────
 const TOOL_NAME = {
@@ -467,7 +484,8 @@ function el(tag, cls, text) {
   return e;
 }
 
-function addRow(role, text) {
+// parent 不给就画到 #log（打开历史会话时用）；给了就画到某一轮的 run.box 里。
+function addRow(role, text, parent = log) {
   const row = el('div', `row ${role}`);
   row.append(el('div', 'who', role === 'user' ? '你' : '模型'));
   if (role === 'assistant') {
@@ -479,8 +497,8 @@ function addRow(role, text) {
   } else {
     row.append(el('div', 'bubble', text));
   }
-  log.append(row);
-  log.scrollTop = log.scrollHeight;
+  parent.append(row);
+  if (row.isConnected) log.scrollTop = log.scrollHeight;
   return row;
 }
 
@@ -491,7 +509,9 @@ function addStep(box, icon, text, sub, cls) {
   if (sub) { body.append(document.createTextNode(' ')); body.append(el('span', 'sub', sub)); }
   s.append(body);
   box.append(s);
-  log.scrollTop = log.scrollHeight;
+  // ★ 这一轮不在屏幕上（用户切到别的会话了）时，别去动滚动条——
+  //   不然别人正在看的那个会话会被一下拽到底。
+  if (box.isConnected) log.scrollTop = log.scrollHeight;
 }
 
 // ── 开场欢迎语 ──────────────────────────
@@ -560,33 +580,32 @@ function showWelcome() {
 // 第一片 token 到了就撤掉，交给流式光标接手。
 const SPARKS = ['✳', '✦', '✧', '✶'];
 const SPARK_MS = 130;
-let live = null;
 
-function setLive(steps, what) {
-  if (!live) {
+function setLive(run, what) {
+  if (!run.live) {
     const row = el('div', 'live');
     const spark = el('span', 'spark', SPARKS[0]);
     const label = el('span', 'what', what);
     row.append(spark, label);
-    steps.append(row);
+    run.steps.append(row);
     let i = 0;
-    live = {row, label, timer: setInterval(() => {
+    run.live = {row, label, timer: setInterval(() => {
       i = (i + 1) % SPARKS.length;
       spark.textContent = SPARKS[i];
     }, SPARK_MS)};
   } else {
-    live.label.textContent = what;
+    run.live.label.textContent = what;
     // 一直挂在进度区最后一行
-    live.row.parentNode.append(live.row);
+    run.steps.append(run.live.row);
   }
-  log.scrollTop = log.scrollHeight;
+  if (run.box.isConnected) log.scrollTop = log.scrollHeight;
 }
 
-function clearLive() {
-  if (!live) return;
-  clearInterval(live.timer);
-  live.row.remove();
-  live = null;
+function clearLive(run) {
+  if (!run.live) return;
+  clearInterval(run.live.timer);
+  run.live.row.remove();
+  run.live = null;
 }
 
 // ── 流式待定区 ──────────────────────────
@@ -606,28 +625,27 @@ function clearLive() {
 // ★ 渲染节流：每片都重渲染会让文字没法选中、而且闪。80ms 一次足够顺。
 const RENDER_MS = 80;
 
-let pending = null;   // { box, text, timer, row }
-
-function pendingBox() {
-  if (pending) return pending;
+function pendingBox(run) {
+  if (run.pending) return run.pending;
   const row = el('div', 'row assistant');
   row.append(el('div', 'who', '模型'));
   const box = el('div', 'bubble md streaming');
   row.append(box);
-  log.append(row);
-  pending = {row, box, text: '', timer: null};
-  return pending;
+  run.box.append(row);
+  run.pending = {row, box, text: '', timer: null};
+  return run.pending;
 }
 
-function stickBottom() {
+function stickBottom(run) {
+  if (!run.box.isConnected) return;   // 不在屏幕上就别动滚动条
   // 用户往上翻看历史时就别抢滚动条
   if (log.scrollHeight - log.scrollTop - log.clientHeight < 140) {
     log.scrollTop = log.scrollHeight;
   }
 }
 
-function onToken(t) {
-  const p = pendingBox();
+function onToken(run, t) {
+  const p = pendingBox(run);
   p.text += t;
   if (p.timer) return;              // 已经排了一次渲染，等它
   p.timer = setTimeout(() => {
@@ -636,88 +654,177 @@ function onToken(t) {
     // 半张表还没等到分隔行），这是这种做法的固有代价——散文和列表没问题，
     // 表格会闪一下再成形。
     p.box.innerHTML = renderMarkdown(p.text);
-    stickBottom();
+    stickBottom(run);
   }, RENDER_MS);
 }
 
 // 这一段流的是中间话（后面来了 tool_call）：挪进进度区，别占最终答案的位置
-function foldPendingIntoSteps(steps) {
-  if (!pending) return;
-  if (pending.timer) clearTimeout(pending.timer);
-  const said = pending.text.trim();
-  pending.row.remove();
-  pending = null;
-  if (said) addStep(steps, '💬', said.length > 160 ? said.slice(0, 160) + '…' : said);
+function foldPendingIntoSteps(run) {
+  const p = run.pending;
+  if (!p) return;
+  if (p.timer) clearTimeout(p.timer);
+  const said = p.text.trim();
+  p.row.remove();
+  run.pending = null;
+  if (said) addStep(run.steps, '💬', said.length > 160 ? said.slice(0, 160) + '…' : said);
 }
 
 // 最终答案：用 answer 的全文覆盖一遍（校准），然后定稿
-function finalizePending(text) {
-  const p = pending;
-  pending = null;
-  if (!p) { addRow('assistant', text); return; }
+function finalizePending(run, text) {
+  const p = run.pending;
+  run.pending = null;
+  if (!p) { addRow('assistant', text, run.box); return; }
   if (p.timer) clearTimeout(p.timer);
   p.box.classList.remove('streaming');
   p.box.innerHTML = renderMarkdown(text);
-  stickBottom();
+  stickBottom(run);
 }
 
 // ── 会话 ────────────────────────────────
+
+// 当前会话记在网址 # 后面。刷新之后回到原来那个会话，而不是跳回欢迎页——
+// 以前刷新一下就回到欢迎页，看起来就像「刚才问的全没了」。
+function setHash(id) {
+  const h = id ? '#s=' + encodeURIComponent(id) : '';
+  if (location.hash !== h) history.replaceState(null, '', h || location.pathname);
+}
+function hashSession() {
+  const m = location.hash.match(/^#s=(.+)$/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+let sessionsTimer = null;
 async function loadSessions() {
   const r = await fetch('/api/sessions');
   if (!r.ok) { if (r.status === 401) showGate(); return; }
   const list = await r.json();
   const box = $('#sessions');
   box.textContent = '';
+  let anyRunning = false;
   for (const s of list) {
     const d = el('div', 'sess' + (s.id === sessionId ? ' on' : ''), s.title || '(还没有标题)');
+    // running 来自库里的状态，所以别的标签页、命令行发起的也看得见
+    if (s.running) {
+      anyRunning = true;
+      d.append(el('span', 'busy', '● 回答中'));
+    }
     d.append(el('span', 'when', new Date(s.created_at * 1000).toLocaleString('zh-CN')));
     d.onclick = () => openSession(s.id);
     box.append(d);
   }
+  // 有会话在跑时，隔几秒刷一次列表，答完了「回答中」会自己消失
+  clearTimeout(sessionsTimer);
+  if (anyRunning) sessionsTimer = setTimeout(loadSessions, 3000);
 }
 
-async function openSession(id) {
-  if (busy) return;                  // 跑着的时候不让切，不然进度会跑到别的会话里
+// allowResume=false：打开时发现有一轮在跑，但**不**去订阅它的实时进度。
+// 只在「订阅刚失败、回头拉记录」时用，防止「订阅失败 → 拉记录 → 还在跑 →
+// 再订阅 → 又失败」无限循环（比如那一轮是从命令行发起的，网页这边接不上）。
+async function openSession(id, allowResume = true) {
+  const nav = ++navSeq;
   sessionId = id;
+  setHash(id);
   log.textContent = '';
+  updateSend();
   const res = await fetch('/api/sessions/' + encodeURIComponent(id));
+  if (nav !== navSeq) return;       // 等的这会儿用户已经切到别处了
   // ★ 404 = 这个会话不存在，或者不是你的（两种情况服务端刻意不区分）。
-  //   以前这里返回空数组 + 200，界面上显示成「这个会话是空的」——而那会
-  //   让人知道「这个 id 确实存在」。现在统一成 404，这里也要接住：
-  //   不接的话 msgs 是个对象，下面的 .length 是 undefined、for..of 直接报错。
   if (!res.ok) {
     log.textContent = '';
     addRow('assistant', res.status === 404
       ? '这个会话不存在，或者不属于你。'
       : '打不开这个会话：' + (await res.text()));
+    setHash(null);
     loadSessions();
     return;
   }
   const msgs = await res.json();
+  if (nav !== navSeq) return;
+  log.textContent = '';
+
+  // 正在跑的那一轮：库里只有问题，后面跟一条占位（running=true）。
+  // 这一轮不按历史画，交给实时显示——要么是这个页面自己发起、还在收事件的，
+  // 要么订阅事件流，从头补发、接着看。
+  const runningSeq = msgs.find(m => m.running)?.seq;
   if (!msgs.length) showWelcome();   // 建了会话但还没问过
   for (const m of msgs) {
+    if (runningSeq !== undefined && m.seq === runningSeq) continue;
+    if (m.interrupted && !m.text) {
+      const n = el('div', 'row');
+      n.append(el('div', 'failed', '服务重启时这一轮还没答完，被中断了。问题还在，可以再问一次。'));
+      log.append(n);
+      continue;
+    }
     const row = addRow(m.role, m.text);
     if (m.failed) row.append(el('div', 'failed', '这一轮没有正常结束，上面的内容可能是残缺的'));
   }
+  if (runningSeq !== undefined) {
+    let run = runs.get(id);
+    if (!run && allowResume) {
+      const q = msgs.find(m => m.seq === runningSeq && m.role === 'user')?.text ?? '';
+      run = resume(id, q);
+    }
+    if (run) {
+      log.append(run.box);
+    } else {
+      const n = el('div', 'row');
+      n.append(el('div', 'failed', '这一轮还在跑，但这个页面接不上它的实时进度。答完之后刷新就能看到。'));
+      log.append(n);
+    }
+    log.scrollTop = log.scrollHeight;
+  }
+  updateSend();
   loadSessions();
 }
 
 $('#new').onclick = () => {
-  if (busy) return;
+  navSeq++;              // 作废还没回来的 openSession
   sessionId = null;
+  setHash(null);
   log.textContent = '';
   showWelcome();
+  updateSend();
   loadSessions();
 };
 
 // ── 提问 ────────────────────────────────
-function setBusy(on) {
-  busy = on;
+
+// 新建一轮。它的全部显示都在 run.box 里，挂不挂在页面上由「当前看着哪个会话」决定。
+function newRun(sid, question) {
+  const run = { sid, box: el('div', 'turn'), steps: el('div', 'steps'),
+                pending: null, live: null, done: false };
+  addRow('user', question, run.box);
+  const wrap = el('div', 'row');
+  wrap.append(run.steps);
+  run.box.append(wrap);
+  active.add(run);
+  if (sid) runs.set(sid, run);
+  return run;
+}
+
+// 这一轮结束了（正常收尾、出错、连接断了都算）。调多次没关系。
+function finishRun(run) {
+  if (run.done) return;
+  run.done = true;
+  clearLive(run);
+  // 进度区折叠起来，点一下能展开
+  run.steps.classList.add('done', 'collapsed');
+  run.steps.onclick = () => run.steps.classList.toggle('collapsed');
+  active.delete(run);
+  if (run.sid && runs.get(run.sid) === run) runs.delete(run.sid);
+  updateSend();
+  loadSessions();
+  refreshMe();
+}
+
+// 发送按钮什么时候变灰：**当前看着的这个会话**有一轮正在跑。
+// 别的会话在跑不影响——那正是并发的意义。
+function updateSend() {
+  const busyHere = [...active].some(r => r.box.isConnected);
   // 输入框**始终可用**——等的时候可以先把下一个问题打好。
-  // 只有发送按钮变灰，而且 Enter 也不触发。
-  sendBtn.disabled = on;
-  hint.textContent = on
-    ? '正在回答中…可以先打下一个问题，答完再发'
+  sendBtn.disabled = busyHere;
+  hint.textContent = busyHere
+    ? '这个会话正在回答…可以先打下一个问题，或者去别的会话问'
     : 'Enter 发送 · Shift+Enter 换行';
 }
 
@@ -727,52 +834,72 @@ qBox.addEventListener('keydown', e => {
 sendBtn.onclick = send;
 
 async function send() {
-  if (busy) return;
+  if (sendBtn.disabled) return;
   const q = qBox.value.trim();
   if (!q) return;
   qBox.value = '';
-  setBusy(true);
 
-  pending = null;   // 上一次的残留（理论上不该有，出错路径下可能留着）
-  clearLive();
   log.querySelector('.welcome')?.remove();   // 开始问了，开场页让位
-  addRow('user', q);
-  const steps = el('div', 'steps');
-  const wrap = el('div', 'row');
-  wrap.append(steps);
-  log.append(wrap);
-  setLive(steps, '思考中');
+  const run = newRun(sessionId, q);
+  log.append(run.box);
+  log.scrollTop = log.scrollHeight;
+  setLive(run, '思考中');
+  updateSend();
 
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        session: sessionId,
+        session: run.sid,
         question: q,
         provider: $('#provider').value,
       }),
     });
     if (!res.ok) {
       const t = await res.text();
-      addStep(steps, '✗', t, null, 'err');
+      addStep(run.steps, '✗', t, null, 'err');
       if (res.status === 401) showGate('登录过期了，重新输一次');
       return;
     }
-    await readStream(res, steps);
+    await readStream(res, run);
   } catch (e) {
-    addStep(steps, '✗', '连接断了：' + e.message, null, 'err');
+    addStep(run.steps, '✗', '连接断了：' + e.message, null, 'err');
   } finally {
-    clearLive();
-    setBusy(false);
-    loadSessions();
-    refreshMe();
+    finishRun(run);
   }
+}
+
+// 接着看一轮**别处发起的**、还在跑的提问（刷新之前的这个页面、或者另一个标签页）。
+//
+// 服务端会把这一轮已经发过的事件从第一条开始补发，然后接着实时推——
+// 所以刷新之前看到的进度和半截答案会重新长出来，后面的接着往外冒。
+function resume(id, question) {
+  const run = newRun(id, question);
+  setLive(run, '接上了，正在补发之前的进度');
+  (async () => {
+    try {
+      const res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/events');
+      if (!res.ok) {
+        // 多半是刚好答完了（服务端说「没有在跑的」）。答案已经在库里，
+        // 回头拉一遍记录——但**不再**尝试订阅，免得来回打转。
+        finishRun(run);
+        if (sessionId === id) openSession(id, false);
+        return;
+      }
+      await readStream(res, run);
+    } catch (e) {
+      addStep(run.steps, '✗', '连接断了：' + e.message, null, 'err');
+    } finally {
+      finishRun(run);
+    }
+  })();
+  return run;
 }
 
 // SSE 是纯文本流：事件之间用空行分隔，每行以 "data: " 开头。
 // 不用 EventSource 是因为它只能发 GET，而问题可能很长，塞不进 URL。
-async function readStream(res, steps) {
+async function readStream(res, run) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
@@ -786,72 +913,74 @@ async function readStream(res, steps) {
       const chunk = buf.slice(0, i);
       buf = buf.slice(i + 2);
       for (const line of chunk.split('\n')) {
-        if (line.startsWith('data: ')) handle(JSON.parse(line.slice(6)), steps);
+        if (line.startsWith('data: ')) handle(JSON.parse(line.slice(6)), run);
       }
     }
   }
-  // 流结束时把进度折叠起来，点一下能展开
-  steps.classList.add('done', 'collapsed');
-  steps.onclick = () => steps.classList.toggle('collapsed');
 }
 
-function handle(d, steps) {
+function handle(d, run) {
   switch (d.t) {
     case 'hello':
-      // 新会话的 id 是 Rust 建的，从这里拿回来。**所有写操作都在 Rust**，
-      // 前端和 Go 都不建会话。
-      sessionId = d.session;
-      addStep(steps, '·', `${d.model}${d.vision ? ' + ' + d.vision : '（没配视觉模型）'}`);
+      // 新会话的 id 是服务端建的，从这里拿回来。
+      if (!run.sid) {
+        run.sid = d.session;
+        runs.set(run.sid, run);
+        // 用户还看着这一轮 → 这就是当前会话。已经切走了 → 不去抢显示。
+        if (run.box.isConnected) { sessionId = run.sid; setHash(run.sid); }
+        loadSessions();
+      }
+      addStep(run.steps, '·', `${d.model}${d.vision ? ' + ' + d.vision : '（没配视觉模型）'}`);
       break;
     case 'compacted':
-      addStep(steps, '📦', `历史太长，已压缩成 ${d.summary_chars} 字的摘要`);
-      setLive(steps, '压缩历史中');
+      addStep(run.steps, '📦', `历史太长，已压缩成 ${d.summary_chars} 字的摘要`);
+      setLive(run, '压缩历史中');
       break;
     case 'token':
       // 第一片字到了 → 撤掉指示条，交给流式光标
-      clearLive();
-      onToken(d.text);
+      clearLive(run);
+      onToken(run, d.text);
       break;
     case 'iteration':
       // 新一轮开始前，上一轮流出来的话（如果有）已经在 tool_call 那里
       // 折进进度区了；这里只画轮次
-      addStep(steps, '⟳', `第 ${d.n} 轮`);
+      addStep(run.steps, '⟳', `第 ${d.n} 轮`);
       break;
     case 'tool_call':
       // 来了工具调用 → 刚才流的那段是中间话，不是答案
-      foldPendingIntoSteps(steps);
-      addStep(steps, '🔧', toolCallText(d));
+      foldPendingIntoSteps(run);
+      addStep(run.steps, '🔧', toolCallText(d));
       // 工具那一步最久（视频下载上传分析实测能到 36 秒），这里最需要有东西在动
-      setLive(steps, TOOL_NAME[d.name] ? `${TOOL_NAME[d.name]}中` : '执行中');
+      setLive(run, TOOL_NAME[d.name] ? `${TOOL_NAME[d.name]}中` : '执行中');
       break;
     case 'tool_result':
-      addStep(steps, d.is_error ? '✗' : '✓', toolResultText(d), null, d.is_error ? 'err' : '');
-      setLive(steps, '思考中');
+      addStep(run.steps, d.is_error ? '✗' : '✓', toolResultText(d), null, d.is_error ? 'err' : '');
+      setLive(run, '思考中');
       break;
     case 'answer':
-      finalizePending(d.text);
+      finalizePending(run, d.text);
       break;
     case 'usage': {
       const u = el('div', 'row');
       u.append(el('div', 'usage', usageText(d)));
-      log.append(u);
+      run.box.append(u);
       break;
     }
     case 'done':
-      clearLive();
+      clearLive(run);
       if (d.note) {
-        const n = el('div', 'row'); n.append(el('div', 'failed', d.note)); log.append(n);
+        const n = el('div', 'row'); n.append(el('div', 'failed', d.note)); run.box.append(n);
       }
       break;
     case 'error':
-      clearLive();
+      clearLive(run);
       // 出错时把已经流出来的半截话折进进度区，别留一个悬着的空气泡
-      foldPendingIntoSteps(steps);
-      addStep(steps, '✗', d.message, null, 'err');
+      foldPendingIntoSteps(run);
+      addStep(run.steps, '✗', d.message, null, 'err');
       break;
     // 认不出的事件类型直接忽略——Rust 那边加了新事件，这里不用同步改
   }
-  log.scrollTop = log.scrollHeight;
+  if (run.box.isConnected) log.scrollTop = log.scrollHeight;
 }
 
 // ── 登录 ────────────────────────────────
@@ -916,8 +1045,7 @@ async function enter() {
     $('#password').value = '';
     $('#gate').classList.remove('on');
     renderMe();
-    showWelcome();
-    loadSessions();
+    enterApp();
   } finally {
     $('#enter').disabled = false;
   }
@@ -939,9 +1067,17 @@ async function refreshMe() {
   if (r.ok) { me = await r.json(); renderMe(); }
 }
 
+// 登录之后进入主界面：网址里记着会话就回到那个会话（刷新的情况），没有就显示欢迎页。
+function enterApp() {
+  const id = hashSession();
+  if (id) openSession(id);
+  else { showWelcome(); loadSessions(); }
+  updateSend();
+}
+
 (async () => {
   const r = await fetch('/api/me');
-  if (r.ok) { me = await r.json(); renderMe(); showWelcome(); loadSessions(); }
+  if (r.ok) { me = await r.json(); renderMe(); enterApp(); }
   else showGate();
 })();
 </script>

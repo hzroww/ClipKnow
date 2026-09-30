@@ -23,6 +23,8 @@ pub struct SessionSummary {
     /// 但空串让「这个字段永远是字符串」成立，少一类判断。
     pub title: String,
     pub created_at: i64,
+    /// 这个会话里有一轮正在跑。会话列表上打个标记，并发时一眼看出哪几个在忙。
+    pub running: bool,
 }
 
 /// 聊天记录里的一条。
@@ -41,8 +43,14 @@ pub struct UiMessage {
     /// ⚠️ 只有布尔，没有原因——`turns.status` 只存 "done"/"failed"，
     /// Rust 侧 `TurnStatus::Failed(String)` 里那个原因**没落库**。实时看
     /// 的时候能从 done 事件的 note 里看到，刷新之后就只剩这个布尔了。
-    /// 要补的话是 turns 加一列 + 一次迁移，属于阶段 C 的活。
+    /// 要补的话是 turns 加一列 + 一次迁移。
     pub failed: bool,
+    /// 这一轮还在跑。只会出现在一条**占位的** assistant 消息上（text 为空）：
+    /// 跑的过程中库里只有用户的问题，答案要等跑完才写进去。
+    /// 前端看到它就去订阅这一轮的事件流，接着看。
+    pub running: bool,
+    /// 这一轮跑到一半服务停了（崩溃、被杀）。同样是占位消息。
+    pub interrupted: bool,
 }
 
 /// 找不到，或者不是你的。
@@ -55,10 +63,12 @@ pub struct NotFound;
 
 /// 这个用户的会话，最近有活动的排前面。
 pub fn list(store: &SqliteStore, user_id: &str, limit: usize) -> Result<Vec<SessionSummary>> {
+    let running = store.running_sessions_for_user(user_id)?;
     Ok(store
         .list_sessions_for_user(user_id, limit)?
         .into_iter()
         .map(|s| SessionSummary {
+            running: running.contains(&s.id),
             id: s.id,
             title: s.title.unwrap_or_default(),
             created_at: s.created_at,
@@ -102,17 +112,19 @@ pub fn create(store: &mut SqliteStore, user_id: &str, title: Option<&str>) -> Re
 /// 单独抽成纯函数是为了能离线测这条规则。它是从 Go 的 `History()` 搬过来
 /// 的，搬运过程中最容易悄悄改掉语义，而改掉的表现是「界面上多出几句半截
 /// 的话」——看起来像模型的问题，不像代码的问题。
-fn project(rows: Vec<(i64, bool, String, String)>) -> Vec<UiMessage> {
+fn project(rows: Vec<(i64, String, String, String)>) -> Vec<UiMessage> {
     let mut out: Vec<UiMessage> = Vec::new();
     // 当前 turn 的最后一条 assistant 在 out 里的下标。None = 这个 turn
     // 还没出现过 assistant。用下标覆盖而不是先收集再挑，是为了让
     // 「问题在前、答案在后」的顺序自然保持住。
     let mut last_assistant: Option<usize> = None;
-    let mut cur_seq: Option<i64> = None;
+    // 当前 turn：(seq, 状态)
+    let mut cur: Option<(i64, String)> = None;
 
-    for (seq, done, kind, text) in rows {
-        if cur_seq != Some(seq) {
-            cur_seq = Some(seq);
+    for (seq, status, kind, text) in rows {
+        if cur.as_ref().map(|(s, _)| *s) != Some(seq) {
+            close_turn(&mut out, cur.take(), last_assistant);
+            cur = Some((seq, status.clone()));
             last_assistant = None;
         }
         match kind.as_str() {
@@ -121,13 +133,17 @@ fn project(rows: Vec<(i64, bool, String, String)>) -> Vec<UiMessage> {
                 text,
                 seq,
                 failed: false,
+                running: false,
+                interrupted: false,
             }),
             "assistant_message" => {
                 let m = UiMessage {
                     role: "assistant",
                     text,
                     seq,
-                    failed: !done,
+                    failed: status != "done",
+                    running: false,
+                    interrupted: false,
                 };
                 match last_assistant {
                     Some(i) => out[i] = m, // 覆盖掉上一条中间思考
@@ -142,7 +158,37 @@ fn project(rows: Vec<(i64, bool, String, String)>) -> Vec<UiMessage> {
             _ => {}
         }
     }
+    close_turn(&mut out, cur, last_assistant);
     out
+}
+
+/// 一个 turn 的条目读完了：如果它还在跑、或者被中断了，而且一条答案都
+/// 没有，补一条**占位**的 assistant 消息，让界面知道该显示什么。
+///
+/// 不补的话，界面上只有一句孤零零的问题，看不出是「还在答」「断了」
+/// 还是「答完了但什么都没说」。
+fn close_turn(
+    out: &mut Vec<UiMessage>,
+    turn: Option<(i64, String)>,
+    last_assistant: Option<usize>,
+) {
+    let Some((seq, status)) = turn else { return };
+    if last_assistant.is_some() {
+        return;
+    }
+    let (running, interrupted) = match status.as_str() {
+        "running" => (true, false),
+        "interrupted" => (false, true),
+        _ => return,
+    };
+    out.push(UiMessage {
+        role: "assistant",
+        text: String::new(),
+        seq,
+        failed: interrupted,
+        running,
+        interrupted,
+    });
 }
 
 #[cfg(test)]
@@ -151,8 +197,55 @@ mod tests {
     use crate::content::model::{Item, ItemKind, TurnStatus};
     use serde_json::json;
 
-    fn row(seq: i64, done: bool, kind: &str, text: &str) -> (i64, bool, String, String) {
-        (seq, done, kind.into(), text.into())
+    fn row(seq: i64, done: bool, kind: &str, text: &str) -> (i64, String, String, String) {
+        let st = if done { "done" } else { "failed" };
+        (seq, st.into(), kind.into(), text.into())
+    }
+
+    fn row_st(seq: i64, status: &str, kind: &str, text: &str) -> (i64, String, String, String) {
+        (seq, status.into(), kind.into(), text.into())
+    }
+
+    /// ★ 跑到一半的那一轮：问题照常显示，后面跟一条「正在回答」的占位。
+    ///
+    /// 这就是「刷新后问题全不见了」那个 bug 的界面这一半：库里有了问题，
+    /// 界面还得知道它**还在跑**，才会去订阅事件流接着看。
+    #[test]
+    fn 正在跑的一轮显示问题和一条正在回答的占位() {
+        let got = project(vec![
+            row(1, true, "user_message", "问题一"),
+            row(1, true, "assistant_message", "答案一"),
+            row_st(2, "running", "user_message", "问题二"),
+        ]);
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got[2].text, "问题二");
+        assert!(got[3].running && got[3].text.is_empty(), "{:?}", got[3]);
+        assert_eq!(got[3].seq, 2);
+        assert!(!got[1].running, "答完的那轮不该标成在跑");
+    }
+
+    #[test]
+    fn 被中断的一轮显示问题和一条中断占位() {
+        let got = project(vec![row_st(
+            1,
+            "interrupted",
+            "user_message",
+            "问到一半服务重启了",
+        )]);
+        assert_eq!(got.len(), 2);
+        assert!(got[1].interrupted && got[1].failed && !got[1].running);
+    }
+
+    /// 中断占位只在**没有任何答案**时补。有半截答案的话用它就行，
+    /// 标成失败——不能再多塞一条空的。
+    #[test]
+    fn 有答案的轮次不补占位() {
+        let got = project(vec![
+            row_st(1, "interrupted", "user_message", "问"),
+            row_st(1, "interrupted", "assistant_message", "半截"),
+        ]);
+        assert_eq!(got.len(), 2);
+        assert!(got[1].failed && got[1].text == "半截");
     }
 
     #[test]

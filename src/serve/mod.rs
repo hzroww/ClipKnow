@@ -49,7 +49,6 @@ use crate::store::sqlite::SqliteStore;
 use crate::wire::TurnSink;
 
 pub mod auth;
-pub mod sink;
 use auth::Principal;
 
 /// 默认监听地址。
@@ -224,6 +223,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // axum 0.8 的路径参数是 {id}，不是老版本的 :id
         .route("/internal/sessions/{id}/messages", get(session_messages))
         .route("/internal/sessions/{id}/turns", post(create_turn))
+        .route("/internal/sessions/{id}/events", get(session_events))
         .fallback(fallback)
         .with_state(state)
 }
@@ -415,9 +415,12 @@ async fn create_turn(
         ApiError::new(status, r.code(), r.message())
     })?;
 
-    let (chan, rx) = sink::ChannelSink::new();
+    // 这一轮的事件记录。执行过程往里写，订阅者（发起提问的这个连接、
+    // 以及刷新后重新连上来的页面）从里面读。
+    let live = permit.live();
     let db_path = st.db_path.clone();
     let sid = session_id.clone();
+    let sink = Arc::clone(&live);
 
     // ★ 真正干活的在 blocking 线程上。
     //
@@ -429,43 +432,163 @@ async fn create_turn(
     //   Drop，所以"每条退出路径都释放"是类型系统保证的。
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        // ★ 这个执行**自己开一条连接**，不用 AppState 里那条只读的。
-        //   它要 &mut SqliteStore 并且一占几分钟，占那条的话会话列表就
-        //   打不开了。WAL 模式下读不挡写、写不挡读。
-        let mut store = match SqliteStore::open(&db_path) {
-            Ok(s) => s,
-            Err(e) => {
-                chan.emit_json(&crate::wire::error_json(&format!("开库失败: {e}")));
-                return;
-            }
-        };
+        run_one_turn(&db_path, &sid, &question, provider, &sink);
+        sink.finish();
+        // _permit 在这里 Drop：名额归还、事件记录从登记表里摘掉。
+        // 摘掉之前已经连上的订阅者手里有自己的 Arc，会把剩下的读完。
+    });
+
+    Ok(subscribe_sse(live))
+}
+
+/// 在 blocking 线程上跑一轮，并且**无论怎么结束都把库收拾干净**。
+///
+/// 「收拾干净」指的是：提问一被接受，库里就有一行 status='running'
+/// （见 `SqliteStore::begin_turn`）。正常结束时 finish_turn 会把它改成终态；
+/// 但执行 panic 了、或者收尾落库本身失败了，它就会一直停在 running，
+/// 界面上永远显示「正在回答」。所以最后一定补一句：这个会话里要是还有
+/// running 的，改成 interrupted。
+///
+/// 这一步必须在名额归还**之前**做（调用方保证）——名额还没还，同一个会话
+/// 就不可能有新的一轮开始，不会误伤别人。
+fn run_one_turn(
+    db_path: &str,
+    sid: &str,
+    question: &str,
+    provider: Option<crate::agent::llm::Provider>,
+    sink: &crate::app::live::LiveTurn,
+) {
+    // ★ 这个执行**自己开一条连接**，不用 AppState 里那条只读的。
+    //   它要 &mut SqliteStore 并且一占几分钟，占那条的话会话列表就
+    //   打不开了。WAL 模式下读不挡写、写不挡读。
+    let mut store = match SqliteStore::open(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            sink.emit_json(&crate::wire::error_json(&format!("开库失败: {e}")));
+            return;
+        }
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let cfg = crate::agent::runner::LoopConfig::default();
         let req = crate::app::turn::TurnRequest {
-            session_id: &sid,
-            question: &question,
+            session_id: sid,
+            question,
             provider,
             config: &cfg,
         };
-        // execute 出错时已经往 sink 推过 error 事件了，这里只补一条服务端
-        // 日志——浏览器那边不需要再来一遍。
-        if let Err(e) = crate::app::turn::execute(&mut store, &req, &chan) {
-            eprintln!("会话 {sid} 这一轮失败: {e}");
+        crate::app::turn::execute(&mut store, &req, sink)
+    }));
+    match outcome {
+        Ok(Ok(())) => {}
+        // execute 出错时已经往 sink 推过 error 事件了，这里只补服务端日志
+        Ok(Err(e)) => eprintln!("会话 {sid} 这一轮失败: {e}"),
+        Err(_) => {
+            eprintln!("⚠️  会话 {sid} 这一轮 panic 了");
+            sink.emit_json(&crate::wire::error_json(
+                "分析过程内部出错了，这一轮没有答完。问题已经保存，可以再问一次。",
+            ));
+        }
+    }
+    match store.interrupt_running(Some(sid)) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("会话 {sid} 有 {n} 轮没收完尾，已标成中断"),
+        Err(e) => eprintln!("⚠️  会话 {sid} 收拾残局失败: {e}"),
+    }
+}
+
+/// `GET /internal/sessions/{id}/events`
+///
+/// 接着看一个**正在跑**的提问：先把这一轮已经发过的事件从第一条开始补发，
+/// 再接着实时推，直到 done / error。
+///
+/// 刷新页面、换一个标签页打开同一个会话，都走这里。
+///
+/// 404 两种：
+///   `not_found`         不是你的会话 / 不存在（不区分，见 session_messages）
+///   `no_running_turn`   是你的，但现在没有在跑的——多半是刚答完。
+///                       前端看到它就去拉一遍聊天记录，答案已经在库里了。
+async fn session_events(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    // 归属先查，**再**看有没有在跑。反过来的话，拿别人的会话 id 来问，
+    // 「没在跑」和「不是你的」给出不同的回答，就能探出别人的会话在不在忙。
+    let owns = {
+        let st = Arc::clone(&st);
+        let (uid, sid) = (who.user_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || st.read().session_owned_by(&uid, &sid))
+            .await
+            .map_err(join_failed)??
+    };
+    if !owns {
+        return Err(not_found_session());
+    }
+    match st.registry.live(&session_id) {
+        Some(live) => Ok(subscribe_sse(live)),
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_running_turn",
+            "这个会话现在没有在跑的提问",
+        )),
+    }
+}
+
+/// 订阅一轮的事件记录，变成一条 SSE 响应：从第一条补发，然后接着推。
+///
+/// ## 为什么每个订阅者单独一个转发任务
+///
+/// 事件记录本身**只管追加、从不等人**（agent 循环写它）。每个订阅者起一个
+/// 小的 async 任务，按自己的进度（cursor）从记录里读，再塞进一个 64 深的
+/// 队列交给 HTTP 响应。慢的浏览器只会让**它自己的**转发任务在
+/// `send().await` 上等着，不影响 agent 循环，也不影响别的订阅者。
+///
+/// 浏览器断开 → HTTP 响应被丢掉 → 队列接收端没了 → `send` 报错 →
+/// 转发任务退出。不会留下孤儿任务。
+fn subscribe_sse(live: Arc<crate::app::live::LiveTurn>) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::spawn(async move {
+        // ★ 先订阅「有新东西」的信号，再读记录。顺序反了的话，在「读完」和
+        //   「开始等」之间来的那一条会被漏掉，这个订阅者就永远卡在等待上。
+        let mut tick = live.watch();
+        let mut cursor = 0usize;
+        loop {
+            let (batch, finished) = live.read_from(cursor);
+            cursor += batch.len();
+            for line in batch {
+                if tx.send(line.to_string()).await.is_err() {
+                    return; // 浏览器走了
+                }
+            }
+            if finished {
+                return;
+            }
+            if tick.changed().await.is_err() {
+                // 事件记录被整个丢掉了（不该发生：订阅者手里有 Arc）。
+                // 保险起见最后读一遍再走。
+                let (batch, _) = live.read_from(cursor);
+                for line in batch {
+                    if tx.send(line.to_string()).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
         }
     });
 
-    // 事件从有界队列流出来，一条一行。
-    //
     // keep_alive 每 15 秒发一个 SSE 注释行（`:`）。一次提问里下载视频那段
     // 可能一分钟没有任何事件，中间的反向代理会把空闲连接掐掉。
     // 注释行不是 `data:` 开头，前端本来就跳过它。
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| {
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(line))
     });
-    Ok(axum::response::sse::Sse::new(stream)
+    axum::response::sse::Sse::new(stream)
         .keep_alive(
             axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
         )
-        .into_response())
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -509,7 +632,15 @@ pub fn run(db_path: &str, addr: &str, max_turns: usize) -> Result<()> {
     //   没配密钥是最常见的启动失败，而它和数据库一点关系都没有——排在后面
     //   的话，一个没迁移的库会先报「版本落后」，把真正的原因盖住。
     let verifier = auth::Verifier::from_env()?;
-    let store = SqliteStore::open(db_path)?;
+    let mut store = SqliteStore::open(db_path)?;
+    // ★ 上一次进程没正常收尾（崩溃、kill -9）留下的「正在回答」，改成中断。
+    //   不改的话它们会永远显示「正在回答」，前端还会不停地去订阅一个根本
+    //   不存在的事件流。**不自动重跑**：外部调用（抓取、视频分析）可能已经
+    //   花过钱了。在开始接受请求**之前**做，不会误伤这次启动后的新提问。
+    let n = store.interrupt_running(None)?;
+    if n > 0 {
+        eprintln!("上次有 {n} 轮提问没答完服务就停了，已标成中断");
+    }
     let state =
         Arc::new(AppState::new(store, db_path.to_string(), verifier).with_max_turns(max_turns));
 
@@ -1205,6 +1336,103 @@ mod tests {
     fn 并发上限给查询留了线程() {
         const { assert!(MAX_TURNS_LIMIT < MAX_BLOCKING_THREADS) };
         const { assert!(crate::app::registry::DEFAULT_MAX_TURNS <= MAX_TURNS_LIMIT) };
+    }
+
+    // ── 接着看：GET /internal/sessions/{id}/events ────────
+
+    /// 读一条 SSE 响应里的全部 data 行（直到流结束）。
+    fn sse_data_lines(r: reqwest::blocking::Response) -> Vec<serde_json::Value> {
+        r.text()
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// ★ 刷新后重新连上：从第一条补发，接着推到结束。
+    ///
+    /// 直接往登记表里塞一轮假的在跑的提问，手工往它的事件记录里写事件，
+    /// 不需要真的跑模型。
+    #[test]
+    fn 接着看会从第一条补发然后推到结束() {
+        let (st, sid) = two_users();
+        let reg = Arc::clone(&st.registry);
+        let srv = testserver::spawn(st);
+
+        let permit = reg.admit(&sid).unwrap();
+        let live = permit.live();
+        live.emit_json(&json!({"t": "hello", "session": sid}));
+        live.emit_json(&json!({"t": "token", "text": "前半句"}));
+
+        // 订阅者连上的时候，前两条已经发过了；之后再来两条，然后结束。
+        let h = {
+            let live = Arc::clone(&live);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                live.emit_json(&json!({"t": "token", "text": "后半句"}));
+                live.emit_json(&json!({"t": "done", "outcome": "done", "note": ""}));
+                drop(permit); // 名额归还 → 事件记录收尾
+            })
+        };
+        let r = get_as(&srv, "u_alice", &format!("/internal/sessions/{sid}/events"));
+        assert_eq!(r.status(), 200);
+        let evs = sse_data_lines(r);
+        h.join().unwrap();
+
+        let ts: Vec<_> = evs
+            .iter()
+            .map(|v| v["t"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ts,
+            vec!["hello", "token", "token", "done"],
+            "补发或续播少了东西"
+        );
+        assert_eq!(evs[1]["text"], "前半句", "连上之前发过的没补上");
+        assert_eq!(evs[2]["text"], "后半句", "连上之后发的没推过来");
+    }
+
+    #[test]
+    fn 没在跑时接着看是_404_no_running_turn() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        let r = get_as(&srv, "u_alice", &format!("/internal/sessions/{sid}/events"));
+        assert_eq!(r.status(), 404);
+        let v: serde_json::Value = r.json().unwrap();
+        assert_eq!(v["code"], "no_running_turn");
+    }
+
+    /// ★ 别人的会话：不管在不在跑，都是一模一样的 not_found。
+    ///
+    /// 要是「在跑」和「没在跑」给出不同的回答，拿别人的会话 id 来探，
+    /// 就能知道别人现在在不在问问题。
+    #[test]
+    fn 别人的会话接着看一律_not_found_不泄露在不在跑() {
+        let (st, alice_sid) = two_users();
+        let reg = Arc::clone(&st.registry);
+        let srv = testserver::spawn(st);
+        let url = format!("/internal/sessions/{alice_sid}/events");
+
+        let idle: serde_json::Value = get_as(&srv, "u_bob", &url).json().unwrap();
+        let _p = reg.admit(&alice_sid).unwrap();
+        let busy = get_as(&srv, "u_bob", &url);
+        assert_eq!(busy.status(), 404);
+        let busy: serde_json::Value = busy.json().unwrap();
+        assert_eq!(idle, busy, "在跑和没在跑给了不同的回答");
+        assert_eq!(busy["code"], "not_found");
+    }
+
+    #[test]
+    fn 会话列表带着在跑的标记() {
+        let (st, sid) = two_users();
+        // 测试里的库是内存库，只有 AppState 手里那一条连接能看到它
+        st.read().begin_turn(&sid, "m", "q", "q").unwrap();
+        let srv = testserver::spawn(st);
+        let v: serde_json::Value = get_as(&srv, "u_alice", "/internal/sessions")
+            .json()
+            .unwrap();
+        assert_eq!(v["sessions"][0]["running"], true, "{v}");
     }
 
     /// 停机信号发出后，服务器线程必须真的收摊。

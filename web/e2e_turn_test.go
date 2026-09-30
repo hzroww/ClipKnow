@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -83,10 +84,14 @@ func postChat(t *testing.T, cli *http.Client, srv *httptest.Server, session, q s
 // 这就是改造前 Go 里那把 turnGate 的行为，搬到 Rust 的 app::registry 之后
 // 必须**一模一样**。这条测试是那次搬家的验收标准。
 func TestSecondQuestionOnBusySessionIsRejected(t *testing.T) {
-	release := make(chan struct{})
+	release, openGate := newGate()
 	entered := make(chan struct{})
 	model := gatedModel(t, release, entered)
 	defer model.Close()
+	// ★ 先放行、再关模型（defer 倒序执行）。测试中途失败时假模型还卡在
+	//   等放行上，httptest 的 Close 要等所有请求结束——不先放行就会卡死
+	//   到 go test 的 10 分钟超时，而不是立刻报错。
+	defer openGate()
 
 	srv := startServer(t, model.URL)
 	cli := register(t, srv, "busyuser")
@@ -120,7 +125,7 @@ func TestSecondQuestionOnBusySessionIsRejected(t *testing.T) {
 		}
 	}
 
-	close(release)
+	openGate()
 	drain(first)
 }
 
@@ -133,10 +138,14 @@ func TestSecondQuestionOnBusySessionIsRejected(t *testing.T) {
 //
 // 这条以前**没有测过**。
 func TestClosingTheBrowserStillPersistsTheAnswer(t *testing.T) {
-	release := make(chan struct{})
+	release, openGate := newGate()
 	entered := make(chan struct{})
 	model := gatedModel(t, release, entered)
 	defer model.Close()
+	// ★ 先放行、再关模型（defer 倒序执行）。测试中途失败时假模型还卡在
+	//   等放行上，httptest 的 Close 要等所有请求结束——不先放行就会卡死
+	//   到 go test 的 10 分钟超时，而不是立刻报错。
+	defer openGate()
 
 	srv := startServer(t, model.URL)
 	cli := register(t, srv, "gonesoon")
@@ -157,7 +166,7 @@ func TestClosingTheBrowserStillPersistsTheAnswer(t *testing.T) {
 	resp.Body.Close()
 	cli.CloseIdleConnections()
 
-	close(release)
+	openGate()
 
 	// 等答案落库。轮询而不是固定 sleep：CI 的机器慢，固定睡眠要么不够
 	// 要么浪费时间。
@@ -319,10 +328,14 @@ func waitAllInside(t *testing.T, arrived <-chan int, want int) {
 // 设计文档第 11 节验收表里那一行：「A、B 不同会话并发 → 能同时进入假模型，
 // 不被全局单任务锁串行化」。
 func TestTwoUsersAskAtTheSameTime(t *testing.T) {
-	release := make(chan struct{})
+	release, openGate := newGate()
 	arrived := make(chan int, 8)
 	model := countingModel(t, release, arrived)
 	defer model.Close()
+	// ★ 先放行、再关模型（defer 倒序执行）。测试中途失败时假模型还卡在
+	//   等放行上，httptest 的 Close 要等所有请求结束——不先放行就会卡死
+	//   到 go test 的 10 分钟超时，而不是立刻报错。
+	defer openGate()
 
 	srv := startServer(t, model.URL)
 	alice := register(t, srv, "alice2")
@@ -340,7 +353,7 @@ func TestTwoUsersAskAtTheSameTime(t *testing.T) {
 	}
 
 	waitAllInside(t, arrived, 2)
-	close(release)
+	openGate()
 
 	// 两个都要正常收尾、都要落库，而且各自只看得到自己的
 	for name, c := range map[string]struct {
@@ -366,10 +379,14 @@ func TestTwoUsersAskAtTheSameTime(t *testing.T) {
 // 登记表只认会话 id，没有「每个用户最多几个」。要加的话在 app::registry
 // 的 admit 里多检查一项，这条测试会提醒你改。
 func TestOneUserTwoSessionsAtTheSameTime(t *testing.T) {
-	release := make(chan struct{})
+	release, openGate := newGate()
 	arrived := make(chan int, 8)
 	model := countingModel(t, release, arrived)
 	defer model.Close()
+	// ★ 先放行、再关模型（defer 倒序执行）。测试中途失败时假模型还卡在
+	//   等放行上，httptest 的 Close 要等所有请求结束——不先放行就会卡死
+	//   到 go test 的 10 分钟超时，而不是立刻报错。
+	defer openGate()
 
 	srv := startServer(t, model.URL)
 	me := register(t, srv, "multitab")
@@ -387,7 +404,7 @@ func TestOneUserTwoSessionsAtTheSameTime(t *testing.T) {
 	}
 
 	waitAllInside(t, arrived, 2)
-	close(release)
+	openGate()
 	drain(r1)
 	drain(r2)
 
@@ -401,7 +418,170 @@ func TestOneUserTwoSessionsAtTheSameTime(t *testing.T) {
 	}
 }
 
+// 一个**说到一半停住**的假模型：先吐「前半句」，然后卡住等 release，
+// 放行后再吐「后半句」收尾。用来造「答到一半」这个状态。
+func splitModel(t *testing.T, midway chan<- struct{}, release <-chan struct{}) *httptest.Server {
+	t.Helper()
+	var once sync.Once
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		f := w.(http.Flusher)
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			f.Flush()
+		}
+		delta := func(text string) {
+			send(map[string]any{"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"content": text}},
+			}})
+		}
+		delta("前半句")
+		once.Do(func() { close(midway) })
+		<-release
+		delta("后半句")
+		send(map[string]any{"choices": []any{
+			map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"},
+		}})
+		send(map[string]any{"choices": []any{}, "usage": map[string]any{
+			"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20,
+		}})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		f.Flush()
+	}))
+}
+
+// 从一条 SSE 流里一直读，直到读到满足 stop 的那个事件（含）。
+func readUntil(t *testing.T, body io.Closer, sc *bufio.Scanner, stop func(event) bool) []event {
+	t.Helper()
+	// ★ 等不到就 20 秒后把连接掐掉，让下面的 Scan 返回、测试报错。
+	//   没有这个的话，一个「永远等不到」的事件会让测试卡到 go test 的
+	//   10 分钟超时——故障注入时真卡过一次。
+	timer := time.AfterFunc(20*time.Second, func() { _ = body.Close() })
+	defer timer.Stop()
+	var out []event
+	for sc.Scan() {
+		payload, ok := strings.CutPrefix(strings.TrimSpace(sc.Text()), "data: ")
+		if !ok {
+			continue
+		}
+		var e event
+		if err := json.Unmarshal([]byte(payload), &e); err != nil {
+			t.Fatalf("SSE 里有一行不是合法 JSON: %s", payload)
+		}
+		out = append(out, e)
+		if stop(e) {
+			return out
+		}
+	}
+	t.Fatalf("流结束了（或 20 秒超时）也没等到想要的事件，已收到：%+v", out)
+	return out
+}
+
+// ★★ 答到一半刷新页面：问题还在，而且能接着看。
+//
+// 这条是用户实际撞上的那个 bug 的验收：
+//
+//	改之前  刷新 → 会话里什么都没有（整轮答完才写库）→ 以为问题丢了
+//	        后面的 token 一个都看不到，前面看到的半截也没了
+//	改之后  刷新 → 看到自己的问题 + 「正在回答」
+//	        重新连上 → 前半句从头补发，后半句接着实时推
+func TestRefreshMidAnswerShowsQuestionAndResumes(t *testing.T) {
+	midway := make(chan struct{})
+	release, openGate := newGate()
+	model := splitModel(t, midway, release)
+	defer model.Close()
+	// ★ 先放行、再关模型（defer 倒序执行）。测试中途失败时假模型还卡在
+	//   等放行上，httptest 的 Close 要等所有请求结束——不先放行就会卡死
+	//   到 go test 的 10 分钟超时，而不是立刻报错。
+	defer openGate()
+
+	srv := startServer(t, model.URL)
+	cli := register(t, srv, "refresher")
+
+	// ① 提问，读到模型吐出「前半句」为止
+	first := postChat(t, cli, srv, "", "刷新测试的问题")
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("提问返回 %d", first.StatusCode)
+	}
+	sc := bufio.NewScanner(first.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 4<<20)
+	before := readUntil(t, first.Body, sc, func(e event) bool { return e.T == "token" && e.Text == "前半句" })
+	session := pick(before, "hello")[0].Session
+
+	// ② 刷新：把这条连接掐掉
+	first.Body.Close()
+	cli.CloseIdleConnections()
+
+	// ③ 刷新后的页面：聊天记录里有问题，后面跟着「正在回答」
+	var msgs []Message
+	getJSON(t, cli, srv.URL+"/api/sessions/"+session, &msgs)
+	if len(msgs) != 2 || msgs[0].Text != "刷新测试的问题" || !msgs[1].Running {
+		t.Fatalf("刷新后应该看到「问题 + 正在回答」，实际：%+v", msgs)
+	}
+	var list []Session
+	getJSON(t, cli, srv.URL+"/api/sessions", &list)
+	if len(list) != 1 || !list[0].Running || list[0].Title != "刷新测试的问题" {
+		t.Errorf("会话列表应该带标题并标着在跑，实际：%+v", list)
+	}
+
+	// ④ 重新连上：前半句从头补发
+	resp, err := cli.Get(srv.URL + "/api/sessions/" + session + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("接着看返回 %d，期望 200", resp.StatusCode)
+	}
+	sc2 := bufio.NewScanner(resp.Body)
+	sc2.Buffer(make([]byte, 0, 64*1024), 4<<20)
+	replayed := readUntil(t, resp.Body, sc2, func(e event) bool { return e.T == "token" && e.Text == "前半句" })
+	if len(pick(replayed, "hello")) != 1 {
+		t.Errorf("补发里应该有开头那条 hello：%+v", replayed)
+	}
+
+	// ⑤ 放行模型：后半句要**接着实时推**过来，直到 done
+	openGate()
+	rest := readUntil(t, resp.Body, sc2, func(e event) bool { return e.T == "done" || e.T == "error" })
+	var tail strings.Builder
+	for _, e := range pick(rest, "token") {
+		tail.WriteString(e.Text)
+	}
+	if !strings.Contains(tail.String(), "后半句") {
+		t.Errorf("重新连上之后没收到后半句：%+v", rest)
+	}
+	if last := rest[len(rest)-1]; last.T != "done" {
+		t.Fatalf("接着看的流没有以 done 收尾：%+v", last)
+	}
+
+	// ⑥ 答完：聊天记录里是完整答案，不再是「正在回答」
+	getJSON(t, cli, srv.URL+"/api/sessions/"+session, &msgs)
+	if len(msgs) != 2 || msgs[1].Running || !strings.Contains(msgs[1].Text, "前半句后半句") {
+		t.Errorf("答完之后聊天记录不对：%+v", msgs)
+	}
+	// ⑦ 再来接着看：已经没在跑了 → 404，前端据此改去拉聊天记录
+	again, err := cli.Get(srv.URL + "/api/sessions/" + session + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Body.Close()
+	if again.StatusCode != http.StatusNotFound {
+		t.Errorf("答完之后再接着看返回 %d，期望 404", again.StatusCode)
+	}
+}
+
 // ── 小工具 ──────────────────────────────────────────────────
+
+// 一道闸门：假模型卡在它上面，测试决定什么时候放行。
+// 放行可以调任意多次（第二次起什么都不做），所以既能在测试中间主动放行，
+// 也能在退出时用 defer 兜底。
+func newGate() (chan struct{}, func()) {
+	ch := make(chan struct{})
+	var once sync.Once
+	return ch, func() { once.Do(func() { close(ch) }) }
+}
 
 // 读到 hello 事件为止，返回会话 id。流不关，调用方继续用。
 func readUntilHello(t *testing.T, resp *http.Response) string {

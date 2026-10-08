@@ -58,6 +58,7 @@ pub fn outcome_tag(o: &TurnOutcome) -> &'static str {
         TurnOutcome::ProtocolError(_) => "protocol_error",
         TurnOutcome::ContextBudget { .. } => "context_budget",
         TurnOutcome::ModelError(_) => "model_error",
+        TurnOutcome::Cancelled => "cancelled",
     }
 }
 
@@ -340,6 +341,7 @@ mod tests {
             outcome_tag(&TurnOutcome::ModelError("x".into())),
             "model_error"
         );
+        assert_eq!(outcome_tag(&TurnOutcome::Cancelled), "cancelled");
     }
 
     #[test]

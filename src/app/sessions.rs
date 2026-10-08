@@ -51,6 +51,12 @@ pub struct UiMessage {
     pub running: bool,
     /// 这一轮跑到一半服务停了（崩溃、被杀）。同样是占位消息。
     pub interrupted: bool,
+    /// 用户点了停止。
+    ///
+    /// 和 failed 分开：停止是用户自己要的，界面说「已停止」而不是「没有正常
+    /// 结束」。这一轮如果模型在调工具之前说过一句话（「我来帮你搜一下」），
+    /// 那句话照常显示、带着这个标记；一句都没说过的话，是一条空的占位。
+    pub cancelled: bool,
 }
 
 /// 找不到，或者不是你的。
@@ -135,15 +141,17 @@ fn project(rows: Vec<(i64, String, String, String)>) -> Vec<UiMessage> {
                 failed: false,
                 running: false,
                 interrupted: false,
+                cancelled: false,
             }),
             "assistant_message" => {
                 let m = UiMessage {
                     role: "assistant",
                     text,
                     seq,
-                    failed: status != "done",
+                    failed: status != "done" && status != "cancelled",
                     running: false,
                     interrupted: false,
+                    cancelled: status == "cancelled",
                 };
                 match last_assistant {
                     Some(i) => out[i] = m, // 覆盖掉上一条中间思考
@@ -176,9 +184,10 @@ fn close_turn(
     if last_assistant.is_some() {
         return;
     }
-    let (running, interrupted) = match status.as_str() {
-        "running" => (true, false),
-        "interrupted" => (false, true),
+    let (running, interrupted, cancelled) = match status.as_str() {
+        "running" => (true, false, false),
+        "interrupted" => (false, true, false),
+        "cancelled" => (false, false, true),
         _ => return,
     };
     out.push(UiMessage {
@@ -188,6 +197,7 @@ fn close_turn(
         failed: interrupted,
         running,
         interrupted,
+        cancelled,
     });
 }
 
@@ -246,6 +256,27 @@ mod tests {
         ]);
         assert_eq!(got.len(), 2);
         assert!(got[1].failed && got[1].text == "半截");
+    }
+
+    /// 用户停止的一轮：说「已停止」，不说「没有正常结束」。
+    #[test]
+    fn 停止的一轮显示问题和一条停止占位_不算失败() {
+        let got = project(vec![row_st(1, "cancelled", "user_message", "问")]);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[1].cancelled && got[1].text.is_empty(), "{:?}", got[1]);
+        assert!(!got[1].failed && !got[1].interrupted && !got[1].running);
+    }
+
+    /// 停之前模型说过一句话（调工具前常有），那句话照常显示，带停止标记。
+    #[test]
+    fn 停止前模型说过的话照常显示_带停止标记() {
+        let got = project(vec![
+            row_st(1, "cancelled", "user_message", "问"),
+            row_st(1, "cancelled", "assistant_message", "我来帮你搜一下"),
+        ]);
+        assert_eq!(got.len(), 2, "有话就不该再补一条空占位：{got:?}");
+        assert_eq!(got[1].text, "我来帮你搜一下");
+        assert!(got[1].cancelled && !got[1].failed);
     }
 
     #[test]

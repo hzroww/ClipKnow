@@ -685,6 +685,9 @@ fn one_turn(
             }
         ),
         TurnOutcome::ModelError(ref e) => println!("\n模型调用失败: {e}"),
+        // 命令行这条路的取消开关永远不会打开（run_turn 给的是一个没人碰的），
+        // 走不到这里。Ctrl-C 直接结束进程。
+        TurnOutcome::Cancelled => println!("\n(已停止)"),
     }
 
     // 快满时提前提醒，别等撞墙。
@@ -802,6 +805,7 @@ fn cmd_turn_json(
             question,
             provider,
             config: &cfg,
+            control: &turn::TurnControl::standalone(),
         },
         &sink,
     )

@@ -418,6 +418,8 @@ async fn create_turn(
     // 这一轮的事件记录。执行过程往里写，订阅者（发起提问的这个连接、
     // 以及刷新后重新连上来的页面）从里面读。
     let live = permit.live();
+    // 编号、取消开关、全局名额。编号在这一刻就定了，比写库早。
+    let control = permit.control();
     let db_path = st.db_path.clone();
     let sid = session_id.clone();
     let sink = Arc::clone(&live);
@@ -432,10 +434,10 @@ async fn create_turn(
     //   Drop，所以"每条退出路径都释放"是类型系统保证的。
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        run_one_turn(&db_path, &sid, &question, provider, &sink);
-        sink.finish();
-        // _permit 在这里 Drop：名额归还、事件记录从登记表里摘掉。
-        // 摘掉之前已经连上的订阅者手里有自己的 Arc，会把剩下的读完。
+        run_one_turn(&db_path, &sid, &question, provider, &control, &sink);
+        // _permit 在这里 Drop：先放会话锁、再把事件记录标成结束（顺序见
+        // Permit 的 Drop）。已经连上的订阅者手里有自己的 Arc，会把剩下的读完。
+        // 全局名额要等这一轮丢下的工具线程（如果有）也结束才还。
     });
 
     Ok(subscribe_sse(live))
@@ -456,6 +458,7 @@ fn run_one_turn(
     sid: &str,
     question: &str,
     provider: Option<crate::agent::llm::Provider>,
+    control: &crate::app::turn::TurnControl,
     sink: &crate::app::live::LiveTurn,
 ) {
     // ★ 这个执行**自己开一条连接**，不用 AppState 里那条只读的。
@@ -477,6 +480,7 @@ fn run_one_turn(
             question,
             provider,
             config: &cfg,
+            control,
         };
         crate::app::turn::execute(&mut store, &req, sink)
     }));
@@ -1428,7 +1432,9 @@ mod tests {
     fn 会话列表带着在跑的标记() {
         let (st, sid) = two_users();
         // 测试里的库是内存库，只有 AppState 手里那一条连接能看到它
-        st.read().begin_turn(&sid, "m", "q", "q").unwrap();
+        st.read()
+            .begin_turn(&crate::content::model::new_id(), &sid, "m", "q", "q")
+            .unwrap();
         let srv = testserver::spawn(st);
         let v: serde_json::Value = get_as(&srv, "u_alice", "/internal/sessions")
             .json()

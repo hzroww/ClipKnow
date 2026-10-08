@@ -737,20 +737,24 @@ impl SqliteStore {
     //   begin_turn   提问一被接受就写：一行 status='running' + 用户的问题 + 标题
     //   finish_turn  答完再写：其余条目追加进去，状态改成终态
     //
-    // 给模型拼历史的查询**只认 status='done'**（load_turns_with_items 等），
+    // 给模型拼历史的查询**只认 done 和 cancelled**（load_turns_with_items 等），
     // 所以 running 的这一轮不会混进下一次提问的上下文。
 
-    /// 提问被接受时调用。写一行 running 的 turn 和用户的问题，返回 (turn_id, seq)。
+    /// 提问被接受时调用。写一行 running 的 turn 和用户的问题，返回 seq。
+    ///
+    /// `turn_id` 由调用方给：服务模式下它在**申请名额的那一刻**就定了
+    /// （`app::registry`），比这一行早——这样从能取消的第一刻起这一轮就有
+    /// 编号，取消请求按编号找目标，迟到的请求停不掉后来的新问题。
     ///
     /// `title` 只在会话还没有标题时写——也就是第一次提问。
     pub fn begin_turn(
         &mut self,
+        turn_id: &str,
         session_id: &str,
         model: &str,
         question: &str,
         title: &str,
-    ) -> Result<(String, i64)> {
-        let turn_id = new_id();
+    ) -> Result<i64> {
         let ts = now_ts();
         let tx = write_tx(&mut self.conn)?;
         let seq: i64 = tx.query_row(
@@ -773,14 +777,14 @@ impl SqliteStore {
         // ★ 和循环里 `Item::user_message(1, question)` 那一条**完全一样**
         //   （同一个构造函数、同一个 idx）。finish_turn 追加时会跳过
         //   UserMessage，所以不会存两遍。
-        insert_items(&tx, &turn_id, &[Item::user_message(1, question)], ts, false)?;
+        insert_items(&tx, turn_id, &[Item::user_message(1, question)], ts, false)?;
         tx.execute(
             "UPDATE sessions SET title = ?2 WHERE id = ?1 AND (title IS NULL OR title = '')",
             params![session_id, title],
         )?;
         touch_session(&tx, session_id, ts)?;
         tx.commit()?;
-        Ok((turn_id, seq))
+        Ok(seq)
     }
 
     /// 一轮跑完时调用。把其余条目追加进去，状态从 running 改成终态。
@@ -841,32 +845,20 @@ impl SqliteStore {
     /// **刻意不取 `raw_json`**：这个查询每轮循环都要跑一次，
     /// 而单条 SC 原始响应能有 2MB，带上就是每轮白读一遍再扔掉。
     ///
-    /// **只取 `status='done'` 的 turn。** 失败的 turn 不进下一次提问的上下文：
+    /// **只取 `done` 和 `cancelled` 的 turn。** 失败的 turn 不进下一次提问的上下文：
     ///   - 贵：一次撞迭代上限的 turn 可能攒了几万 token
     ///   - 误导：模型看到「我上次试了这堆方向都没成」，可能重走死路
     ///   - 危险：截断的 turn 里可能有没配对的 function_call，发出去直接 400
     ///
-    /// 但它们还在库里，`list_turns` / `get_raw_json` 照样查得到。
+    /// 用户停止的（cancelled）进：那是用户自己要停的，历史是完整配对的，
+    /// 而且后面跟一句提示（见 `agent::cancel::CANCELLED_TURN_NOTE`）。
+    ///
+    /// 但它们都还在库里，`list_turns` / `get_raw_json` 照样查得到。
+    ///
+    /// 就是 [`Self::load_turns_with_items`] 摊平。两份查询各写一遍的话，
+    /// 「哪些 turn 进上下文」迟早两处不一致。
     pub fn load_history(&self, session_id: &str) -> Result<Vec<Item>> {
-        // 有摘要的话：摘要顶在最前面，它覆盖的 turn 全部跳过
-        let compaction = self.latest_compaction(session_id)?;
-        let floor = compaction.as_ref().map(|(_, u)| *u).unwrap_or(0);
-
-        let mut stmt = self.conn.prepare(
-            "SELECT i.idx, i.item_type, i.iteration, i.call_id, i.payload_json
-             FROM items i JOIN turns t ON t.id = i.turn_id
-             WHERE t.session_id = ?1 AND t.status = 'done' AND t.seq > ?2
-             ORDER BY t.seq, i.idx",
-        )?;
-        let rows = stmt.query_map(params![session_id, floor], |r| row_to_item(r, 0))?;
-        let mut out: Vec<Item> = Vec::new();
-        if let Some((summary, _)) = compaction {
-            // 摘要以一条 user_message 的形式进上下文。用 user 而不是 assistant，
-            // 是因为它是「运行时提供的材料」，不是模型自己说过的话。
-            out.push(Item::user_message(0, &summary));
-        }
-        out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
-        Ok(out)
+        Ok(self.load_turns_with_items(session_id)?.to_items())
     }
 
     /// 存一份视觉档案。**追加，不覆盖。**
@@ -1092,7 +1084,8 @@ impl SqliteStore {
         })
     }
 
-    /// 按 turn 分组的历史，给切点选择用。已过滤失败的 turn。
+    /// 按 turn 分组的历史，给切点选择用。已过滤失败的 turn，规则见
+    /// [`Self::load_history`]。
     ///
     /// 被摘要覆盖的 turn 不读原文，**但摘要本身要一起带出去**——只跳过不带回，
     /// 压缩就成了「把旧 turn 直接删掉」。
@@ -1100,25 +1093,40 @@ impl SqliteStore {
         let compaction = self.latest_compaction(session_id)?;
         let floor = compaction.as_ref().map(|(_, u)| *u).unwrap_or(0);
         let mut stmt = self.conn.prepare(
-            "SELECT t.seq, i.idx, i.item_type, i.iteration, i.call_id, i.payload_json
+            "SELECT t.seq, t.status, i.idx, i.item_type, i.iteration, i.call_id, i.payload_json
              FROM items i JOIN turns t ON t.id = i.turn_id
-             WHERE t.session_id = ?1 AND t.status = 'done' AND t.seq > ?2
+             WHERE t.session_id = ?1 AND t.status IN ('done', 'cancelled') AND t.seq > ?2
              ORDER BY t.seq, i.idx",
         )?;
         let rows = stmt.query_map(params![session_id, floor], |r| {
             let seq: i64 = r.get(0)?;
-            Ok((seq, row_to_item(r, 1)?))
+            let status: String = r.get(1)?;
+            Ok((seq, status, row_to_item(r, 2)?))
         })?;
         let mut turns: Vec<TurnItems> = Vec::new();
+        // 和 turns 一一对应：这一轮是不是用户停止的
+        let mut cancelled: Vec<bool> = Vec::new();
         for row in rows {
-            let (seq, item) = row?;
+            let (seq, status, item) = row?;
             match turns.last_mut() {
                 Some(t) if t.seq == seq => t.items.push(item),
-                _ => turns.push(TurnItems {
-                    seq,
-                    items: vec![item],
-                }),
+                _ => {
+                    turns.push(TurnItems {
+                        seq,
+                        items: vec![item],
+                    });
+                    cancelled.push(TurnStatus::from_db(&status) == TurnStatus::Cancelled);
+                }
             }
+        }
+        // ★ 停止的那一轮后面跟一句提示。放在读历史这一处，所有用历史的地方
+        //   （拼上下文、压缩、估算长度）就都看得到，不用各加一遍。
+        for (t, _) in turns.iter_mut().zip(&cancelled).filter(|(_, c)| **c) {
+            let next = t.items.last().map_or(1, |i| i.idx + 1);
+            t.items.push(Item::user_message(
+                next,
+                crate::agent::cancel::CANCELLED_TURN_NOTE,
+            ));
         }
         Ok(History {
             summary: compaction.as_ref().map(|(s, _)| s.clone()),
@@ -1127,14 +1135,15 @@ impl SqliteStore {
         })
     }
 
-    /// 历史有多少条。口径和 `load_history` 一致（只数 done 的）。
+    /// 历史有多少条。口径和 `load_history` 一致（只数 done 和 cancelled 的，
+    /// 不算停止的那一轮后面那句提示）。
     ///
     /// `--continue` 时只想打印个条数，为此把几万字符的 payload 读出来再数一遍
     /// 是浪费。
     pub fn count_history(&self, session_id: &str) -> Result<usize> {
         let n: i64 = self.conn.query_row(
             "SELECT count(*) FROM items i JOIN turns t ON t.id = i.turn_id
-             WHERE t.session_id = ?1 AND t.status = 'done'",
+             WHERE t.session_id = ?1 AND t.status IN ('done', 'cancelled')",
             params![session_id],
             |r| r.get(0),
         )?;
@@ -1237,7 +1246,7 @@ mod two_phase_tests {
     #[test]
     fn 开始跑时问题和标题就已经在库里() {
         let (mut s, sid) = store_with_session();
-        s.begin_turn(&sid, "m", "这条视频讲什么", "这条视频讲什么")
+        s.begin_turn(&new_id(), &sid, "m", "这条视频讲什么", "这条视频讲什么")
             .unwrap();
 
         let turns = s.list_turns(&sid).unwrap();
@@ -1270,7 +1279,7 @@ mod two_phase_tests {
         let (mut s, sid) = store_with_session();
         s.save_turn(&sid, "m", TurnStatus::Done, &loop_items("老问题", "老答案"))
             .unwrap();
-        s.begin_turn(&sid, "m", "新问题", "t").unwrap();
+        s.begin_turn(&new_id(), &sid, "m", "新问题", "t").unwrap();
         let h = s.load_turns_with_items(&sid).unwrap();
         assert_eq!(h.turns.len(), 1, "running 的那一轮混进了给模型的历史");
         assert_eq!(s.load_history(&sid).unwrap().len(), 2);
@@ -1279,7 +1288,8 @@ mod two_phase_tests {
     #[test]
     fn 答完后补上其余条目_问题不重复() {
         let (mut s, sid) = store_with_session();
-        let (tid, seq) = s.begin_turn(&sid, "m", "问", "问").unwrap();
+        let tid = new_id();
+        let seq = s.begin_turn(&tid, &sid, "m", "问", "问").unwrap();
         assert_eq!(seq, 1);
         s.finish_turn(&tid, &sid, TurnStatus::Done, &loop_items("问", "答"))
             .unwrap();
@@ -1293,13 +1303,57 @@ mod two_phase_tests {
         assert_eq!(h.turns[0].items.len(), 2);
     }
 
+    /// ★ 用户停止的一轮进下次的历史，后面跟一句提示；失败的照旧不进。
+    ///
+    /// 没有这句提示，模型会以为停掉的那个问题已经答过了。
+    #[test]
+    fn 停止的一轮进下次的历史_后面跟一句提示() {
+        let (mut s, sid) = store_with_session();
+        let t1 = new_id();
+        s.begin_turn(&t1, &sid, "m", "第一问", "第一问").unwrap();
+        let stopped = vec![
+            Item::user_message(1, "第一问"),
+            Item::assistant_message(2, 1, "我来查一下"),
+            Item::function_call(3, 1, "call_1", "search_videos", &serde_json::json!({})),
+            Item::function_call_output(4, 1, "call_1", "已取消", true, None),
+        ];
+        s.finish_turn(&t1, &sid, TurnStatus::Cancelled, &stopped)
+            .unwrap();
+        let t2 = new_id();
+        s.begin_turn(&t2, &sid, "m", "第二问", "第二问").unwrap();
+        s.finish_turn(
+            &t2,
+            &sid,
+            TurnStatus::Failed("x".into()),
+            &loop_items("第二问", "半截"),
+        )
+        .unwrap();
+
+        let h = s.load_turns_with_items(&sid).unwrap();
+        assert_eq!(h.turns.len(), 1, "停止的该进、失败的不该进");
+        let items = &h.turns[0].items;
+        assert_eq!(items.len(), 5, "库里 4 条 + 1 句提示");
+        let last = items.last().unwrap();
+        assert_eq!(last.kind, ItemKind::UserMessage);
+        assert_eq!(
+            last.payload["text"],
+            crate::agent::cancel::CANCELLED_TURN_NOTE
+        );
+        assert!(last.idx > items[3].idx, "提示要排在这一轮最后");
+
+        // 摊平的版本、条数，口径都一致（条数不算那句提示——库里没有它）
+        assert_eq!(s.load_history(&sid).unwrap().len(), 5);
+        assert_eq!(s.count_history(&sid).unwrap(), 4);
+    }
+
     /// ★ 已经被标成中断的一轮，不能再被「答完」覆盖回 done。
     ///
     /// 两个终态互相覆盖，库里的状态就不可信了。
     #[test]
     fn 已中断的一轮不能再被收尾覆盖() {
         let (mut s, sid) = store_with_session();
-        let (tid, _) = s.begin_turn(&sid, "m", "问", "问").unwrap();
+        let tid = new_id();
+        s.begin_turn(&tid, &sid, "m", "问", "问").unwrap();
         assert_eq!(s.interrupt_running(None).unwrap(), 1);
         let e = s
             .finish_turn(&tid, &sid, TurnStatus::Done, &loop_items("问", "答"))
@@ -1318,8 +1372,8 @@ mod two_phase_tests {
         let mut s = SqliteStore::in_memory().unwrap();
         let a = s.create_session(None, None).unwrap();
         let b = s.create_session(None, None).unwrap();
-        s.begin_turn(&a, "m", "a", "a").unwrap();
-        s.begin_turn(&b, "m", "b", "b").unwrap();
+        s.begin_turn(&new_id(), &a, "m", "a", "a").unwrap();
+        s.begin_turn(&new_id(), &b, "m", "b", "b").unwrap();
         assert_eq!(s.interrupt_running(Some(&a)).unwrap(), 1);
         assert_eq!(
             s.count_for_test("SELECT count(*) FROM turns WHERE status = 'running'")
@@ -1332,10 +1386,12 @@ mod two_phase_tests {
     #[test]
     fn 标题只在第一次写() {
         let (mut s, sid) = store_with_session();
-        let (t1, _) = s.begin_turn(&sid, "m", "第一问", "第一问").unwrap();
+        let t1 = new_id();
+        s.begin_turn(&t1, &sid, "m", "第一问", "第一问").unwrap();
         s.finish_turn(&t1, &sid, TurnStatus::Done, &loop_items("第一问", "答"))
             .unwrap();
-        s.begin_turn(&sid, "m", "第二问", "第二问").unwrap();
+        s.begin_turn(&new_id(), &sid, "m", "第二问", "第二问")
+            .unwrap();
         assert_eq!(
             s.count_for_test("SELECT count(*) FROM sessions WHERE title = '第一问'")
                 .unwrap(),
@@ -1354,7 +1410,7 @@ mod two_phase_tests {
         .unwrap();
         let a = s.create_session(None, Some("u")).unwrap();
         let _b = s.create_session(None, Some("u")).unwrap();
-        s.begin_turn(&a, "m", "q", "q").unwrap();
+        s.begin_turn(&new_id(), &a, "m", "q", "q").unwrap();
         let running = s.running_sessions_for_user("u").unwrap();
         assert_eq!(running.len(), 1);
         assert!(running.contains(&a));

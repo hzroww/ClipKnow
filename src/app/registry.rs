@@ -17,6 +17,24 @@
 //!
 //! `max_total` 默认 [`DEFAULT_MAX_TURNS`]，`clipknow serve --max-turns N` 可改。
 //!
+//! ## 会话锁和全局名额是两样东西
+//!
+//! ```text
+//! 会话锁    这一轮一结束（包括被停止）就放开，用户能马上接着问
+//! 全局名额  这一轮**和它丢下的工具线程**都结束了才还
+//! ```
+//!
+//! 用户点停止时，循环不再等正在跑的工具（`agent::exec`），但那个工具还在
+//! 后台下载视频、占着内存。名额要是跟着会话锁一起还，用户反复「问、停、
+//! 再问」就能叠出任意多个同时进行的下载——而「最多同时跑几个」本来就是
+//! 内存的上限（一个视频整个读进内存，最大 512MB）。
+//!
+//! ## 取消按「这一轮」找，不按会话找
+//!
+//! 每一轮在申请名额时就分到一个编号（`turn_id`，之后就是 `turns` 表那一行
+//! 的 id）。取消请求带着编号来，和登记表里这个会话正在跑的那一轮对不上就
+//! 什么都不做——一个迟到的取消请求永远停不掉用户后来发的新问题。
+//!
 //! **没有「每个用户最多几个」。** 所以同一个人开两个会话可以同时问。要加的话
 //! 是一张 `per_user: HashMap<user_id, usize>`，在 `admit` 里多检查一项——
 //! 数据结构和调用点都不用动。
@@ -42,6 +60,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use super::live::LiveTurn;
+use super::turn::TurnControl;
+use crate::agent::cancel::CancelSignal;
+use crate::content::model::new_id;
 
 /// 默认最多同时跑几个提问（全局）。`clipknow serve --max-turns` 可改。
 ///
@@ -69,7 +90,7 @@ impl Reject {
                 elapsed.as_secs_f64()
             ),
             Reject::Capacity { running, elapsed } => format!(
-                "服务正忙（{running} 个提问在跑，最久的已经 {:.0} 秒），稍后再试",
+                "服务正忙（{running} 个提问在跑或刚停止还在收尾，最久的已经 {:.0} 秒），稍后再试",
                 elapsed.as_secs_f64()
             ),
             Reject::ShuttingDown => "服务正在停机，暂时不接受新的提问".into(),
@@ -89,14 +110,21 @@ impl Reject {
 /// 一个正在跑的执行。
 struct Running {
     started: Instant,
+    /// 这一轮的编号。取消请求拿它核对目标。
+    turn_id: String,
+    /// 这一轮的取消开关。
+    cancel: CancelSignal,
     /// 这一轮发过的全部事件。刷新后的页面从这里补发、接着看。
     live: Arc<LiveTurn>,
 }
 
 #[derive(Default)]
 struct Inner {
-    /// session_id → 正在跑的那一轮
+    /// session_id → 正在跑的那一轮（这就是「会话锁」）
     running: HashMap<String, Running>,
+    /// 全局名额用掉了几个。**可能比 `running` 多**：被停止的轮次丢下的工具
+    /// 线程还在跑时，它的名额还没还。
+    slots_in_use: usize,
     /// 收到停机信号之后变 false，之后一律拒绝。
     accepting: bool,
 }
@@ -122,6 +150,7 @@ impl Registry {
         Arc::new(Registry {
             inner: Mutex::new(Inner {
                 running: HashMap::new(),
+                slots_in_use: 0,
                 accepting: true,
             }),
             max_total,
@@ -140,7 +169,8 @@ impl Registry {
     ///
     /// 两项检查在**同一把锁里**完成，中间没有空窗：
     ///   ① 这个会话是不是已经在跑（→ SessionBusy）
-    ///   ② 全局名额够不够（→ Capacity）
+    ///   ② 全局名额够不够（→ Capacity）。数的是名额，不是在跑的轮次——
+    ///      被停止的轮次丢下的工具还在跑时也占着一个
     ///
     /// 抢不到**不排队**。排队的话用户点了发送、界面一动不动，分不清是卡了
     /// 还是坏了；明确拒绝并说明原因，至少知道发生了什么。
@@ -154,7 +184,7 @@ impl Registry {
                 elapsed: r.started.elapsed(),
             });
         }
-        if inner.running.len() >= self.max_total {
+        if inner.slots_in_use >= self.max_total {
             let oldest = inner
                 .running
                 .values()
@@ -162,23 +192,55 @@ impl Registry {
                 .max()
                 .unwrap_or_default();
             return Err(Reject::Capacity {
-                running: inner.running.len(),
+                running: inner.slots_in_use,
                 elapsed: oldest,
             });
         }
         let live = LiveTurn::new();
+        let turn_id = new_id();
+        let cancel = CancelSignal::new();
         inner.running.insert(
             session_id.to_string(),
             Running {
                 started: Instant::now(),
+                turn_id: turn_id.clone(),
+                cancel: cancel.clone(),
                 live: Arc::clone(&live),
             },
         );
+        inner.slots_in_use += 1;
         Ok(Permit {
             registry: Arc::clone(self),
             session_id: session_id.to_string(),
+            turn_id,
+            cancel,
             live,
+            slot: Arc::new(Slot {
+                registry: Arc::clone(self),
+            }),
         })
+    }
+
+    /// 停止一轮：会话对、编号也对，才打开它的取消开关。
+    ///
+    /// 返回它的事件记录，调用方用它等这一轮真正结束（记录被标成结束的那一刻，
+    /// 会话锁已经放开了，见 `Permit` 的 Drop）。
+    ///
+    /// 返回 None：这个会话现在没在跑，或者跑的不是这一轮——**什么都不做**。
+    /// 这一轮多半已经结束了，调用方去库里查它的结局。
+    pub fn request_cancel(&self, session_id: &str, turn_id: &str) -> Option<Arc<LiveTurn>> {
+        let inner = self.lock();
+        let r = inner.running.get(session_id)?;
+        if r.turn_id != turn_id {
+            return None;
+        }
+        r.cancel.cancel();
+        Some(Arc::clone(&r.live))
+    }
+
+    /// 全局名额用掉了几个（含被停止的轮次还在后台跑的工具）。
+    pub fn slots_in_use(&self) -> usize {
+        self.lock().slots_in_use
     }
 
     /// 这个会话正在跑的那一轮的事件记录。没在跑返回 None。
@@ -209,6 +271,10 @@ impl Registry {
     ///
     /// 返回还剩几个没跑完（0 = 都收干净了）。
     ///
+    /// 只等**轮次**，不等被停止的轮次丢下的工具线程：它们的结果本来就作废，
+    /// 进程退出时一起结束。它们正在写的缓存是一个 SQLite 事务，写一半断掉
+    /// 等于没写。
+    ///
     /// 轮询而不是用条件变量：停机一辈子就走一次，多等 100 毫秒无所谓，
     /// 而条件变量要求每条归还路径都记得 notify——又回到了「靠记得」。
     /// `Permit` 的 Drop 只做一件事（从 map 里删掉），这是刻意的。
@@ -233,12 +299,29 @@ impl Registry {
 pub struct Permit {
     registry: Arc<Registry>,
     session_id: String,
+    turn_id: String,
+    cancel: CancelSignal,
     live: Arc<LiveTurn>,
+    /// 全局名额。Permit 手里一份，工具线程手里各一份，最后一份放手时才还。
+    slot: Arc<Slot>,
 }
 
 impl Permit {
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// 跑这一轮要带上的：编号、取消开关、全局名额。交给 `app::turn::execute`。
+    pub fn control(&self) -> TurnControl {
+        TurnControl {
+            turn_id: self.turn_id.clone(),
+            cancel: self.cancel.clone(),
+            held: Some(Arc::clone(&self.slot) as Arc<dyn std::any::Any + Send + Sync>),
+        }
     }
 
     /// 这一轮的事件记录。执行过程把事件写进这里，订阅者从这里读。
@@ -265,11 +348,31 @@ impl Eq for Permit {}
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // ★ 兜底收尾：执行任务正常会自己调 finish，但它要是 panic 了，
-        //   订阅者会永远等下一条事件。名额归还的那一刻一定是这一轮彻底
-        //   结束了，在这里再收一次尾（finish 调多次没关系）。
-        self.live.finish();
+        // ★ 先放会话锁，**再**把事件记录标成结束。
+        //
+        //   取消接口等的就是「记录结束」，等到了就告诉前端「停好了」，前端
+        //   马上在同一个会话里发下一个问题。顺序反过来的话，中间有一小段
+        //   记录已经结束、会话锁还没放的空档，那个新问题会撞上 409「上一个
+        //   问题还在跑」。
+        //
+        //   这里也是兜底收尾：执行任务 panic 了的话没人调 finish，订阅者会
+        //   永远等下一条事件。
         self.registry.lock().running.remove(&self.session_id);
+        self.live.finish();
+        // 全局名额在字段 `slot` 被 Drop 时还——要是还有工具线程拿着，
+        // 等它们结束才还。
+    }
+}
+
+/// 一个全局名额。最后一份 `Arc<Slot>` 放手时归还。
+struct Slot {
+    registry: Arc<Registry>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut inner = self.registry.lock();
+        inner.slots_in_use = inner.slots_in_use.saturating_sub(1);
     }
 }
 
@@ -412,6 +515,102 @@ mod tests {
             drop(p);
         });
         assert_eq!(reg.wait_until_idle(Duration::from_secs(5)), 0);
+    }
+
+    // ── 取消 ───────────────────────────────────────────────
+
+    #[test]
+    fn 每一轮申请名额时就分到编号_各不相同() {
+        let reg = Registry::with_capacity(4);
+        let a = reg.admit("s1").unwrap();
+        let b = reg.admit("s2").unwrap();
+        assert!(!a.turn_id().is_empty());
+        assert_ne!(a.turn_id(), b.turn_id());
+        assert_eq!(a.control().turn_id, a.turn_id());
+    }
+
+    /// ★ 编号对不上就什么都不做——迟到的取消请求停不掉后来的新问题。
+    #[test]
+    fn 编号对得上才会打开取消开关() {
+        let reg = Registry::with_capacity(4);
+        let p = reg.admit("s1").unwrap();
+        let ctl = p.control();
+
+        assert!(reg.request_cancel("s1", "别的编号").is_none());
+        assert!(reg.request_cancel("s2", p.turn_id()).is_none(), "会话不对");
+        assert!(!ctl.cancel.is_cancelled(), "编号不对却打开了开关");
+
+        let live = reg.request_cancel("s1", p.turn_id()).expect("编号对得上");
+        assert!(ctl.cancel.is_cancelled());
+        assert!(Arc::ptr_eq(&live, &p.live()));
+    }
+
+    /// 上一轮停完、马上在同一个会话发新问题：新的一轮有新编号，拿旧编号来
+    /// 停什么都不会发生。
+    #[test]
+    fn 拿上一轮的编号停不掉新的一轮() {
+        let reg = Registry::with_capacity(4);
+        let old = reg.admit("s1").unwrap();
+        let old_id = old.turn_id().to_string();
+        drop(old);
+        let new = reg.admit("s1").unwrap();
+        assert!(reg.request_cancel("s1", &old_id).is_none());
+        assert!(!new.control().cancel.is_cancelled());
+    }
+
+    /// ★ 会话锁一结束就放；全局名额等丢下的工具线程也结束才还。
+    #[test]
+    fn 会话锁马上放开_全局名额等工具线程放手才还() {
+        let reg = Registry::with_capacity(2);
+        let p = reg.admit("s1").unwrap();
+        // 工具线程手里那一份
+        let held = p.control().held.expect("服务模式下要给工具线程一份名额");
+        drop(p);
+
+        assert_eq!(reg.running_count(), 0);
+        assert_eq!(reg.slots_in_use(), 1, "工具还在跑，名额就还了");
+        let again = reg
+            .admit("s1")
+            .expect("这一轮结束了，同一个会话该能马上再问");
+        assert_eq!(reg.slots_in_use(), 2);
+        assert!(
+            matches!(reg.admit("s2"), Err(Reject::Capacity { running: 2, .. })),
+            "被丢下的工具占着的名额也该算数"
+        );
+
+        drop(held);
+        assert_eq!(reg.slots_in_use(), 1);
+        let _s2 = reg.admit("s2").expect("工具线程放手之后名额该回来了");
+        drop(again);
+    }
+
+    /// ★ 事件记录被标成结束的那一刻，会话锁一定已经放开了。
+    ///
+    ///   取消接口等的就是「记录结束」，等到就告诉前端停好了，前端马上在同一个
+    ///   会话里发下一个问题。顺序反过来的话那个问题会撞 409。
+    ///
+    ///   空档只有几微秒，靠「多跑几遍碰运气」测不出来（试过，300 遍一次都没
+    ///   撞上）。所以换成确定的做法：测试**拿着登记表的锁**，让另一条线程去
+    ///   结束这一轮。顺序对的话，它卡在「放会话锁」那一步，记录还没结束；
+    ///   顺序反了的话，记录先结束了、它才卡在锁上。
+    #[test]
+    fn 记录结束时会话锁一定已经放开() {
+        let reg = Registry::with_capacity(4);
+        let p = reg.admit("s1").unwrap();
+        let live = p.live();
+
+        let guard = reg.lock();
+        let ender = std::thread::spawn(move || drop(p));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !live.read_from(0).1,
+            "会话锁还没放（登记表被测试拿着），事件记录却已经标成结束了"
+        );
+        drop(guard);
+        ender.join().unwrap();
+
+        assert!(live.read_from(0).1);
+        assert!(reg.live("s1").is_none());
     }
 
     /// 多个线程同时抢同一个会话，只能有一个拿到。

@@ -7,10 +7,11 @@
 //! 把状态显式画出来，是为了让**哪些转移不存在**也变得明确——
 //! 大部分 bug 出在不该走通的边被无意走通了。见 7.3 节的三条。
 
+use crate::agent::cancel::CancelSignal;
 use crate::agent::compaction::{
     History, SUMMARIZE_PROMPT, parse_summary, pick_split, render_raw_fallback,
 };
-use crate::agent::exec::{InlineTools, ToolExecutor};
+use crate::agent::exec::{InlineTools, ToolExecutor, ToolRun};
 use crate::agent::llm::{LlmClient, ModelRequest, Msg, StopReason, ToolResult};
 use crate::agent::tools::tool_defs;
 use crate::content::evidence::{
@@ -109,6 +110,12 @@ pub enum TurnOutcome {
         limit: usize,
     },
     ModelError(String),
+    /// 用户点了停止。
+    ///
+    /// 模型正在说的话会让它说完（见 `agent::cancel`）：说完是最终答案的话，
+    /// 结局是 `Done` 而不是这个——只有「还有事没做完」时才是 Cancelled。
+    /// 所以这一轮一定**没有**最终答案。
+    Cancelled,
 }
 
 pub struct TurnResult {
@@ -414,6 +421,8 @@ impl TurnObserver for NoopObserver {
 pub struct TurnDeps<'a> {
     pub llm: &'a dyn LlmClient,
     pub tools: &'a mut dyn ToolExecutor,
+    /// 用户点了停止。循环在固定的位置看它，规则见 `agent::cancel`。
+    pub cancel: &'a CancelSignal,
 }
 
 /// 跑一次提问。不关心进度就用这个（CLI、测试）。
@@ -430,6 +439,8 @@ pub fn run_turn(
         TurnDeps {
             llm,
             tools: &mut InlineTools { api, store, vision },
+            // 命令行和测试没有「停止」按钮，给一个永远不会打开的
+            cancel: &CancelSignal::new(),
         },
         history,
         question,
@@ -449,6 +460,7 @@ pub fn run_turn_observed(
     let TurnDeps {
         llm,
         tools: executor,
+        cancel,
     } = deps;
 
     // 两本账。settle() 是唯一同时改它们的地方——分开改的话，
@@ -545,6 +557,14 @@ pub fn run_turn_observed(
     let mut settled_msgs = 0usize;
 
     loop {
+        // ★ 取消检查点 ①：两步之间，准备调模型之前。
+        //   上一步是压缩历史、或者刚执行完一批工具——它们都已经做完了，
+        //   在这里停不浪费任何东西。
+        if cancel.is_cancelled() {
+            res.outcome = TurnOutcome::Cancelled;
+            return res;
+        }
+
         // ── CallingModel 入口 ────────────────────────────────
         iteration += 1;
         if iteration > cfg.max_iterations {
@@ -621,7 +641,7 @@ pub fn run_turn_observed(
                     &mut res.items,
                     &mut idx,
                     iteration as i64,
-                    &resp,
+                    &resp.tool_calls,
                     TRUNCATED_CALL,
                 );
                 res.answer = resp.text;
@@ -633,7 +653,7 @@ pub fn run_turn_observed(
                     &mut res.items,
                     &mut idx,
                     iteration as i64,
-                    &resp,
+                    &resp.tool_calls,
                     PROTOCOL_CALL,
                 );
                 res.answer = resp.text;
@@ -654,6 +674,10 @@ pub fn run_turn_observed(
         // ★ 终止条件只看 tool_calls 是否为空，**不看 text**。
         //   实测 DeepSeek 发起工具调用时常常同时说一句话，
         //   拿 text 判断第一轮就会误判结束。
+        //
+        // ★ 这里**不看取消信号**。模型正在说的话让它说完（产品决定，见
+        //   agent::cancel）：说完了是最终答案，就照常算完成——哪怕用户在它
+        //   说话的时候点了停止。答案已经付过钱、也已经流到用户眼前了。
         if resp.tool_calls.is_empty() {
             res.answer = resp.text;
             res.outcome = TurnOutcome::Done;
@@ -662,7 +686,23 @@ pub fn run_turn_observed(
         }
 
         // ── ExecutingTools：唯一出边是回到 CallingModel ──────
-        for call in &resp.tool_calls {
+        for (i, call) in resp.tool_calls.iter().enumerate() {
+            // ★ 取消检查点 ②：执行每个工具之前。
+            //   模型刚说完、要调 3 个工具，这时候停 → 一个都不执行；
+            //   第 1 个刚做完时停 → 第 2、3 个不执行。没执行的都补一条配对的
+            //   结果，否则这一轮的历史是坏的（下次发给模型直接 400）。
+            if cancel.is_cancelled() {
+                pair_unexecuted(
+                    &mut res.items,
+                    &mut idx,
+                    iteration as i64,
+                    &resp.tool_calls[i..],
+                    CANCELLED_NOT_RUN,
+                );
+                res.outcome = TurnOutcome::Cancelled;
+                return res;
+            }
+
             obs.on(&TurnEvent::ToolCall {
                 id: &call.id,
                 name: &call.name,
@@ -701,10 +741,44 @@ pub fn run_turn_observed(
             } else if pointless_vision_call {
                 (VISION_EXHAUSTED.to_string(), true, None, None, Some(0))
             } else {
-                let out = executor.run(
-                    call,
-                    cfg.max_video_analyses.saturating_sub(res.video_analyses),
-                );
+                let budget = cfg.max_video_analyses.saturating_sub(res.video_analyses);
+                let out = match executor.run(call, budget, cancel) {
+                    ToolRun::Finished(out) => out,
+                    // ★ 取消检查点 ③：工具跑到一半用户停止了，执行器已经不等它。
+                    //
+                    //   **对所有工具一视同仁**——现在的 5 个和以后加的都一样，
+                    //   工具里不用写任何取消相关的代码。工具在后台跑完，结果
+                    //   作废；它花掉的外部调用这里记不到（还没报回来）。
+                    ToolRun::Abandoned => {
+                        obs.on(&TurnEvent::ToolResult {
+                            id: &call.id,
+                            name: &call.name,
+                            is_error: true,
+                            external_calls: 0,
+                            credits: 0,
+                            vision_calls: 0,
+                            preview: CANCELLED_MIDWAY,
+                        });
+                        res.items.push(Item::function_call_output(
+                            idx,
+                            iteration as i64,
+                            &call.id,
+                            CANCELLED_MIDWAY,
+                            true,
+                            None,
+                        ));
+                        idx += 1;
+                        pair_unexecuted(
+                            &mut res.items,
+                            &mut idx,
+                            iteration as i64,
+                            &resp.tool_calls[i + 1..],
+                            CANCELLED_NOT_RUN,
+                        );
+                        res.outcome = TurnOutcome::Cancelled;
+                        return res;
+                    }
+                };
                 // ★ 加 external_calls 而不是固定加 1：fetch_video 内部打三个端点，
                 //   命中缓存打 0 个。原来固定加 1，max_tool_calls: 25 实际能放出
                 //   75 次 SC 调用，成本闸门的数字就没意义了。
@@ -763,6 +837,10 @@ const PREVIEW_CHARS: usize = 240;
 const TRUNCATED_CALL: &str =
     "没有执行：模型这一轮的回答达到长度上限被截断了，工具请求的参数可能不完整。";
 const PROTOCOL_CALL: &str = "没有执行：模型返回了没见过的结束原因，这一轮中止。";
+const CANCELLED_NOT_RUN: &str = "没有执行：用户停止了这一轮。";
+/// 这两句会跟着这一轮进入下次发给模型的历史，所以要让模型看得懂发生了什么。
+const CANCELLED_MIDWAY: &str = "已取消：执行到一半用户停止了这一轮，结果作废。\
+     工具可能已经做了一部分（比如抓到的视频资料已经存进缓存）。";
 
 /// 给「开了单但没执行」的工具请求补上配对的结果。
 ///
@@ -777,10 +855,10 @@ fn pair_unexecuted(
     items: &mut Vec<Item>,
     idx: &mut i64,
     iteration: i64,
-    resp: &crate::agent::llm::ModelResponse,
+    calls: &[crate::agent::llm::ToolCall],
     why: &str,
 ) {
-    for call in &resp.tool_calls {
+    for call in calls {
         items.push(Item::function_call_output(
             *idx, iteration, &call.id, why, true, None,
         ));
@@ -2394,5 +2472,269 @@ mod tests {
         // 实测一次「NBA 对某笔交易什么态度」的提问，模型拿视频当新闻源读了
         // 7 条不同视频。3 条太紧，放宽到 5。
         assert!(LoopConfig::default().max_video_analyses >= 5);
+    }
+
+    // -----------------------------------------------------------------
+    // 取消：用户在每一个时刻点停止
+    // -----------------------------------------------------------------
+
+    use crate::agent::exec::ToolRun;
+    use crate::agent::tools::ToolOutcome;
+
+    /// 在第 `at` 次模型调用**期间**打开取消开关——模拟「模型正在说话时用户
+    /// 点了停止」。这次调用照常返回（说完再停）。
+    struct StopWhileTalking {
+        inner: MockLlm,
+        cancel: CancelSignal,
+        at: usize,
+        n: RefCell<usize>,
+    }
+
+    impl LlmClient for StopWhileTalking {
+        fn complete(&self, req: &ModelRequest) -> Result<ModelResponse> {
+            *self.n.borrow_mut() += 1;
+            if *self.n.borrow() == self.at {
+                self.cancel.cancel();
+            }
+            self.inner.complete(req)
+        }
+        fn pricing(&self) -> Pricing {
+            self.inner.pricing()
+        }
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+        fn max_tokens_limit(&self) -> u32 {
+            8192
+        }
+    }
+
+    /// 第 i 次工具调用怎么收场。
+    #[derive(Clone, Copy)]
+    enum ToolScript {
+        /// 正常跑完
+        Ok,
+        /// 跑完了，但跑的过程中用户点了停止（就地执行时就是这样）
+        OkButStopDuring,
+        /// 跑到一半用户点了停止，执行器不等了
+        Abandoned,
+    }
+
+    struct ScriptedTools {
+        script: Vec<ToolScript>,
+        cancel: CancelSignal,
+        ran: Vec<String>,
+    }
+
+    impl ScriptedTools {
+        fn new(cancel: &CancelSignal, script: &[ToolScript]) -> Self {
+            ScriptedTools {
+                script: script.to_vec(),
+                cancel: cancel.clone(),
+                ran: Vec::new(),
+            }
+        }
+    }
+
+    impl ToolExecutor for ScriptedTools {
+        fn run(&mut self, call: &ToolCall, _: usize, _: &CancelSignal) -> ToolRun {
+            let step = self
+                .script
+                .get(self.ran.len())
+                .copied()
+                .unwrap_or(ToolScript::Ok);
+            self.ran.push(call.id.clone());
+            let ok = ToolOutcome {
+                result: ToolResult {
+                    call_id: call.id.clone(),
+                    content: format!("{} 的真实结果", call.id),
+                    is_error: false,
+                },
+                endpoint: None,
+                raw_json: None,
+                credits_charged: Some(1),
+                external_calls: 1,
+                vision_calls: 0,
+                video_tokens: 0,
+            };
+            match step {
+                ToolScript::Ok => ToolRun::Finished(ok),
+                ToolScript::OkButStopDuring => {
+                    self.cancel.cancel();
+                    ToolRun::Finished(ok)
+                }
+                ToolScript::Abandoned => {
+                    self.cancel.cancel();
+                    ToolRun::Abandoned
+                }
+            }
+        }
+    }
+
+    fn run_cancellable(
+        llm: &dyn LlmClient,
+        tools: &mut dyn ToolExecutor,
+        cancel: &CancelSignal,
+    ) -> TurnResult {
+        run_turn_observed(
+            TurnDeps { llm, tools, cancel },
+            &no_hist(),
+            "问题",
+            &cfg(),
+            &NoopObserver,
+        )
+    }
+
+    /// 某次调用的结果正文。
+    fn output_of<'a>(items: &'a [Item], call_id: &str) -> &'a str {
+        items
+            .iter()
+            .find(|i| {
+                i.kind == ItemKind::FunctionCallOutput && i.call_id.as_deref() == Some(call_id)
+            })
+            .and_then(|i| i.payload.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{call_id} 没有配对的结果"))
+    }
+
+    /// ★ 每个工具调用**恰好一条**结果。停止的轮次要进下次的历史，配对坏了
+    ///   下次发给模型直接 400。
+    fn assert_paired(items: &[Item]) {
+        let calls: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::FunctionCall)
+            .map(|i| i.call_id.clone())
+            .collect();
+        for c in &calls {
+            let n = items
+                .iter()
+                .filter(|i| i.kind == ItemKind::FunctionCallOutput && i.call_id == *c)
+                .count();
+            assert_eq!(n, 1, "{c:?} 有 {n} 条结果");
+        }
+        let outputs = items
+            .iter()
+            .filter(|i| i.kind == ItemKind::FunctionCallOutput)
+            .count();
+        assert_eq!(outputs, calls.len(), "有不属于任何调用的结果");
+    }
+
+    fn three_tools() -> ModelResponse {
+        wants(
+            "我来查三样",
+            &[
+                ("search_videos", "a"),
+                ("search_videos", "b"),
+                ("search_videos", "c"),
+            ],
+        )
+    }
+
+    #[test]
+    fn 开始前就停了_一次模型都不调() {
+        let cancel = CancelSignal::new();
+        cancel.cancel();
+        let llm = MockLlm::new(vec![says("不该走到这里")]);
+        let mut tools = ScriptedTools::new(&cancel, &[]);
+        let out = run_cancellable(&llm, &mut tools, &cancel);
+
+        assert!(
+            matches!(out.outcome, TurnOutcome::Cancelled),
+            "{:?}",
+            out.outcome
+        );
+        assert_eq!(llm.calls(), 0, "停了还在调模型");
+        assert_eq!(out.items.len(), 1, "只该有用户的问题");
+    }
+
+    /// 产品决定：模型正在说的话让它说完。说完是最终答案就照常完成。
+    #[test]
+    fn 模型说话时停了_说完是最终答案就照常完成() {
+        let cancel = CancelSignal::new();
+        let llm = StopWhileTalking {
+            inner: MockLlm::new(vec![says("完整的答案")]),
+            cancel: cancel.clone(),
+            at: 1,
+            n: RefCell::new(0),
+        };
+        let mut tools = ScriptedTools::new(&cancel, &[]);
+        let out = run_cancellable(&llm, &mut tools, &cancel);
+
+        assert!(
+            matches!(out.outcome, TurnOutcome::Done),
+            "{:?}",
+            out.outcome
+        );
+        assert_eq!(out.answer, "完整的答案");
+    }
+
+    #[test]
+    fn 模型说话时停了_说完要调工具就一个都不执行() {
+        let cancel = CancelSignal::new();
+        let llm = StopWhileTalking {
+            inner: MockLlm::new(vec![three_tools(), says("不该走到这里")]),
+            cancel: cancel.clone(),
+            at: 1,
+            n: RefCell::new(0),
+        };
+        let mut tools = ScriptedTools::new(&cancel, &[]);
+        let out = run_cancellable(&llm, &mut tools, &cancel);
+
+        assert!(matches!(out.outcome, TurnOutcome::Cancelled));
+        assert!(tools.ran.is_empty(), "停了还执行了 {:?}", tools.ran);
+        assert_eq!(*llm.n.borrow(), 1, "停了还在调模型");
+        assert_paired(&out.items);
+        for id in ["call_00_x", "call_01_x", "call_02_x"] {
+            assert_eq!(output_of(&out.items, id), CANCELLED_NOT_RUN);
+        }
+    }
+
+    #[test]
+    fn 第一个工具做完时停了_后面的不执行_已做的结果留着() {
+        let cancel = CancelSignal::new();
+        let llm = MockLlm::new(vec![three_tools(), says("不该走到这里")]);
+        let mut tools = ScriptedTools::new(&cancel, &[ToolScript::OkButStopDuring]);
+        let out = run_cancellable(&llm, &mut tools, &cancel);
+
+        assert!(matches!(out.outcome, TurnOutcome::Cancelled));
+        assert_eq!(tools.ran, vec!["call_00_x"]);
+        assert_eq!(llm.calls(), 1, "停了还在调模型");
+        assert_paired(&out.items);
+        assert_eq!(output_of(&out.items, "call_00_x"), "call_00_x 的真实结果");
+        assert_eq!(output_of(&out.items, "call_01_x"), CANCELLED_NOT_RUN);
+        assert_eq!(output_of(&out.items, "call_02_x"), CANCELLED_NOT_RUN);
+    }
+
+    /// ★ 工具跑到一半、执行器不等了：这一个记「已取消」，后面的「没有执行」。
+    #[test]
+    fn 工具跑到一半被丢下_记已取消_后面的不执行() {
+        let cancel = CancelSignal::new();
+        let llm = MockLlm::new(vec![three_tools(), says("不该走到这里")]);
+        let mut tools = ScriptedTools::new(&cancel, &[ToolScript::Ok, ToolScript::Abandoned]);
+        let out = run_cancellable(&llm, &mut tools, &cancel);
+
+        assert!(matches!(out.outcome, TurnOutcome::Cancelled));
+        assert_eq!(tools.ran, vec!["call_00_x", "call_01_x"]);
+        assert_eq!(llm.calls(), 1);
+        assert_paired(&out.items);
+        assert_eq!(output_of(&out.items, "call_00_x"), "call_00_x 的真实结果");
+        assert_eq!(output_of(&out.items, "call_01_x"), CANCELLED_MIDWAY);
+        assert_eq!(output_of(&out.items, "call_02_x"), CANCELLED_NOT_RUN);
+    }
+
+    /// 两轮工具之间停：第一批工具都做完了，下一次模型调用不发。
+    #[test]
+    fn 一批工具做完之后停_下一次模型调用不发() {
+        let cancel = CancelSignal::new();
+        let llm = MockLlm::new(vec![
+            wants("查一下", &[("search_videos", "a")]),
+            says("不该走到这里"),
+        ]);
+        let mut tools = ScriptedTools::new(&cancel, &[ToolScript::OkButStopDuring]);
+        let out = run_cancellable(&llm, &mut tools, &cancel);
+
+        assert!(matches!(out.outcome, TurnOutcome::Cancelled));
+        assert_eq!(llm.calls(), 1, "工具做完后不该再调模型");
+        assert_paired(&out.items);
     }
 }

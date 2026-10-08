@@ -20,13 +20,15 @@
 //! 这个人的，然后老老实实跑一轮：建模型客户端 → 读历史 → 跑循环 → 落库 →
 //! 报用量和结局。
 
+use std::any::Any;
 use std::sync::Arc;
 
+use crate::agent::cancel::CancelSignal;
 use crate::agent::exec::DetachedTools;
 use crate::agent::llm::{Provider, build_client};
 use crate::agent::runner::{LoopConfig, TurnDeps, TurnOutcome, TurnResult, run_turn_observed};
 use crate::agent::vision::{VisionClient, build_vision_client};
-use crate::content::model::TurnStatus;
+use crate::content::model::{TurnStatus, new_id};
 use crate::error::{ClipKnowError, Result};
 use crate::ingest::discovery::DiscoveryApi;
 use crate::ingest::scrapecreators::ScrapeCreators;
@@ -45,6 +47,30 @@ pub struct TurnRequest<'a> {
     /// `None` = 按环境变量里配了谁的 key 自动挑。
     pub provider: Option<Provider>,
     pub config: &'a LoopConfig,
+    pub control: &'a TurnControl,
+}
+
+/// 跑一轮要带上的控制信息。服务模式下由登记表在申请名额时给出
+/// （`app::registry::Permit::control`）。
+pub struct TurnControl {
+    /// 这一轮的编号，也就是 `turns` 表那一行的 id。在写库之前就定了。
+    pub turn_id: String,
+    /// 用户点了停止。
+    pub cancel: CancelSignal,
+    /// 工具线程要一直拿着、跑完才放手的东西——服务模式下是全局名额。
+    /// 见 `agent::exec::DetachedTools` 里 `held` 的说明。
+    pub held: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl TurnControl {
+    /// 命令行 `clipknow turn` 用：没有登记表，也没人会点停止。
+    pub fn standalone() -> Self {
+        TurnControl {
+            turn_id: new_id(),
+            cancel: CancelSignal::new(),
+            held: None,
+        }
+    }
 }
 
 /// 跑一次提问，所有事件通过 `sink` 发出去。
@@ -92,21 +118,23 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
     //
     //   以前是整轮答完才写。实测：跑到一半刷新页面，连自己问的问题都看不到，
     //   会话连标题都没有——看起来像「问题全丢了」，其实只是还没写。
-    let (turn_id, _seq) = match store.begin_turn(
+    let turn_id = req.control.turn_id.as_str();
+    if let Err(e) = store.begin_turn(
+        turn_id,
         req.session_id,
         llm.model_name(),
         req.question,
         &truncate_chars(req.question, 40),
     ) {
-        Ok(t) => t,
-        Err(e) => bail!(e),
-    };
+        bail!(e)
+    }
 
     let res = run_turn_observed(
         TurnDeps {
             llm: &*llm,
             // ★ 工具放到另一条线程上执行，这一轮在循环这边等结果。
-            tools: &mut DetachedTools::new(api, vision, req.db_path),
+            tools: &mut DetachedTools::new(api, vision, req.db_path, req.control.held.clone()),
+            cancel: &req.control.cancel,
         },
         &history,
         req.question,
@@ -121,7 +149,7 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
     //   persist_turn 什么都不落，这里**标成失败**。因为问题已经在 begin_turn
     //   里写进去了，不收尾的话它会永远显示「正在回答」。
     let finished = store
-        .finish_turn(&turn_id, req.session_id, final_status(&res), &res.items)
+        .finish_turn(turn_id, req.session_id, final_status(&res), &res.items)
         .and_then(|()| match &res.pending_summary {
             Some((text, upto)) => store.save_compaction(req.session_id, text, *upto),
             None => Ok(()),
@@ -160,8 +188,8 @@ pub fn parse_provider(s: Option<&str>) -> Result<Option<Provider>> {
 
 /// 一轮的结局 → 库里的终态。两条落库路径（persist_turn 和 execute）共用。
 ///
-/// 除了 Done 以外全算失败：残缺的答案不能标成成功，不然下一次提问的
-/// 历史里会带着半句话。
+/// 除了 Done 和 Cancelled 以外全算失败：残缺的答案不能标成成功，不然下一次
+/// 提问的历史里会带着半句话。Cancelled 单独一个状态，见 `TurnStatus::Cancelled`。
 fn final_status(res: &TurnResult) -> TurnStatus {
     match &res.outcome {
         TurnOutcome::Done => TurnStatus::Done,
@@ -170,6 +198,7 @@ fn final_status(res: &TurnResult) -> TurnStatus {
         TurnOutcome::ProtocolError(e) => TurnStatus::Failed(format!("协议异常: {e}")),
         TurnOutcome::ContextBudget { .. } => TurnStatus::Failed("上下文预算不足".into()),
         TurnOutcome::ModelError(e) => TurnStatus::Failed(format!("模型调用失败: {e}")),
+        TurnOutcome::Cancelled => TurnStatus::Cancelled,
     }
 }
 
@@ -239,6 +268,9 @@ pub fn outcome_note(res: &TurnResult, cfg: &LoopConfig) -> String {
         // 不加「模型调用失败：」前缀——e 本身就是 ClipKnowError::Llm，
         // 渲染出来已经带「大模型调用失败: 」了，加了就是重一遍。
         TurnOutcome::ModelError(e) => model_error_note(e),
+        TurnOutcome::Cancelled => "已停止。停止前查到的内容都留着，下次提问时模型也看得到；\
+             想继续的话直接接着问，或者换个问法。"
+            .into(),
     }
 }
 

@@ -336,12 +336,19 @@ pub enum TurnStatus {
     /// 已经被接受、正在跑。提问一被接受就先写一行这个状态（连同用户的问题），
     /// 这样跑到一半刷新页面也能看到问题，而不是一片空白。
     ///
-    /// ★ 给模型拼历史的查询**只认 `done`**，所以跑着的这一轮不会混进
-    ///   别的提问的上下文里。
+    /// ★ 给模型拼历史的查询**只认 `done` 和 `cancelled`**，所以跑着的这一轮
+    ///   不会混进别的提问的上下文里。
     Running,
     /// 跑到一半服务停了（崩溃、被杀）。重启时由 `running` 改成这个。
     /// 问题还在，答案没有；不自动重跑——外部调用可能已经花过钱了。
     Interrupted,
+    /// 用户点了停止。和 Interrupted 的区别：这是用户**自己要的**，
+    /// 而且停下时历史是完整配对的（没执行的工具调用都补了结果）。
+    ///
+    /// ★ 所以它**会**进下一次提问的上下文（失败和中断的不会），并且后面
+    ///   跟一句提示，告诉模型「这个问题被用户中途停止了」——这样停下以后说
+    ///   「换个问法再来」，模型知道刚才问的是什么。Codex 也是这么做的。
+    Cancelled,
 }
 
 impl TurnStatus {
@@ -351,6 +358,7 @@ impl TurnStatus {
             TurnStatus::Failed(_) => "failed",
             TurnStatus::Running => "running",
             TurnStatus::Interrupted => "interrupted",
+            TurnStatus::Cancelled => "cancelled",
         }
     }
 
@@ -361,6 +369,7 @@ impl TurnStatus {
             "done" => TurnStatus::Done,
             "running" => TurnStatus::Running,
             "interrupted" => TurnStatus::Interrupted,
+            "cancelled" => TurnStatus::Cancelled,
             other => TurnStatus::Failed(other.to_string()),
         }
     }

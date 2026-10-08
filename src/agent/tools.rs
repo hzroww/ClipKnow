@@ -270,7 +270,7 @@ pub struct ToolOutcome {
 impl ToolOutcome {
     /// 失败也要产出配对的 ToolResult。**不能返回 Err 中止循环**——
     /// 见设计文档 7.3：ExecutingTools 只有一条出边。
-    fn err(call_id: &str, msg: impl Into<String>) -> Self {
+    pub(crate) fn err(call_id: &str, msg: impl Into<String>) -> Self {
         ToolOutcome {
             result: ToolResult {
                 call_id: call_id.into(),

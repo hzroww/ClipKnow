@@ -28,7 +28,9 @@ fn main() {
         &mut ToolCtx {
             api: &api,
             store: &mut st,
-            vision: vision.as_deref(),
+            vision: vision
+                .as_deref()
+                .map(|v| v as &dyn clipknow::agent::vision::VisionClient),
             vision_budget_left: 3,
         },
         &ToolCall {

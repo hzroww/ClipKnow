@@ -20,11 +20,15 @@
 //! 这个人的，然后老老实实跑一轮：建模型客户端 → 读历史 → 跑循环 → 落库 →
 //! 报用量和结局。
 
+use std::sync::Arc;
+
+use crate::agent::exec::DetachedTools;
 use crate::agent::llm::{Provider, build_client};
 use crate::agent::runner::{LoopConfig, TurnDeps, TurnOutcome, TurnResult, run_turn_observed};
-use crate::agent::vision::build_vision_client;
+use crate::agent::vision::{VisionClient, build_vision_client};
 use crate::content::model::TurnStatus;
 use crate::error::{ClipKnowError, Result};
+use crate::ingest::discovery::DiscoveryApi;
 use crate::ingest::scrapecreators::ScrapeCreators;
 use crate::store::sqlite::SqliteStore;
 use crate::wire::{TurnSink, done_json, error_json, hello_json, usage_json};
@@ -34,6 +38,9 @@ pub struct TurnRequest<'a> {
     /// 接着哪个会话。**必须已经存在**——建会话是调用方的事
     /// （[`super::sessions::create`]），因为归属必须在创建那一刻就写进去。
     pub session_id: &'a str,
+    /// 数据库文件。工具在自己的线程上跑，每次调用用它新开一条连接
+    /// （见 `agent::exec::DetachedTools`）。
+    pub db_path: &'a str,
     pub question: &'a str,
     /// `None` = 按环境变量里配了谁的 key 自动挑。
     pub provider: Option<Provider>,
@@ -61,17 +68,16 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
         Ok(l) => l,
         Err(e) => bail!(e),
     };
-    let api = match ScrapeCreators::from_env() {
-        Ok(a) => a,
+    let api: Arc<dyn DiscoveryApi + Send + Sync> = match ScrapeCreators::from_env() {
+        Ok(a) => Arc::new(a),
         Err(e) => bail!(e),
     };
-    let vision = build_vision_client();
-    let vision_ref = vision.as_deref();
+    let vision: Option<Arc<dyn VisionClient + Send + Sync>> = build_vision_client().map(Arc::from);
 
     sink.emit_json(&hello_json(
         req.session_id,
         llm.model_name(),
-        vision_ref.map(|v| v.model_name()),
+        vision.as_ref().map(|v| v.model_name()),
     ));
 
     // ★ 历史在 begin_turn **之前**读。反过来也不会出错（读历史只认
@@ -99,9 +105,8 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
     let res = run_turn_observed(
         TurnDeps {
             llm: &*llm,
-            api: &api,
-            store,
-            vision: vision_ref,
+            // ★ 工具放到另一条线程上执行，这一轮在循环这边等结果。
+            tools: &mut DetachedTools::new(api, vision, req.db_path),
         },
         &history,
         req.question,

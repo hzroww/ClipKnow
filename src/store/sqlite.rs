@@ -1383,29 +1383,7 @@ mod concurrency_tests {
     use crate::content::model::{Item, ItemKind, TurnStatus};
     use std::sync::{Arc, Barrier};
 
-    /// 一个真文件库，测试结束自动删掉（连 -wal / -shm 一起）。
-    struct TempDb(std::path::PathBuf);
-    impl TempDb {
-        fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "clipknow-conc-{tag}-{}-{}.db",
-                std::process::id(),
-                new_id()
-            ));
-            SqliteStore::open_and_migrate(p.to_str().unwrap()).unwrap();
-            TempDb(p)
-        }
-        fn path(&self) -> &str {
-            self.0.to_str().unwrap()
-        }
-    }
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", self.path()));
-            }
-        }
-    }
+    use crate::store::testdb::TempDb;
 
     fn one_item(text: &str) -> Vec<Item> {
         vec![Item {

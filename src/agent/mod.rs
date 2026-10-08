@@ -7,6 +7,7 @@
 
 pub mod compaction;
 pub mod context;
+pub mod exec;
 pub mod llm;
 pub mod runner;
 pub mod tools;

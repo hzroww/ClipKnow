@@ -559,7 +559,7 @@ fn cmd_find(
     // 没配 DASHSCOPE_API_KEY 就是 None——不是错误。那时 fetch_video 降级成
     // 只给文字材料并在结果里明写「未配置视觉模型」。
     let vision = build_vision_client();
-    let vision_ref = vision.as_deref();
+    let vision_ref = vision.as_deref().map(|v| v as &dyn VisionClient);
     let cfg = LoopConfig::default();
 
     let mut session_id = if continue_ {
@@ -798,6 +798,7 @@ fn cmd_turn_json(
         &mut store,
         &turn::TurnRequest {
             session_id: &session_id,
+            db_path,
             question,
             provider,
             config: &cfg,

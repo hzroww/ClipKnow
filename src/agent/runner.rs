@@ -10,8 +10,9 @@
 use crate::agent::compaction::{
     History, SUMMARIZE_PROMPT, parse_summary, pick_split, render_raw_fallback,
 };
+use crate::agent::exec::{InlineTools, ToolExecutor};
 use crate::agent::llm::{LlmClient, ModelRequest, Msg, StopReason, ToolResult};
-use crate::agent::tools::{ToolCtx, execute, tool_defs};
+use crate::agent::tools::tool_defs;
 use crate::content::evidence::{
     DISCOVERY_SYSTEM_PROMPT, QUESTION_CLOSE, QUESTION_OPEN, neutralize,
 };
@@ -405,20 +406,14 @@ impl TurnObserver for NoopObserver {
     fn on(&self, _: &TurnEvent<'_>) {}
 }
 
-/// 跑一次 turn 要用到的四样外部能力。
+/// 跑一次 turn 要用到的外部能力：模型，和「工具在哪儿执行」。
 ///
-/// 打包成结构体而不是摊成四个参数：加上观察者之后 `run_turn_observed` 是
-/// 8 个参数，clippy 会报（而且确实不好读）。这四个天然是一组「环境」，
-/// `tools.rs` 里的 `ToolCtx` 是同一个模式。
-///
-/// 按值传：里面就四个引用，拷贝成本为零，而按值传能在函数里一次解构出
-/// 四个局部变量，函数体一个字都不用改。
+/// 工具要的那三样（抓数据的客户端、数据库连接、视觉模型客户端）不直接放在
+/// 这里，而是包在执行器里（见 `agent::exec`）——循环只管调哪个工具、结果
+/// 怎么记账，不管工具跑在哪条线程上。
 pub struct TurnDeps<'a> {
     pub llm: &'a dyn LlmClient,
-    pub api: &'a dyn DiscoveryApi,
-    pub store: &'a mut SqliteStore,
-    /// `None` = 没配视觉模型。**不是错误**，那时 fetch_video 降级成只给文字。
-    pub vision: Option<&'a dyn crate::agent::vision::VisionClient>,
+    pub tools: &'a mut dyn ToolExecutor,
 }
 
 /// 跑一次提问。不关心进度就用这个（CLI、测试）。
@@ -434,9 +429,7 @@ pub fn run_turn(
     run_turn_observed(
         TurnDeps {
             llm,
-            api,
-            store,
-            vision,
+            tools: &mut InlineTools { api, store, vision },
         },
         history,
         question,
@@ -453,12 +446,9 @@ pub fn run_turn_observed(
     cfg: &LoopConfig,
     obs: &dyn TurnObserver,
 ) -> TurnResult {
-    // 解构成四个局部变量，下面的代码和加观察者之前完全一样。
     let TurnDeps {
         llm,
-        api,
-        store,
-        vision,
+        tools: executor,
     } = deps;
 
     // 两本账。settle() 是唯一同时改它们的地方——分开改的话，
@@ -711,16 +701,9 @@ pub fn run_turn_observed(
             } else if pointless_vision_call {
                 (VISION_EXHAUSTED.to_string(), true, None, None, Some(0))
             } else {
-                let out = execute(
-                    &mut ToolCtx {
-                        api,
-                        store,
-                        vision,
-                        vision_budget_left: cfg
-                            .max_video_analyses
-                            .saturating_sub(res.video_analyses),
-                    },
+                let out = executor.run(
                     call,
+                    cfg.max_video_analyses.saturating_sub(res.video_analyses),
                 );
                 // ★ 加 external_calls 而不是固定加 1：fetch_video 内部打三个端点，
                 //   命中缓存打 0 个。原来固定加 1，max_tool_calls: 25 实际能放出

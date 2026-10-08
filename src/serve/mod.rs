@@ -473,6 +473,7 @@ fn run_one_turn(
         let cfg = crate::agent::runner::LoopConfig::default();
         let req = crate::app::turn::TurnRequest {
             session_id: sid,
+            db_path,
             question,
             provider,
             config: &cfg,

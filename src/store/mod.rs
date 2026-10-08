@@ -8,6 +8,8 @@
 pub mod claim;
 pub mod migrate;
 pub mod sqlite;
+#[cfg(test)]
+pub(crate) mod testdb;
 
 use crate::content::model::{Artifact, Comment, FetchedVideo, Transcript, Video};
 use crate::error::Result;

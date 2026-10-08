@@ -54,11 +54,20 @@ const agentReadTimeout = 10 * time.Second
 // 是一个永远不结束的加载条。
 const agentHeaderTimeout = 30 * time.Second
 
+// 停止一轮最多等多久。
+//
+// **必须比 Rust 那边的等待上限长**（src/serve/mod.rs 的 CANCEL_WAIT，15 秒）：
+// 它最多等 15 秒这一轮停下，再回 200 或 202。用 c.read 那个 10 秒的客户端的话，
+// 模型正在说话、要等十几秒才停的时候，第 10 秒就被这边自己掐断了——明明快停好
+// 了，浏览器却看到「分析服务没在跑」。多出来的 5 秒给网络和查库。
+const agentCancelTimeout = 20 * time.Second
+
 type AgentClient struct {
 	base   string // 形如 http://127.0.0.1:3100，末尾没有斜杠
 	signer *tokenSigner
 	read   *http.Client // 查询用，有 10 秒总超时
 	stream *http.Client // 提问用，没有总超时，见 StartTurn
+	cancel *http.Client // 停止用，20 秒总超时，见 agentCancelTimeout
 }
 
 func NewAgentClient(base string, signer *tokenSigner) (*AgentClient, error) {
@@ -76,6 +85,7 @@ func NewAgentClient(base string, signer *tokenSigner) (*AgentClient, error) {
 				ResponseHeaderTimeout: agentHeaderTimeout,
 			},
 		},
+		cancel: &http.Client{Timeout: agentCancelTimeout},
 	}, nil
 }
 
@@ -158,6 +168,8 @@ type Message struct {
 	// 这一轮还在跑 / 跑到一半服务停了。前端看到 running 就去订阅事件流接着看。
 	Running     bool `json:"running"`
 	Interrupted bool `json:"interrupted"`
+	// 用户点了停止。不算失败。停之前模型说过的话（如果有）照常显示、带着它。
+	Cancelled bool `json:"cancelled"`
 }
 
 // 这个用户的会话，最近有活动的排前面。
@@ -308,6 +320,48 @@ func (c *AgentClient) StreamEvents(userID, sessionID string) (*http.Response, er
 		return nil, readAgentError(resp)
 	}
 	return resp, nil
+}
+
+// 停止的结果。对应 Rust 那边 cancel_turn 的响应体。
+type CancelResult struct {
+	Turn string `json:"turn"`
+	// cancelled / done / failed / interrupted：这一轮的真实结局。
+	// cancelling：开关已经打开，但等满了还没停（模型还在说话，规则是让它
+	// 说完）。前端接着看事件流里的结束事件就行。
+	Status string `json:"status"`
+}
+
+// 停止一个会话里编号为 turnID 的那一轮。编号来自 hello 事件的 turn 字段。
+//
+// 返回的状态码只有两种：200（停好了，或者早就结束了）和 202（还在收尾）。
+// 其余（404 不是你的 / 没有这一轮）走 agentError，由 writeAgentError 翻译。
+//
+// 用单独的 c.cancel 客户端，原因见 agentCancelTimeout。
+func (c *AgentClient) CancelTurn(userID, sessionID, turnID string) (int, *CancelResult, error) {
+	tok, err := c.signer.sign(userID)
+	if err != nil {
+		return 0, nil, err
+	}
+	u := c.base + "/internal/sessions/" + url.PathEscape(sessionID) +
+		"/turns/" + url.PathEscape(turnID) + "/cancel"
+	req, err := http.NewRequest(http.MethodPost, u, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.cancel.Do(req)
+	if err != nil {
+		return 0, nil, &agentDownError{err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return 0, nil, readAgentError(resp)
+	}
+	var out CancelResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, &out, nil
 }
 
 // ── 启动自检 ────────────────────────────────────────────────

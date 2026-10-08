@@ -103,7 +103,18 @@ pub struct AppState {
     /// 执行准入登记表：现在有哪几次提问在跑。
     /// 策略：同一个会话一次一个，全局最多 `--max-turns` 个（默认 4）。
     pub registry: Arc<crate::app::registry::Registry>,
+
+    /// 取消接口最多等多久。见 [`CANCEL_WAIT`]。
+    cancel_wait: std::time::Duration,
 }
+
+/// 取消接口最多等这一轮停下多久。
+///
+/// 大部分情况几十毫秒就停了：在两步之间、或者在跑工具（循环直接不等工具）。
+/// 等得久只有一种情况——模型正在说话，规则是让它说完（`agent::cancel`），
+/// 那可能要十几二十秒。等满了返回 202「正在收尾」，**不是错误**：开关已经
+/// 打开了，它说完就会停，前端接着看事件流里的结束事件就行。
+pub const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl AppState {
     pub fn new(store: SqliteStore, db_path: String, verifier: auth::Verifier) -> Self {
@@ -112,7 +123,14 @@ impl AppState {
             registry: crate::app::registry::Registry::new(),
             read: Mutex::new(store),
             db_path,
+            cancel_wait: CANCEL_WAIT,
         }
+    }
+
+    /// 改取消接口的等待上限。测试用——不然测一次「等满了」要 15 秒。
+    pub fn with_cancel_wait(mut self, d: std::time::Duration) -> Self {
+        self.cancel_wait = d;
+        self
     }
 
     /// 改全局并发上限。`clipknow serve --max-turns` 用它。
@@ -224,6 +242,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/internal/sessions/{id}/messages", get(session_messages))
         .route("/internal/sessions/{id}/turns", post(create_turn))
         .route("/internal/sessions/{id}/events", get(session_events))
+        .route(
+            "/internal/sessions/{id}/turns/{turn}/cancel",
+            post(cancel_turn),
+        )
         .fallback(fallback)
         .with_state(state)
 }
@@ -245,8 +267,9 @@ async fn fallback() -> ApiError {
 ///   写死的常量。「进程活着」和「进程能用」是两回事：库文件被删了、权限
 ///   不对、被别的写者锁死超过 busy_timeout，进程都还活得好好的。
 async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response, ApiError> {
-    let (running, max_turns, accepting) = (
+    let (running, slots, max_turns, accepting) = (
         st.registry.running_count(),
+        st.registry.slots_in_use(),
         st.registry.max_total(),
         st.registry.is_accepting(),
     );
@@ -257,6 +280,9 @@ async fn health(State(st): State<Arc<AppState>>) -> std::result::Result<Response
         "ok": true,
         "schema_version": version,
         "running_turns": running,
+        // 全局名额用掉了几个。可能比 running_turns 多：被停止的提问丢下的
+        // 工具还在后台跑时，名额还没还（见 app::registry）。
+        "slots_in_use": slots,
         "max_turns": max_turns,
         // 停机过程中变 false。healthcheck 不看它——那时候该让在跑的
         // 跑完，而不是让编排系统立刻重启容器。
@@ -604,6 +630,98 @@ struct TurnBody {
 }
 
 /// 会话相关的「没找到」。消息刻意含糊，见上面 handler 的说明。
+/// `POST /internal/sessions/{id}/turns/{turn}/cancel`
+///
+/// 停止这个会话里编号为 `turn` 的那一轮。编号从 hello 事件的 `turn` 字段来。
+///
+/// ```text
+/// 正在跑，15 秒内停下了                200 {"turn":…, "status":"cancelled"}
+/// 正在跑，模型说完的是最终答案         200 {"turn":…, "status":"done"}
+/// 正在跑，15 秒还没停（模型还在说）    202 {"turn":…, "status":"cancelling"}
+/// 早就结束了                           200 {"turn":…, "status": 真实结局}
+/// 不是你的会话 / 这一轮不在这个会话里  404
+/// ```
+///
+/// ## 为什么按「这一轮」停，不按会话停
+///
+/// 用户点了停止，请求在路上卡住了；这期间那一轮自己答完了，用户又发了
+/// 新问题。按会话停的话，迟到的请求会把新问题停掉。按编号停：登记表里
+/// 这个会话正在跑的已经是另一轮，对不上，什么都不做，返回旧那轮的结局。
+///
+/// ## 200 保证了什么
+///
+/// 这一轮**真的停了**：库里是终态，会话锁已经放开。前端收到就能马上在同一个
+/// 会话里发下一个问题（Permit 的 Drop 先放锁、再标记事件记录结束，这里等的
+/// 是后者）。重复调、网络重试都安全——第二次只是查一下结局。
+///
+/// 接口本身不改库：开关打开之后，「已停止」由循环自己写进去（Laplace 的
+/// 规则：只有执行那一轮的循环能写它的终态）。
+async fn cancel_turn(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+    Path((session_id, turn_id)): Path<(String, String)>,
+) -> std::result::Result<Response, ApiError> {
+    // 归属先查。和 session_events 同一个道理：别人的会话在跑和没在跑
+    // 必须给一样的回答。
+    let owns = {
+        let st = Arc::clone(&st);
+        let (uid, sid) = (who.user_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || st.read().session_owned_by(&uid, &sid))
+            .await
+            .map_err(join_failed)??
+    };
+    if !owns {
+        return Err(not_found_session());
+    }
+
+    if let Some(live) = st.registry.request_cancel(&session_id, &turn_id)
+        && !wait_finished(&live, st.cancel_wait).await
+    {
+        return Ok((
+            StatusCode::ACCEPTED,
+            axum::Json(json!({"turn": turn_id, "status": "cancelling"})),
+        )
+            .into_response());
+    }
+
+    // 没在跑，或者刚停好：结局以库里为准。
+    let status = {
+        let st = Arc::clone(&st);
+        let (sid, tid) = (session_id.clone(), turn_id.clone());
+        tokio::task::spawn_blocking(move || st.read().turn_status(&sid, &tid))
+            .await
+            .map_err(join_failed)??
+    };
+    match status {
+        Some(s) => Ok(axum::Json(json!({"turn": turn_id, "status": s.as_str()})).into_response()),
+        // 编号不存在、或者属于别的会话——一样的回答。会话已经确认是你的，
+        // 所以这里说不出任何关于别人的事。
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "这个会话里没有这一轮",
+        )),
+    }
+}
+
+/// 等这一轮的事件记录被标成结束，最多等 `limit`。等到了返回 true。
+async fn wait_finished(live: &crate::app::live::LiveTurn, limit: std::time::Duration) -> bool {
+    // 先订阅再看：反过来的话，「看完」和「开始等」之间结束的那一下会漏掉，
+    // 白等到超时。（和 subscribe_sse 同一个道理。）
+    let mut tick = live.watch();
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if live.is_finished() {
+            return true;
+        }
+        match tokio::time::timeout_at(deadline, tick.changed()).await {
+            Ok(Ok(())) => {}
+            // 超时，或者发信号的那一头没了（只会在记录本身被扔掉时发生）
+            Ok(Err(_)) | Err(_) => return live.is_finished(),
+        }
+    }
+}
+
 fn not_found_session() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", "没有这个会话")
 }
@@ -1026,6 +1144,12 @@ mod tests {
     /// 造两个用户，各一个会话，阿的那个里有一轮对话。
     /// 返回 (state, 阿的会话 id)。
     fn two_users() -> (Arc<AppState>, String) {
+        let (st, sid) = two_users_state();
+        (Arc::new(st), sid)
+    }
+
+    /// 同 [`two_users`]，但还没包进 Arc，测试能先改配置（比如取消的等待上限）。
+    fn two_users_state() -> (AppState, String) {
         use crate::content::model::{Item, ItemKind, TurnStatus};
         let mut store = SqliteStore::in_memory().expect("建内存库");
         for id in ["u_alice", "u_bob"] {
@@ -1065,11 +1189,7 @@ mod tests {
             )
             .unwrap();
         (
-            Arc::new(AppState::new(
-                store,
-                ":memory:".into(),
-                auth::Verifier::new(TEST_SECRET),
-            )),
+            AppState::new(store, ":memory:".into(), auth::Verifier::new(TEST_SECRET)),
             sid,
         )
     }
@@ -1456,5 +1576,161 @@ mod tests {
             reqwest::blocking::get(&url).is_err(),
             "停机之后还能连上，说明 graceful shutdown 没生效"
         );
+    }
+
+    // ── 取消 ───────────────────────────────────────────────
+
+    fn cancel_as(
+        srv: &testserver::TestServer,
+        user: &str,
+        sid: &str,
+        turn: &str,
+    ) -> reqwest::blocking::Response {
+        reqwest::blocking::Client::new()
+            .post(srv.url(&format!("/internal/sessions/{sid}/turns/{turn}/cancel")))
+            .bearer_auth(token_for(user))
+            .send()
+            .unwrap()
+    }
+
+    fn json_of(r: reqwest::blocking::Response) -> (u16, serde_json::Value) {
+        let code = r.status().as_u16();
+        (code, r.json().unwrap())
+    }
+
+    /// 在登记表里占一个名额、在库里写一行 running，假装这一轮在跑。
+    /// 不真的跑循环：这里测的是接口，循环的行为在 runner 的测试里。
+    fn fake_running(st: &AppState, sid: &str) -> crate::app::registry::Permit {
+        let p = st.registry.admit(sid).unwrap();
+        st.read()
+            .begin_turn(p.turn_id(), sid, "m", "问", "问")
+            .unwrap();
+        p
+    }
+
+    #[test]
+    fn 取消_别人的会话一律_404() {
+        let (st, sid) = two_users();
+        let p = fake_running(&st, &sid);
+        let srv = testserver::spawn(Arc::clone(&st));
+        let (code, v) = json_of(cancel_as(&srv, "u_bob", &sid, p.turn_id()));
+        assert_eq!(code, 404, "{v}");
+        assert!(!p.control().cancel.is_cancelled(), "别人能停掉阿的提问");
+    }
+
+    #[test]
+    fn 取消_这个会话里没有这一轮_404() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        let (code, v) = json_of(cancel_as(&srv, "u_alice", &sid, "no-such-turn"));
+        assert_eq!(code, 404, "{v}");
+        assert_eq!(v["code"], "not_found");
+    }
+
+    /// 早就结束了：返回真实结局，什么都不改。重复调也一样。
+    #[test]
+    fn 取消_已经结束的一轮返回真实结局() {
+        let (st, sid) = two_users();
+        let tid = crate::content::model::new_id();
+        st.read().begin_turn(&tid, &sid, "m", "问", "问").unwrap();
+        st.read()
+            .finish_turn(&tid, &sid, crate::content::model::TurnStatus::Done, &[])
+            .unwrap();
+        let srv = testserver::spawn(st);
+        for _ in 0..2 {
+            let (code, v) = json_of(cancel_as(&srv, "u_alice", &sid, &tid));
+            assert_eq!(code, 200, "{v}");
+            assert_eq!(v["status"], "done");
+            assert_eq!(v["turn"], tid.as_str());
+        }
+    }
+
+    /// ★ 正在跑：开关打开 → 循环写下终态、放开会话锁 → 接口返回 200。
+    ///   返回之后**马上**在同一个会话申请，必须拿得到。
+    #[test]
+    fn 取消_正在跑的一轮停下后返回_cancelled_会话马上能再问() {
+        let (st, sid) = two_users();
+        let st = Arc::new(st);
+        let p = fake_running(&st, &sid);
+        let tid = p.turn_id().to_string();
+        let ctl = p.control();
+
+        // 假装是循环：看到开关打开，写下终态，结束这一轮
+        let (st2, sid2, tid2) = (Arc::clone(&st), sid.clone(), tid.clone());
+        let looper = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            while !ctl.cancel.is_cancelled() {
+                assert!(t0.elapsed().as_secs() < 5, "开关一直没被打开");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            st2.read()
+                .finish_turn(
+                    &tid2,
+                    &sid2,
+                    crate::content::model::TurnStatus::Cancelled,
+                    &[],
+                )
+                .unwrap();
+            drop(p);
+        });
+
+        let srv = testserver::spawn(Arc::clone(&st));
+        let (code, v) = json_of(cancel_as(&srv, "u_alice", &sid, &tid));
+        looper.join().unwrap();
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["status"], "cancelled");
+        assert!(
+            st.registry.admit(&sid).is_ok(),
+            "接口说停好了，同一个会话却还不能再问"
+        );
+    }
+
+    /// 等满了还没停（模型还在说话）：202「正在收尾」，开关已经打开。
+    #[test]
+    fn 取消_等满了还没停返回_202() {
+        let (st, sid) = two_users_state();
+        let st = Arc::new(st.with_cancel_wait(std::time::Duration::from_millis(200)));
+        let p = fake_running(&st, &sid);
+        let srv = testserver::spawn(Arc::clone(&st));
+
+        let (code, v) = json_of(cancel_as(&srv, "u_alice", &sid, p.turn_id()));
+        assert_eq!(code, 202, "{v}");
+        assert_eq!(v["status"], "cancelling");
+        assert!(p.control().cancel.is_cancelled(), "202 也得把开关打开");
+    }
+
+    /// ★ 迟到的取消：拿上一轮的编号来，停不掉正在跑的新一轮。
+    #[test]
+    fn 取消_拿上一轮的编号停不掉新的一轮() {
+        let (st, sid) = two_users();
+        let old = crate::content::model::new_id();
+        st.read().begin_turn(&old, &sid, "m", "旧", "旧").unwrap();
+        st.read()
+            .finish_turn(&old, &sid, crate::content::model::TurnStatus::Done, &[])
+            .unwrap();
+        let new = fake_running(&st, &sid);
+        let srv = testserver::spawn(Arc::clone(&st));
+
+        let (code, v) = json_of(cancel_as(&srv, "u_alice", &sid, &old));
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["status"], "done", "该返回旧那一轮的结局");
+        assert!(
+            !new.control().cancel.is_cancelled(),
+            "迟到的取消请求把新的一轮停了"
+        );
+    }
+
+    #[test]
+    fn 健康检查报名额用了几个() {
+        let (st, sid) = two_users();
+        let _p = st.registry.admit(&sid).unwrap();
+        let srv = testserver::spawn(st);
+        let v: serde_json::Value = reqwest::blocking::get(srv.url("/internal/health"))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(v["slots_in_use"], 1);
+        assert_eq!(v["running_turns"], 1);
     }
 }

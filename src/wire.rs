@@ -105,11 +105,21 @@ pub fn event_json(ev: &TurnEvent<'_>) -> Value {
 }
 
 /// 开场那一行。Go 读到它才知道自己在跟什么说话。
-pub fn hello_json(session_id: &str, model: &str, vision_model: Option<&str>) -> Value {
+/// `turn` 是这一轮的编号（`turns` 表那一行的 id）。前端要停止这一轮时
+/// 带着它去调取消接口——按编号停，不按会话停，迟到的取消请求就停不掉
+/// 用户后来发的新问题。刷新页面后「接着看」会从第一条补发，所以刷新了
+/// 也拿得到。
+pub fn hello_json(
+    session_id: &str,
+    turn_id: &str,
+    model: &str,
+    vision_model: Option<&str>,
+) -> Value {
     json!({
         "t": "hello",
         "protocol": PROTOCOL_VERSION,
         "session": session_id,
+        "turn": turn_id,
         "model": model,
         // null 明确表示「没配视觉模型」,和「配了但叫 null」区分得开
         "vision": vision_model,
@@ -346,10 +356,11 @@ mod tests {
 
     #[test]
     fn hello_says_null_when_no_vision_model_is_configured() {
-        let v = hello_json("s1", "deepseek-chat", None);
+        let v = hello_json("s1", "t1", "deepseek-chat", None);
         assert!(v["vision"].is_null());
         assert_eq!(v["protocol"], PROTOCOL_VERSION);
-        let v2 = hello_json("s1", "deepseek-chat", Some("qwen3-vl-plus"));
+        assert_eq!(v["turn"], "t1");
+        let v2 = hello_json("s1", "t1", "deepseek-chat", Some("qwen3-vl-plus"));
         assert_eq!(v2["vision"], "qwen3-vl-plus");
     }
 }

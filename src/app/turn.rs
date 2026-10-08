@@ -102,6 +102,7 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
 
     sink.emit_json(&hello_json(
         req.session_id,
+        &req.control.turn_id,
         llm.model_name(),
         vision.as_ref().map(|v| v.model_name()),
     ));

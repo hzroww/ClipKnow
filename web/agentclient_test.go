@@ -18,8 +18,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 起一个假 agent，用给定的 handler 应答。
@@ -239,5 +241,27 @@ func TestGoHasNoChatTableSQL(t *testing.T) {
 	// 防呆：目录读空了的话上面那个循环一次都不跑，测试会假绿
 	if checked < 5 {
 		t.Fatalf("只检查了 %d 个 .go 文件，太少了，八成是路径不对", checked)
+	}
+}
+
+// ★ Go 等停止的时间必须比 Rust 那边等的长。
+//
+// Rust 最多等 CANCEL_WAIT（src/serve/mod.rs）这一轮停下，再回 200 或 202。
+// Go 这边要是先超时，明明快停好了，浏览器却看到「分析服务没在跑」。
+// 两个数字在两种语言里，改一个忘了另一个很容易，所以直接读 Rust 源码比对。
+func TestCancelClientOutlastsRustWait(t *testing.T) {
+	src, err := os.ReadFile("../src/serve/mod.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`pub const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs\((\d+)\);`).
+		FindSubmatch(src)
+	if m == nil {
+		t.Fatal("在 src/serve/mod.rs 里找不到 CANCEL_WAIT 的定义——改了写法的话这条测试也要跟着改")
+	}
+	secs, _ := strconv.Atoi(string(m[1]))
+	rustWait := time.Duration(secs) * time.Second
+	if agentCancelTimeout <= rustWait {
+		t.Errorf("Go 等 %v，Rust 等 %v：Go 会先超时", agentCancelTimeout, rustWait)
 	}
 }

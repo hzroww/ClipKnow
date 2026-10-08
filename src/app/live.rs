@@ -119,6 +119,11 @@ impl LiveTurn {
         (batch, log.finished)
     }
 
+    /// 这一轮结束了没有。
+    pub fn is_finished(&self) -> bool {
+        self.lock().finished
+    }
+
     /// 订阅「有新东西了」的信号。**必须在第一次 read_from 之前调**。
     pub fn watch(&self) -> watch::Receiver<u64> {
         self.tick.subscribe()

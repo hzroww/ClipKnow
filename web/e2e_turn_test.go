@@ -540,6 +540,9 @@ func TestRefreshMidAnswerShowsQuestionAndResumes(t *testing.T) {
 	replayed := readUntil(t, resp.Body, sc2, func(e event) bool { return e.T == "token" && e.Text == "前半句" })
 	if len(pick(replayed, "hello")) != 1 {
 		t.Errorf("补发里应该有开头那条 hello：%+v", replayed)
+	} else if got, want := pick(replayed, "hello")[0].Turn, pick(before, "hello")[0].Turn; got == "" || got != want {
+		// 刷新后的页面靠补发的 hello 拿这一轮的编号，停止按钮才能用
+		t.Errorf("补发的 hello 里编号是 %q，原来的是 %q", got, want)
 	}
 
 	// ⑤ 放行模型：后半句要**接着实时推**过来，直到 done

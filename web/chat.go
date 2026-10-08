@@ -125,6 +125,32 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, u *Account
 	pipeSSE(w, flusher, upstream.Body)
 }
 
+// POST /api/sessions/{id}/turns/{turn}/cancel —— 停止正在跑的那一轮。
+//
+// {turn} 是 hello 事件里的 turn 字段。按「这一轮」停而不是按会话停：
+// 用户点了停止、请求在路上卡住，这期间那一轮自己答完了、用户又发了新问题——
+// 按会话停的话，迟到的请求会把新问题停掉。
+//
+// 这里只转发。归属校验、编号核对、等它停下，全在 Rust 那一侧
+// （src/serve/mod.rs 的 cancel_turn）。返回：
+//
+//	200 {"turn":…,"status":"cancelled"}   停好了，可以马上在这个会话里接着问
+//	200 {"status":"done"}                 模型正在说的就是最终答案，让它说完了
+//	202 {"status":"cancelling"}           还在等模型说完，接着看事件流
+//	404                                   不是你的会话 / 没有这一轮
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, u *Account) {
+	code, res, err := s.agent.CancelTurn(u.ID, r.PathValue("id"), r.PathValue("turn"))
+	if err != nil {
+		writeAgentError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		log.Printf("写响应失败: %v", err)
+	}
+}
+
 // 把 agent 的 SSE 一行一行原样转给浏览器。提问和「接着看」共用。
 //
 // 调用前**还没有**写任何响应头——拒绝要用 HTTP 状态码表达，只能在这之前。

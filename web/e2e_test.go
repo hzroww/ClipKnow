@@ -105,6 +105,14 @@ func clipknowBin(t *testing.T) string {
 // 起一个和 main() 一模一样的服务，只是库在临时目录里。
 func startServer(t *testing.T, modelURL string) *httptest.Server {
 	t.Helper()
+	srv, _ := startServerWithAgent(t, modelURL)
+	return srv
+}
+
+// 同 startServer，另外把 Go 手里那个 agent 客户端也交出来——要直接看 Rust
+// 那边状态（比如 /internal/health 里名额用了几个）的测试用。
+func startServerWithAgent(t *testing.T, modelURL string) (*httptest.Server, *AgentClient) {
+	t.Helper()
 	bin := clipknowBin(t)
 	dir := t.TempDir()
 	db := filepath.Join(dir, "clipknow.db")
@@ -138,7 +146,7 @@ func startServer(t *testing.T, modelURL string) *httptest.Server {
 	}
 	srv := httptest.NewServer(s.routes())
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, s.agent
 }
 
 // 注册一个账号并返回已登录的客户端。
@@ -170,6 +178,7 @@ type event struct {
 	Note    string `json:"note"`
 	// hello
 	Session string `json:"session"`
+	Turn    string `json:"turn"` // 这一轮的编号，停止时用
 	Model   string `json:"model"`
 }
 

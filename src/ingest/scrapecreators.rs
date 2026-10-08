@@ -32,6 +32,7 @@ const COMMENT_LIMIT: usize = 20;
 pub struct ScrapeCreators {
     http: reqwest::blocking::Client,
     api_key: String,
+    base_url: String,
 }
 
 impl ScrapeCreators {
@@ -40,14 +41,25 @@ impl ScrapeCreators {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("构造 HTTP 客户端失败");
-        Self { http, api_key }
+        Self {
+            http,
+            api_key,
+            base_url: BASE_URL.to_string(),
+        }
     }
 
     /// 从环境变量读 key。key 放在 ~/.zshrc 里。
     pub fn from_env() -> Result<Self> {
         let key = crate::env_var("SCRAPECREATORS_API_KEY")
             .ok_or(ClipKnowError::MissingEnv("SCRAPECREATORS_API_KEY"))?;
-        Ok(Self::new(key))
+        let mut c = Self::new(key);
+        // 和 DEEPSEEK_BASE_URL 同一个用途：把请求打到本地的假服务器上，离线
+        // 端到端测试靠它（比如造一个「卡住不返回的工具」测停止）。
+        // 不设就是线上那个地址，生产行为一个字不变。
+        if let Some(u) = crate::env_var("SCRAPECREATORS_BASE_URL") {
+            c.base_url = u.trim_end_matches('/').to_string();
+        }
+        Ok(c)
     }
 
     /// 抓一个视频的全部内容：元数据 + 文字稿 + 评论。
@@ -222,7 +234,7 @@ impl ScrapeCreators {
     fn get_once(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
         let resp = self
             .http
-            .get(format!("{BASE_URL}{path}"))
+            .get(format!("{}{path}", self.base_url))
             .header("x-api-key", &self.api_key)
             .query(params)
             .send()?;

@@ -787,6 +787,23 @@ impl SqliteStore {
         Ok(seq)
     }
 
+    /// 这个会话里编号为 `turn_id` 的那一轮现在是什么状态。不在这个会话里
+    /// （或者根本没有）返回 None。
+    ///
+    /// 取消接口用：这一轮已经不在跑了的话，告诉调用方它的真实结局。
+    /// **两个条件一起查**，所以拿自己的会话配别人那一轮的编号查不到任何东西。
+    pub fn turn_status(&self, session_id: &str, turn_id: &str) -> Result<Option<TurnStatus>> {
+        let s: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM turns WHERE id = ?1 AND session_id = ?2",
+                params![turn_id, session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(s.map(|s| TurnStatus::from_db(&s)))
+    }
+
     /// 一轮跑完时调用。把其余条目追加进去，状态从 running 改成终态。
     ///
     /// ★ `WHERE status = 'running'` 是保护：这一轮如果已经被改成别的状态

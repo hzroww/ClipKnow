@@ -85,6 +85,7 @@ pub fn event_json(ev: &TurnEvent<'_>) -> Value {
             credits,
             vision_calls,
             preview,
+            cancelled,
         } => json!({
             "t": "tool_result",
             "id": id,
@@ -96,6 +97,7 @@ pub fn event_json(ev: &TurnEvent<'_>) -> Value {
             "credits": credits,
             "vision_calls": vision_calls,
             "preview": preview,
+            "cancelled": cancelled,
         }),
         TurnEvent::Token { text } => json!({"t": "token", "text": text}),
         TurnEvent::Answer { text } => {
@@ -247,6 +249,7 @@ mod tests {
                 credits: 3,
                 vision_calls: 1,
                 preview: "abc",
+                cancelled: false,
             },
             TurnEvent::Token { text: "片" },
             TurnEvent::Answer { text: "hi" },
@@ -352,6 +355,21 @@ mod tests {
             "model_error"
         );
         assert_eq!(outcome_tag(&TurnOutcome::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn tool_result_says_whether_it_was_stopped() {
+        let v = event_json(&TurnEvent::ToolResult {
+            id: "c1",
+            name: "search_videos",
+            is_error: true,
+            external_calls: 0,
+            credits: 0,
+            vision_calls: 0,
+            preview: "已取消",
+            cancelled: true,
+        });
+        assert_eq!(v["cancelled"], true);
     }
 
     #[test]

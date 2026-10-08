@@ -385,6 +385,10 @@ pub enum TurnEvent<'a> {
         vision_calls: usize,
         /// 结果正文的前若干字符，给界面显示用。完整内容在库里。
         preview: &'a str,
+        /// 跑到一半用户停止了、执行器不再等它。这时 `is_error` 也是 true
+        /// （给模型的那条结果是「已取消」），界面要靠这个区分「没成功」和
+        /// 「被停了」——不然停一下就显示成工具出错。
+        cancelled: bool,
     },
     /// 正文的一片。模型边生成边吐的时候，一片一片推出来。
     ///
@@ -758,6 +762,7 @@ pub fn run_turn_observed(
                             credits: 0,
                             vision_calls: 0,
                             preview: CANCELLED_MIDWAY,
+                            cancelled: true,
                         });
                         res.items.push(Item::function_call_output(
                             idx,
@@ -808,6 +813,7 @@ pub fn run_turn_observed(
                     .char_indices()
                     .nth(PREVIEW_CHARS)
                     .map_or(content.len(), |(i, _)| i)],
+                cancelled: false,
             });
 
             res.items.push(Item::function_call_output_full(
@@ -2736,5 +2742,44 @@ mod tests {
         assert!(matches!(out.outcome, TurnOutcome::Cancelled));
         assert_eq!(llm.calls(), 1, "工具做完后不该再调模型");
         assert_paired(&out.items);
+    }
+
+    /// 被丢下的那次工具调用，推给界面的结果要标着「被停止」——不然界面只看到
+    /// is_error，显示成「搜视频没成功」（浏览器里实测撞上过）。
+    #[test]
+    fn 被丢下的工具_推给界面的结果标着被停止() {
+        struct Rec(RefCell<Vec<(bool, bool)>>);
+        impl TurnObserver for Rec {
+            fn on(&self, ev: &TurnEvent<'_>) {
+                if let TurnEvent::ToolResult {
+                    is_error,
+                    cancelled,
+                    ..
+                } = ev
+                {
+                    self.0.borrow_mut().push((*is_error, *cancelled));
+                }
+            }
+        }
+        let cancel = CancelSignal::new();
+        let llm = MockLlm::new(vec![three_tools()]);
+        let mut tools = ScriptedTools::new(&cancel, &[ToolScript::Ok, ToolScript::Abandoned]);
+        let rec = Rec(RefCell::new(Vec::new()));
+        run_turn_observed(
+            TurnDeps {
+                llm: &llm,
+                tools: &mut tools,
+                cancel: &cancel,
+            },
+            &no_hist(),
+            "问题",
+            &cfg(),
+            &rec,
+        );
+        assert_eq!(
+            *rec.0.borrow(),
+            vec![(false, false), (true, true)],
+            "正常的那次不标，被丢下的那次标着被停止"
+        );
     }
 }

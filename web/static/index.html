@@ -66,6 +66,8 @@
     border-radius: 8px; padding: 11px 14px;
   }
   .failed { color: var(--bad); font-size: 13px; margin-top: 6px; }
+  /* 用户自己停的：不是出错，用中性色 */
+  .stopped { color: var(--mid); font-size: 13px; margin-top: 6px; }
   /* 开场欢迎语 */
   .welcome { display: flex; flex-direction: column; gap: 14px; padding-top: 14px }
   .welcome .sig {
@@ -200,6 +202,14 @@
     font-size: 14.5px; cursor: pointer;
   }
   #send:disabled { background: var(--line); color: var(--soft); cursor: not-allowed; }
+  /* 这个会话在回答时，停止按钮顶替发送按钮的位置 */
+  #stop {
+    display: none; flex: none; align-self: stretch; padding: 11px 20px; border-radius: 8px;
+    border: 1px solid var(--bad); background: transparent; color: var(--bad);
+    font: inherit; font-size: 14.5px; cursor: pointer;
+  }
+  #stop.on { display: block; }
+  #stop:disabled { border-color: var(--line); color: var(--soft); cursor: default; }
   .ctl { display: flex; flex-direction: column; gap: 6px; align-self: flex-end; }
   #provider {
     padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
@@ -289,6 +299,7 @@
           <option value="anthropic" disabled>Claude（还不支持工具调用）</option>
         </select>
         <button id="send">发送</button>
+        <button id="stop" title="停下这个会话正在回答的问题">停止</button>
       </div>
     </div>
     <div class="hint" id="hint">Enter 发送 · Shift+Enter 换行</div>
@@ -306,7 +317,7 @@
 const ANSWER_SIGNATURE = '你好呀 我叫王浩宇 是个扫0 很开心为你福务';
 
 const $ = s => document.querySelector(s);
-const log = $('#log'), qBox = $('#q'), sendBtn = $('#send'), hint = $('#hint');
+const log = $('#log'), qBox = $('#q'), sendBtn = $('#send'), stopBtn = $('#stop'), hint = $('#hint');
 
 let sessionId = null;   // 当前**显示着**的会话。null = 新会话（下一次提问会新建一个）
 
@@ -353,6 +364,9 @@ function toolCallText(d) {
 }
 
 function toolResultText(d) {
+  // 先看这个：被停的那一次 is_error 也是 true（给模型的结果是「已取消」），
+  // 不先挡住的话，点一下停止就显示成「没成功」。
+  if (d.cancelled) return `${TOOL_NAME[d.name] ?? d.name}被停止了，结果作废`;
   if (d.is_error) return `${TOOL_NAME[d.name] ?? d.name}没成功`;
   const bits = [];
   // external_calls 是**接口调用次数**，不是工具调用次数：
@@ -755,8 +769,15 @@ async function openSession(id, allowResume = true) {
       log.append(n);
       continue;
     }
+    if (m.cancelled && !m.text) {
+      const n = el('div', 'row');
+      n.append(el('div', 'stopped', '你中途停止了这个问题。停止前查到的内容下次提问时模型也看得到。'));
+      log.append(n);
+      continue;
+    }
     const row = addRow(m.role, m.text);
-    if (m.failed) row.append(el('div', 'failed', '这一轮没有正常结束，上面的内容可能是残缺的'));
+    if (m.cancelled) row.append(el('div', 'stopped', '你中途停止了这个问题，上面是停之前模型说的话。'));
+    else if (m.failed) row.append(el('div', 'failed', '这一轮没有正常结束，上面的内容可能是残缺的'));
   }
   if (runningSeq !== undefined) {
     let run = runs.get(id);
@@ -792,7 +813,9 @@ $('#new').onclick = () => {
 // 新建一轮。它的全部显示都在 run.box 里，挂不挂在页面上由「当前看着哪个会话」决定。
 function newRun(sid, question) {
   const run = { sid, box: el('div', 'turn'), steps: el('div', 'steps'),
-                pending: null, live: null, done: false };
+                pending: null, live: null, done: false,
+                // 这一轮的编号（hello 里给）。停止时带着它，见 stopRun
+                turn: null, stopping: false, stopWanted: false };
   addRow('user', question, run.box);
   const wrap = el('div', 'row');
   wrap.append(run.steps);
@@ -819,13 +842,72 @@ function finishRun(run) {
 
 // 发送按钮什么时候变灰：**当前看着的这个会话**有一轮正在跑。
 // 别的会话在跑不影响——那正是并发的意义。
+// 这时停止按钮顶替发送按钮的位置，停的就是看着的这一轮。
 function updateSend() {
-  const busyHere = [...active].some(r => r.box.isConnected);
+  const here = visibleRun();
   // 输入框**始终可用**——等的时候可以先把下一个问题打好。
-  sendBtn.disabled = busyHere;
-  hint.textContent = busyHere
-    ? '这个会话正在回答…可以先打下一个问题，或者去别的会话问'
-    : 'Enter 发送 · Shift+Enter 换行';
+  sendBtn.disabled = !!here;
+  sendBtn.style.display = here ? 'none' : '';
+  stopBtn.classList.toggle('on', !!here);
+  stopBtn.disabled = !!here?.stopping;
+  stopBtn.textContent = here?.stopping ? '正在停止…' : '停止';
+  hint.textContent = !here
+    ? 'Enter 发送 · Shift+Enter 换行'
+    : here.stopping
+      ? '正在停止…模型正在说的话会让它说完'
+      : '这个会话正在回答…可以先打下一个问题，或者去别的会话问';
+}
+
+// 当前看着的会话里正在跑的那一轮（同一个会话一次只有一轮）。
+function visibleRun() {
+  return [...active].find(r => r.box.isConnected && !r.done);
+}
+
+stopBtn.onclick = () => { const run = visibleRun(); if (run) stopRun(run); };
+
+// 停止一轮。
+//
+// 按**这一轮的编号**停（hello 事件里的 turn），不按会话停：点了停止、请求在
+// 路上卡住，这期间这一轮自己答完了、又发了新问题——按会话停的话，迟到的请求
+// 会把新问题停掉；按编号停，服务端发现对不上就什么都不做。
+//
+// 停不停得下、什么时候停，全看服务端（三条规则见 src/agent/cancel.rs）：
+// 在跑工具或者两步之间，马上停；模型正在说话，让它说完再停。这里只负责
+// 发请求、把按钮变成「正在停止…」，真正的结束由事件流里的 done 事件带来。
+function stopRun(run) {
+  if (run.stopping || run.done) return;
+  run.stopping = true;
+  setLive(run, '正在停止');
+  updateSend();
+  // 刚点了发送、hello 还没到：先记下，拿到编号马上发（见 handle 里的 hello）
+  if (!run.turn) { run.stopWanted = true; return; }
+  sendCancel(run);
+}
+
+async function sendCancel(run) {
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(run.sid) +
+      '/turns/' + encodeURIComponent(run.turn) + '/cancel', { method: 'POST' });
+    if (res.status === 202) {
+      // 开关已经打开，模型还在说话。接着等事件流里的结束事件。
+      setLive(run, '正在收尾：等模型把这段话说完');
+      return;
+    }
+    // 200：停好了，或者模型正在写的就是最终答案、已经让它写完了。两种的
+    // 提示都在事件流的 done 那里画——202 之后模型才写完的情况也走那里，
+    // 一处画就不会漏、也不会画两遍。
+    if (res.ok) return;
+    // 404：这一轮已经不在了（多半刚好答完），事件流会自己收尾
+    if (res.status === 404) return;
+    if (res.status === 401) showGate('登录过期了，重新输一次');
+    throw new Error((await res.text()).trim() || 'HTTP ' + res.status);
+  } catch (e) {
+    // 没停成：按钮还原，可以再点一次
+    run.stopping = false;
+    addStep(run.steps, '✗', '停止失败：' + e.message, null, 'err');
+    if (!run.done) setLive(run, '思考中');
+    updateSend();
+  }
 }
 
 qBox.addEventListener('keydown', e => {
@@ -930,6 +1012,9 @@ function handle(d, run) {
         if (run.box.isConnected) { sessionId = run.sid; setHash(run.sid); }
         loadSessions();
       }
+      // 这一轮的编号。刷新后「接着看」会从这一条补发，所以刷新了也拿得到
+      run.turn = d.turn;
+      if (run.stopWanted) { run.stopWanted = false; sendCancel(run); }
       addStep(run.steps, '·', `${d.model}${d.vision ? ' + ' + d.vision : '（没配视觉模型）'}`);
       break;
     case 'compacted':
@@ -954,8 +1039,9 @@ function handle(d, run) {
       setLive(run, TOOL_NAME[d.name] ? `${TOOL_NAME[d.name]}中` : '执行中');
       break;
     case 'tool_result':
-      addStep(run.steps, d.is_error ? '✗' : '✓', toolResultText(d), null, d.is_error ? 'err' : '');
-      setLive(run, '思考中');
+      if (d.cancelled) addStep(run.steps, '⏹', toolResultText(d));
+      else addStep(run.steps, d.is_error ? '✗' : '✓', toolResultText(d), null, d.is_error ? 'err' : '');
+      setLive(run, run.stopping ? '正在停止' : '思考中');
       break;
     case 'answer':
       finalizePending(run, d.text);
@@ -968,7 +1054,17 @@ function handle(d, run) {
     }
     case 'done':
       clearLive(run);
-      if (d.note) {
+      if (d.outcome === 'cancelled') {
+        // 停之前模型说的半句话（调工具前常有一句「我来查一下」）挪进进度区，
+        // 别留一个悬着的气泡、看起来像答案
+        foldPendingIntoSteps(run);
+        const n = el('div', 'row'); n.append(el('div', 'stopped', d.note || '已停止')); run.box.append(n);
+      } else if (run.stopping && d.outcome === 'done') {
+        // 点了停止，但模型正在写的就是最终答案——规则是让它写完
+        const n = el('div', 'row');
+        n.append(el('div', 'stopped', '点停止时已经在写最终回答了，已让它写完。'));
+        run.box.append(n);
+      } else if (d.note) {
         const n = el('div', 'row'); n.append(el('div', 'failed', d.note)); run.box.append(n);
       }
       break;

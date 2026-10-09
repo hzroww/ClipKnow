@@ -923,33 +923,113 @@ async function send() {
 
   log.querySelector('.welcome')?.remove();   // 开始问了，开场页让位
   const run = newRun(sessionId, q);
+  // 这一次「点发送」的编号。自动重试都带它，服务端据此认出是同一次提交：
+  // 最多建一个会话、最多跑一轮。你自己重新打字再发，是新的编号、新的问题。
+  run.requestId = newRequestId();
   log.append(run.box);
   log.scrollTop = log.scrollHeight;
   setLive(run, '思考中');
   updateSend();
 
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session: run.sid,
-        question: q,
-        provider: $('#provider').value,
-      }),
-    });
+    await submit(run, q, $('#provider').value);
+  } catch (e) {
+    addStep(run.steps, '✗', '连接断了：' + e.message, null, 'err');
+  } finally {
+    finishRun(run);
+  }
+}
+
+// 每次点发送一个新编号。crypto.randomUUID 只在 https 和 localhost 下有，
+// 用局域网 IP 的 http 地址打开页面时它不存在——退回用 getRandomValues 拼一个。
+function newRequestId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  return [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+// 「不知道成没成」时自动重试：等 1 秒再试一次，再等 3 秒再试一次。
+const RETRY_DELAYS = [1000, 3000];
+// 这几个状态码说明请求可能没到、或者服务暂时不行。重试是安全的——
+// 带的是同一个编号，已经跑起来的话服务端会认出来，不会再跑一遍。
+const RETRYABLE = new Set([502, 503, 504]);
+
+// 把这次提交发出去，读它的事件流。
+//
+// ★ 只在**拿到第一条事件（hello）之前**重试。那时浏览器不知道服务端到底
+//   接没接这个问题——可能请求根本没到，也可能已经在跑、只是回程断了。
+//   有了编号，两种都可以放心重试。拿到 hello 之后就知道这一轮的编号了，
+//   断了该做的是「接着看」，不是重发。
+async function submit(run, q, provider) {
+  for (let attempt = 0; ; attempt++) {
+    const canRetry = attempt < RETRY_DELAYS.length && !run.stopping;
+    let res;
+    try {
+      res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session: run.sid,
+          question: q,
+          provider,
+          request_id: run.requestId,
+        }),
+      });
+    } catch (e) {
+      if (canRetry) { await retryPause(run, attempt, '网络断了'); continue; }
+      throw e;
+    }
+    if (RETRYABLE.has(res.status) && canRetry) {
+      await retryPause(run, attempt, `服务暂时不可用（${res.status}）`);
+      continue;
+    }
     if (!res.ok) {
       const t = await res.text();
       addStep(run.steps, '✗', t, null, 'err');
       if (res.status === 401) showGate('登录过期了，重新输一次');
       return;
     }
-    await readStream(res, run);
-  } catch (e) {
-    addStep(run.steps, '✗', '连接断了：' + e.message, null, 'err');
-  } finally {
-    finishRun(run);
+    // 服务端认出这是同一次提交的重试：没重跑，告诉我们是哪一轮
+    if ((res.headers.get('Content-Type') || '').startsWith('application/json')) {
+      await attachExisting(run, await res.json());
+      return;
+    }
+    try {
+      await readStream(res, run);
+    } catch (e) {
+      if (!run.turn && canRetry) { await retryPause(run, attempt, '连接断了'); continue; }
+      throw e;
+    }
+    return;
   }
+}
+
+async function retryPause(run, attempt, why) {
+  const ms = RETRY_DELAYS[attempt];
+  addStep(run.steps, '↻', `${why}，${ms / 1000} 秒后自动重试（第 ${attempt + 1} 次，不会重复提问）`);
+  setLive(run, '等待重试');
+  await new Promise(r => setTimeout(r, ms));
+}
+
+// 重试撞上了已经存在的那一轮（{"duplicate":true,"session","turn","status"}）。
+//   还在跑   → 接上它的事件流（和刷新后「接着看」是同一个接口，会从头补发）
+//   已经结束 → 答案在库里，拉一遍聊天记录
+async function attachExisting(run, d) {
+  if (!run.sid) {
+    run.sid = d.session;
+    runs.set(run.sid, run);
+    if (run.box.isConnected) { sessionId = run.sid; setHash(run.sid); }
+    loadSessions();
+  }
+  run.turn = d.turn;
+  addStep(run.steps, '·', '刚才那次其实已经发出去了，没有重复提问');
+  if (d.status === 'running') {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(d.session) + '/events');
+    if (res.ok) { await readStream(res, run); return; }
+    // 刚好答完了，往下走去拉记录
+  }
+  finishRun(run);
+  if (run.box.isConnected) openSession(d.session, false);
 }
 
 // 接着看一轮**别处发起的**、还在跑的提问（刷新之前的这个页面、或者另一个标签页）。

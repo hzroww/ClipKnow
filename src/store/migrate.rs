@@ -72,6 +72,13 @@ const MIGRATIONS: &[Migration] = &[
             "../../migrations/accounts/008a_user_is_admin.sql"
         ))],
     },
+    Migration {
+        version: 4,
+        name: "chat_requests",
+        steps: &[Step::Sql(include_str!(
+            "../../migrations/agent/009_chat_requests.sql"
+        ))],
+    },
 ];
 
 /// 代码期望的库版本。
@@ -301,27 +308,75 @@ mod tests {
         assert!(c.execute(ins, ["u2"]).is_err(), "同名第二次插入必须失败");
     }
 
-    #[test]
-    fn 会话创建幂等键在同一用户下唯一() {
-        let mut c = fresh();
-        run(&mut c).unwrap();
+    fn user(c: &Connection, id: &str) {
         c.execute(
             "INSERT INTO users(id,username_normalized,display_name,password_hash,status,created_at,updated_at)
-             VALUES ('u1','alice','Alice','h','active',0,0)",
+             VALUES (?1,?1,?1,'h','active',0,0)",
+            [id],
+        )
+        .unwrap();
+    }
+
+    /// ★ 请求幂等靠的是这个主键：同一个用户、同一个编号只能有一行。
+    ///   不是「先查一下没有再插入」——那两步之间有竞态窗口。
+    #[test]
+    fn 同一个用户的同一个提交编号只能有一行_不同用户互不影响() {
+        let mut c = fresh();
+        run(&mut c).unwrap();
+        user(&c, "u1");
+        user(&c, "u2");
+        c.execute_batch(
+            "INSERT INTO sessions(id,created_at,user_id) VALUES ('s1',0,'u1'),('s2',0,'u2')",
+        )
+        .unwrap();
+        let ins = "INSERT INTO chat_requests(user_id,request_id,session_id,question,created_at)
+                   VALUES (?1,'req-1',?2,'q',0)";
+        c.execute(ins, ["u1", "s1"]).unwrap();
+        assert!(
+            c.execute(ins, ["u1", "s1"]).is_err(),
+            "同一个提交只能记一次"
+        );
+        c.execute(ins, ["u2", "s2"])
+            .expect("别人用同一个编号不该撞上");
+    }
+
+    #[test]
+    fn 一轮最多属于一次提交() {
+        let mut c = fresh();
+        run(&mut c).unwrap();
+        user(&c, "u1");
+        c.execute_batch(
+            "INSERT INTO sessions(id,created_at,user_id) VALUES ('s1',0,'u1');
+             INSERT INTO turns(id,session_id,seq,model,status,created_at)
+                 VALUES ('t1','s1',1,'m','done',0);",
+        )
+        .unwrap();
+        let ins =
+            "INSERT INTO chat_requests(user_id,request_id,session_id,turn_id,question,created_at)
+                   VALUES ('u1',?1,'s1',?2,'q',0)";
+        c.execute(ins, ["r1", "t1"]).unwrap();
+        assert!(c.execute(ins, ["r2", "t1"]).is_err());
+        // 还没跑起来的（turn_id 为空）可以有很多条
+        c.execute(
+            "INSERT INTO chat_requests(user_id,request_id,session_id,question,created_at)
+             VALUES ('u1','r3','s1','q',0),('u1','r4','s1','q',0)",
             [],
         )
         .unwrap();
-        let ins = "INSERT INTO sessions(id,created_at,title,user_id,creation_request_id)
-                   VALUES (?1,0,'t','u1','req-1')";
-        c.execute(ins, ["s1"]).unwrap();
-        assert!(
-            c.execute(ins, ["s2"]).is_err(),
-            "同一个创建请求只能建一个会话"
-        );
+    }
 
-        // creation_request_id 为 NULL 的老会话不受约束（部分索引的 WHERE 条件）
-        let old = "INSERT INTO sessions(id,created_at,title,user_id) VALUES (?1,0,'t','u1')";
-        c.execute(old, ["s3"]).unwrap();
-        c.execute(old, ["s4"]).unwrap();
+    /// 从来没用过的那一列删干净了，免得以后有人以为它也在管去重。
+    #[test]
+    fn 没用过的会话创建编号那一列已经删掉() {
+        let mut c = fresh();
+        run(&mut c).unwrap();
+        let cols: Vec<String> = c
+            .prepare("SELECT name FROM pragma_table_info('sessions')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!cols.iter().any(|n| n == "creation_request_id"), "{cols:?}");
     }
 }

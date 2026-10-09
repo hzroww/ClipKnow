@@ -20,6 +20,31 @@ pub struct SqliteStore {
     conn: Connection,
 }
 
+/// 一次提交到达时查 `chat_requests` 的结果。见 [`SqliteStore::claim_chat_request`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatRequestClaim {
+    /// 去申请名额，在这个会话里跑。第一次到达（新会话的话刚建好），或者
+    /// 上次被拒了（名额满、会话忙）这次重试。
+    Proceed { session_id: String },
+    /// 这次提交已经跑起来过了，就是这一轮。不重跑。
+    Duplicate { session_id: String, turn_id: String },
+    /// 同一个编号来了不同的问题、或者指定了另一个会话——前端把编号用错了。
+    Conflict,
+    /// 指定的会话不存在，或者不是这个用户的（两种不区分）。
+    NotFound,
+}
+
+/// 建一个会话，返回它的 id。在事务里也能用（`Transaction` 解引用成 `Connection`）。
+fn insert_session(conn: &Connection, title: Option<&str>, owner: Option<&str>) -> Result<String> {
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO sessions (id, created_at, title, user_id, updated_at)
+         VALUES (?1,?2,?3,?4,?2)",
+        params![id, now_ts(), title, owner],
+    )?;
+    Ok(id)
+}
+
 impl SqliteStore {
     /// 打开（或创建）一个数据库文件，并建好表。
     pub fn open(path: &str) -> Result<Self> {
@@ -509,13 +534,84 @@ impl SqliteStore {
     /// 传 None——那些会话的 user_id 为空，网页上谁都看不到，只有命令行自己能用。
     /// 网页那条路**必须**给 owner，否则建完之后连建它的人都列不出来。
     pub fn create_session(&mut self, title: Option<&str>, owner: Option<&str>) -> Result<String> {
-        let id = new_id();
-        self.conn.execute(
-            "INSERT INTO sessions (id, created_at, title, user_id, updated_at)
-             VALUES (?1,?2,?3,?4,?2)",
-            params![id, now_ts(), title, owner],
-        )?;
-        Ok(id)
+        insert_session(&self.conn, title, owner)
+    }
+
+    /// 一次提交（浏览器的一次「点发送」）到达时调用：查它的记录，第一次来就建。
+    ///
+    /// 依据 `chat_requests` 表（见 `migrations/agent/009_chat_requests.sql`）：
+    /// 同一个用户的同一个 `request_id` 最多建一个会话、最多跑一轮。
+    ///
+    /// `session_id` 是浏览器指定的会话；`None` = 新会话里的第一个问题，第一次
+    /// 来时在**同一个事务里**建会话、写记录——要么都成功要么都没发生，不会
+    /// 出现「会话建了、记录没写」，那样重试时又会再建一个会话。
+    ///
+    /// 什么时候建会话的规则和改之前一样：没带会话才建，带了就在那个会话里问。
+    pub fn claim_chat_request(
+        &mut self,
+        user_id: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        question: &str,
+    ) -> Result<ChatRequestClaim> {
+        let tx = write_tx(&mut self.conn)?;
+        // ★ 归属先查，排在一切之前：别人的会话 id 拿来也不能写下任何东西，
+        //   和「不存在」给一样的回答。
+        if let Some(sid) = session_id {
+            let owns = tx
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
+                    params![sid, user_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !owns {
+                return Ok(ChatRequestClaim::NotFound);
+            }
+        }
+        let found: Option<(String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT session_id, turn_id, question FROM chat_requests
+                 WHERE user_id = ?1 AND request_id = ?2",
+                params![user_id, request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let claim = match found {
+            Some((sid, turn, q)) => {
+                // ★ 同一个编号、内容却不一样：正常使用不会发生（重试带的是同一个
+                //   问题），只能是前端把编号用错了。悄悄返回那一轮的话，用户问 B
+                //   看到的是 A 的答案，而且不报任何错。所以明确拒绝，让 bug 露出来。
+                //   指定了另一个会话同理。
+                if q != question || session_id.is_some_and(|s| s != sid) {
+                    ChatRequestClaim::Conflict
+                } else {
+                    match turn {
+                        Some(turn_id) => ChatRequestClaim::Duplicate {
+                            session_id: sid,
+                            turn_id,
+                        },
+                        // 上次被拒了（名额满、会话忙），这次重试：接着用上次那个会话
+                        None => ChatRequestClaim::Proceed { session_id: sid },
+                    }
+                }
+            }
+            None => {
+                let sid = match session_id {
+                    Some(s) => s.to_string(),
+                    None => insert_session(&tx, None, Some(user_id))?,
+                };
+                tx.execute(
+                    "INSERT INTO chat_requests (user_id, request_id, session_id, question, created_at)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![user_id, request_id, sid, question, now_ts()],
+                )?;
+                ChatRequestClaim::Proceed { session_id: sid }
+            }
+        };
+        tx.commit()?;
+        Ok(claim)
     }
 
     /// `--continue` 用：找**最近有活动**的会话，不是最近创建的。
@@ -747,6 +843,10 @@ impl SqliteStore {
     /// 编号，取消请求按编号找目标，迟到的请求停不掉后来的新问题。
     ///
     /// `title` 只在会话还没有标题时写——也就是第一次提问。
+    ///
+    /// `request` 是这一轮来自哪次提交（`(user_id, request_id)`，网页那条路才有）。
+    /// 在**同一个事务里**把这一轮的编号填回 `chat_requests`：之后同一个编号再来，
+    /// 查到的就是这一轮，不会再跑一遍。
     pub fn begin_turn(
         &mut self,
         turn_id: &str,
@@ -754,6 +854,7 @@ impl SqliteStore {
         model: &str,
         question: &str,
         title: &str,
+        request: Option<(&str, &str)>,
     ) -> Result<i64> {
         let ts = now_ts();
         let tx = write_tx(&mut self.conn)?;
@@ -782,6 +883,21 @@ impl SqliteStore {
             "UPDATE sessions SET title = ?2 WHERE id = ?1 AND (title IS NULL OR title = '')",
             params![session_id, title],
         )?;
+        if let Some((user_id, request_id)) = request {
+            // `turn_id IS NULL`：一次提交只能对应一轮。准入登记表已经保证同一次
+            // 提交不会被放进来两次，这里改不到行说明那层保证坏了——报错，
+            // 不能悄悄让两轮挂在同一次提交上。
+            let n = tx.execute(
+                "UPDATE chat_requests SET turn_id = ?1
+                 WHERE user_id = ?2 AND request_id = ?3 AND session_id = ?4 AND turn_id IS NULL",
+                params![turn_id, user_id, request_id, session_id],
+            )?;
+            if n != 1 {
+                return Err(crate::error::ClipKnowError::BadRequest(format!(
+                    "提交记录对不上：{request_id} 不存在、不在这个会话、或者已经跑过一轮"
+                )));
+            }
+        }
         touch_session(&tx, session_id, ts)?;
         tx.commit()?;
         Ok(seq)
@@ -1263,8 +1379,15 @@ mod two_phase_tests {
     #[test]
     fn 开始跑时问题和标题就已经在库里() {
         let (mut s, sid) = store_with_session();
-        s.begin_turn(&new_id(), &sid, "m", "这条视频讲什么", "这条视频讲什么")
-            .unwrap();
+        s.begin_turn(
+            &new_id(),
+            &sid,
+            "m",
+            "这条视频讲什么",
+            "这条视频讲什么",
+            None,
+        )
+        .unwrap();
 
         let turns = s.list_turns(&sid).unwrap();
         assert_eq!(turns.len(), 1);
@@ -1296,7 +1419,8 @@ mod two_phase_tests {
         let (mut s, sid) = store_with_session();
         s.save_turn(&sid, "m", TurnStatus::Done, &loop_items("老问题", "老答案"))
             .unwrap();
-        s.begin_turn(&new_id(), &sid, "m", "新问题", "t").unwrap();
+        s.begin_turn(&new_id(), &sid, "m", "新问题", "t", None)
+            .unwrap();
         let h = s.load_turns_with_items(&sid).unwrap();
         assert_eq!(h.turns.len(), 1, "running 的那一轮混进了给模型的历史");
         assert_eq!(s.load_history(&sid).unwrap().len(), 2);
@@ -1306,7 +1430,7 @@ mod two_phase_tests {
     fn 答完后补上其余条目_问题不重复() {
         let (mut s, sid) = store_with_session();
         let tid = new_id();
-        let seq = s.begin_turn(&tid, &sid, "m", "问", "问").unwrap();
+        let seq = s.begin_turn(&tid, &sid, "m", "问", "问", None).unwrap();
         assert_eq!(seq, 1);
         s.finish_turn(&tid, &sid, TurnStatus::Done, &loop_items("问", "答"))
             .unwrap();
@@ -1327,7 +1451,8 @@ mod two_phase_tests {
     fn 停止的一轮进下次的历史_后面跟一句提示() {
         let (mut s, sid) = store_with_session();
         let t1 = new_id();
-        s.begin_turn(&t1, &sid, "m", "第一问", "第一问").unwrap();
+        s.begin_turn(&t1, &sid, "m", "第一问", "第一问", None)
+            .unwrap();
         let stopped = vec![
             Item::user_message(1, "第一问"),
             Item::assistant_message(2, 1, "我来查一下"),
@@ -1337,7 +1462,8 @@ mod two_phase_tests {
         s.finish_turn(&t1, &sid, TurnStatus::Cancelled, &stopped)
             .unwrap();
         let t2 = new_id();
-        s.begin_turn(&t2, &sid, "m", "第二问", "第二问").unwrap();
+        s.begin_turn(&t2, &sid, "m", "第二问", "第二问", None)
+            .unwrap();
         s.finish_turn(
             &t2,
             &sid,
@@ -1370,7 +1496,7 @@ mod two_phase_tests {
     fn 已中断的一轮不能再被收尾覆盖() {
         let (mut s, sid) = store_with_session();
         let tid = new_id();
-        s.begin_turn(&tid, &sid, "m", "问", "问").unwrap();
+        s.begin_turn(&tid, &sid, "m", "问", "问", None).unwrap();
         assert_eq!(s.interrupt_running(None).unwrap(), 1);
         let e = s
             .finish_turn(&tid, &sid, TurnStatus::Done, &loop_items("问", "答"))
@@ -1389,8 +1515,8 @@ mod two_phase_tests {
         let mut s = SqliteStore::in_memory().unwrap();
         let a = s.create_session(None, None).unwrap();
         let b = s.create_session(None, None).unwrap();
-        s.begin_turn(&new_id(), &a, "m", "a", "a").unwrap();
-        s.begin_turn(&new_id(), &b, "m", "b", "b").unwrap();
+        s.begin_turn(&new_id(), &a, "m", "a", "a", None).unwrap();
+        s.begin_turn(&new_id(), &b, "m", "b", "b", None).unwrap();
         assert_eq!(s.interrupt_running(Some(&a)).unwrap(), 1);
         assert_eq!(
             s.count_for_test("SELECT count(*) FROM turns WHERE status = 'running'")
@@ -1404,10 +1530,11 @@ mod two_phase_tests {
     fn 标题只在第一次写() {
         let (mut s, sid) = store_with_session();
         let t1 = new_id();
-        s.begin_turn(&t1, &sid, "m", "第一问", "第一问").unwrap();
+        s.begin_turn(&t1, &sid, "m", "第一问", "第一问", None)
+            .unwrap();
         s.finish_turn(&t1, &sid, TurnStatus::Done, &loop_items("第一问", "答"))
             .unwrap();
-        s.begin_turn(&new_id(), &sid, "m", "第二问", "第二问")
+        s.begin_turn(&new_id(), &sid, "m", "第二问", "第二问", None)
             .unwrap();
         assert_eq!(
             s.count_for_test("SELECT count(*) FROM sessions WHERE title = '第一问'")
@@ -1427,7 +1554,7 @@ mod two_phase_tests {
         .unwrap();
         let a = s.create_session(None, Some("u")).unwrap();
         let _b = s.create_session(None, Some("u")).unwrap();
-        s.begin_turn(&new_id(), &a, "m", "q", "q").unwrap();
+        s.begin_turn(&new_id(), &a, "m", "q", "q", None).unwrap();
         let running = s.running_sessions_for_user("u").unwrap();
         assert_eq!(running.len(), 1);
         assert!(running.contains(&a));
@@ -1441,6 +1568,155 @@ mod two_phase_tests {
         let it = Item::user_message(1, "q");
         assert_eq!(it.kind, ItemKind::UserMessage);
         assert_eq!(it.idx, 1);
+    }
+}
+
+#[cfg(test)]
+mod chat_request_tests {
+    //! 请求幂等：一次「点发送」最多建一个会话、最多跑一轮。
+
+    use super::*;
+    use crate::content::model::TurnStatus;
+
+    fn store_with_users() -> SqliteStore {
+        let mut s = SqliteStore::in_memory().unwrap();
+        for u in ["u1", "u2"] {
+            s.exec_for_test(&format!(
+                "INSERT INTO users(id,username_normalized,display_name,password_hash,status,created_at,updated_at)
+                 VALUES ('{u}','{u}','{u}','h','active',0,0)"
+            ))
+            .unwrap();
+        }
+        s
+    }
+
+    fn sessions_of(s: &SqliteStore, user: &str) -> i64 {
+        s.count_for_test(&format!(
+            "SELECT count(*) FROM sessions WHERE user_id = '{user}'"
+        ))
+        .unwrap()
+    }
+
+    fn proceed(c: ChatRequestClaim) -> String {
+        match c {
+            ChatRequestClaim::Proceed { session_id } => session_id,
+            other => panic!("期望 Proceed，实际 {other:?}"),
+        }
+    }
+
+    /// ★ 新会话里提问被拒（比如名额满），带同一个编号重试：用的还是上次建的
+    ///   那个会话，不会再建一个。这就是合并接口要解决的那个场景。
+    #[test]
+    fn 新会话里的提交重试_只建一个会话() {
+        let mut s = store_with_users();
+        let first = proceed(s.claim_chat_request("u1", "r1", None, "问").unwrap());
+        let again = proceed(s.claim_chat_request("u1", "r1", None, "问").unwrap());
+        assert_eq!(first, again, "重试又建了一个会话");
+        assert_eq!(sessions_of(&s, "u1"), 1);
+    }
+
+    #[test]
+    fn 带了会话就在那个会话里问_不建新的() {
+        let mut s = store_with_users();
+        let sid = s.create_session(None, Some("u1")).unwrap();
+        let got = proceed(s.claim_chat_request("u1", "r1", Some(&sid), "问").unwrap());
+        assert_eq!(got, sid);
+        assert_eq!(sessions_of(&s, "u1"), 1);
+    }
+
+    /// 跑起来之后再来：就是那一轮，不重跑。
+    #[test]
+    fn 跑起来之后同一个编号再来_返回那一轮() {
+        let mut s = store_with_users();
+        let sid = proceed(s.claim_chat_request("u1", "r1", None, "问").unwrap());
+        let tid = new_id();
+        s.begin_turn(&tid, &sid, "m", "问", "问", Some(("u1", "r1")))
+            .unwrap();
+        assert_eq!(
+            s.claim_chat_request("u1", "r1", None, "问").unwrap(),
+            ChatRequestClaim::Duplicate {
+                session_id: sid.clone(),
+                turn_id: tid.clone()
+            }
+        );
+        // 跑完了也一样
+        s.finish_turn(&tid, &sid, TurnStatus::Done, &[]).unwrap();
+        assert!(matches!(
+            s.claim_chat_request("u1", "r1", Some(&sid), "问").unwrap(),
+            ChatRequestClaim::Duplicate { .. }
+        ));
+    }
+
+    /// ★ 同一个编号、不同的问题：前端 bug。不能悄悄返回另一个问题的那一轮。
+    #[test]
+    fn 同一个编号换了问题或者换了会话_是冲突() {
+        let mut s = store_with_users();
+        let sid = proceed(s.claim_chat_request("u1", "r1", None, "问 A").unwrap());
+        assert_eq!(
+            s.claim_chat_request("u1", "r1", None, "问 B").unwrap(),
+            ChatRequestClaim::Conflict
+        );
+        let other = s.create_session(None, Some("u1")).unwrap();
+        assert_eq!(
+            s.claim_chat_request("u1", "r1", Some(&other), "问 A")
+                .unwrap(),
+            ChatRequestClaim::Conflict
+        );
+        // 不带会话、问题一样：就是同一次
+        assert_eq!(
+            proceed(s.claim_chat_request("u1", "r1", None, "问 A").unwrap()),
+            sid
+        );
+    }
+
+    /// 别人的会话拿来提问：什么都不写，和「不存在」一样的回答。
+    #[test]
+    fn 指定别人的会话_什么都不写() {
+        let mut s = store_with_users();
+        let theirs = s.create_session(None, Some("u2")).unwrap();
+        assert_eq!(
+            s.claim_chat_request("u1", "r1", Some(&theirs), "偷看")
+                .unwrap(),
+            ChatRequestClaim::NotFound
+        );
+        assert_eq!(
+            s.claim_chat_request("u1", "r1", Some("根本没有"), "问")
+                .unwrap(),
+            ChatRequestClaim::NotFound
+        );
+        assert_eq!(
+            s.count_for_test("SELECT count(*) FROM chat_requests")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// 编号按用户划分：别人用同一个编号，各是各的。
+    #[test]
+    fn 不同用户用同一个编号_互不影响() {
+        let mut s = store_with_users();
+        let a = proceed(s.claim_chat_request("u1", "r1", None, "问").unwrap());
+        let b = proceed(s.claim_chat_request("u2", "r1", None, "问").unwrap());
+        assert_ne!(a, b);
+        assert_eq!(sessions_of(&s, "u1"), 1);
+        assert_eq!(sessions_of(&s, "u2"), 1);
+    }
+
+    /// 一次提交只能对应一轮。准入登记表已经挡住了，这里是第二道。
+    #[test]
+    fn 同一次提交不能挂两轮() {
+        let mut s = store_with_users();
+        let sid = proceed(s.claim_chat_request("u1", "r1", None, "问").unwrap());
+        let t1 = new_id();
+        s.begin_turn(&t1, &sid, "m", "问", "问", Some(("u1", "r1")))
+            .unwrap();
+        s.finish_turn(&t1, &sid, TurnStatus::Done, &[]).unwrap();
+        let e = s
+            .begin_turn(&new_id(), &sid, "m", "问", "问", Some(("u1", "r1")))
+            .unwrap_err();
+        assert!(e.to_string().contains("提交记录对不上"), "{e}");
+        // 事务回滚了：第二轮没留下
+        assert_eq!(s.count_for_test("SELECT count(*) FROM turns").unwrap(), 1);
     }
 }
 

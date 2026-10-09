@@ -12,8 +12,7 @@ use crate::store::sqlite::SqliteStore;
 
 /// 会话列表里的一条。
 ///
-/// **不是 `sessions` 表的行**：user_id、deleted_at、creation_request_id
-/// 都不出现在这里。给浏览器的东西和库里存的东西是两回事，混成一个的话，
+/// **不是 `sessions` 表的行**：user_id、deleted_at 都不出现在这里。给浏览器的东西和库里存的东西是两回事，混成一个的话，
 /// 加一列内部字段就会直接漏到接口上。
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct SessionSummary {
@@ -102,11 +101,6 @@ pub fn messages(
     }
     let rows = store.ui_items_for_user(user_id, session_id)?;
     Ok(Ok(project(rows)))
-}
-
-/// 新建一个属于这个用户的空会话，返回 id。
-pub fn create(store: &mut SqliteStore, user_id: &str, title: Option<&str>) -> Result<String> {
-    store.create_session(title, Some(user_id))
 }
 
 /// 把库里的原始条目投影成界面要显示的消息。
@@ -353,7 +347,7 @@ mod tests {
         let mut store = SqliteStore::in_memory().unwrap();
         // sessions.user_id 有外键指向 users，先插一个真用户
         add_user(&mut store, user);
-        let sid = create(&mut store, user, Some("测试会话")).unwrap();
+        let sid = store.create_session(Some("测试会话"), Some(user)).unwrap();
         store
             .save_turn(
                 &sid,
@@ -414,7 +408,9 @@ mod tests {
     fn 列表只出自己的会话() {
         let (mut store, _) = seeded("u_alice", "问题", "答案");
         add_user(&mut store, "u_bob");
-        create(&mut store, "u_bob", Some("鲍勃的会话")).unwrap();
+        store
+            .create_session(Some("鲍勃的会话"), Some("u_bob"))
+            .unwrap();
 
         let alice = list(&store, "u_alice", 100).unwrap();
         assert_eq!(alice.len(), 1);
@@ -433,7 +429,9 @@ mod tests {
     fn 列表按最后活动时间排_不是按创建时间() {
         let (mut store, old_sid) = seeded("u_alice", "问题", "答案");
         // 后建的一个，一句话都没说
-        let new_sid = create(&mut store, "u_alice", Some("新建的")).unwrap();
+        let new_sid = store
+            .create_session(Some("新建的"), Some("u_alice"))
+            .unwrap();
 
         // ★ 把两个会话的时间戳显式拉开。
         //

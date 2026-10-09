@@ -37,8 +37,9 @@ use crate::wire::{TurnSink, done_json, error_json, hello_json, usage_json};
 
 /// 跑一轮要的全部输入。
 pub struct TurnRequest<'a> {
-    /// 接着哪个会话。**必须已经存在**——建会话是调用方的事
-    /// （[`super::sessions::create`]），因为归属必须在创建那一刻就写进去。
+    /// 接着哪个会话。**必须已经存在**——建会话是调用方的事：网页那条路在
+    /// 收到提交时建（`SqliteStore::claim_chat_request`，归属在创建那一刻就
+    /// 写进去），命令行那条路在 `main.rs` 里建。
     pub session_id: &'a str,
     /// 数据库文件。工具在自己的线程上跑，每次调用用它新开一条连接
     /// （见 `agent::exec::DetachedTools`）。
@@ -60,6 +61,16 @@ pub struct TurnControl {
     /// 工具线程要一直拿着、跑完才放手的东西——服务模式下是全局名额。
     /// 见 `agent::exec::DetachedTools` 里 `held` 的说明。
     pub held: Option<Arc<dyn Any + Send + Sync>>,
+    /// 这一轮来自哪次提交（浏览器的一次「点发送」）。写库时把这一轮的编号
+    /// 填回 `chat_requests`，同一个编号再来就认得出。命令行没有这个，是 None。
+    pub request: Option<ChatRequestRef>,
+}
+
+/// 一次提交的身份：哪个用户、哪个编号。见 `migrations/agent/009_chat_requests.sql`。
+#[derive(Debug, Clone)]
+pub struct ChatRequestRef {
+    pub user_id: String,
+    pub request_id: String,
 }
 
 impl TurnControl {
@@ -69,6 +80,7 @@ impl TurnControl {
             turn_id: new_id(),
             cancel: CancelSignal::new(),
             held: None,
+            request: None,
         }
     }
 }
@@ -126,6 +138,10 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
         llm.model_name(),
         req.question,
         &truncate_chars(req.question, 40),
+        req.control
+            .request
+            .as_ref()
+            .map(|r| (r.user_id.as_str(), r.request_id.as_str())),
     ) {
         bail!(e)
     }

@@ -785,9 +785,9 @@ fn cmd_turn_json(
             }
             id
         }
-        // ★ 这里直接调 store，没走 app::sessions::create——因为那个函数
-        //   **要求必须有归属**（网页那条路的不变量）。命令行允许建无主会话，
-        //   那是既有行为，`clipknow claim-sessions` 就是事后给它们认领的。
+        // ★ 命令行允许建无主会话（网页那条路要求必须有归属，见
+        //   SqliteStore::claim_chat_request）。这是既有行为，
+        //   `clipknow claim-sessions` 就是事后给它们认领的。
         None => match store.create_session(None, user.as_deref()) {
             Ok(id) => id,
             Err(e) => bail!(e),

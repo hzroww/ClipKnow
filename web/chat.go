@@ -30,18 +30,24 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type chatReq struct {
 	Session  string `json:"session"` // 空 = 新建一个会话
 	Question string `json:"question"`
 	Provider string `json:"provider"` // 空 = 让 Rust 自己挑
+	// 浏览器点发送时生成的编号。自动重试带同一个，Rust 据此认出「同一次提交」：
+	// 最多建一个会话、最多跑一轮。见 migrations/agent/009_chat_requests.sql。
+	RequestID string `json:"request_id"`
 }
 
 // bufio.Scanner 单行上限。
@@ -74,33 +80,51 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, u *Account) 
 		return
 	}
 
-	// ★ 新会话在**提问之前**建好，归属在创建那一刻写进库。
-	//   改造前是 Rust 建完把 id 放在 hello 那一行报回来、Go 再认领一次——
-	//   中间那一小段时间里会话是无主的，认领失败就永远无主了。
-	//
-	//   多一次本机 HTTP 往返，微秒级，换掉一个真实存在的竞态。
-	session := req.Session
-	if session == "" {
-		id, err := s.agent.CreateSession(u.ID)
-		if err != nil {
-			writeAgentError(w, err)
-			return
-		}
-		session = id
+	requestID := strings.TrimSpace(req.RequestID)
+	if requestID == "" {
+		// 还没刷新的旧页面不带编号。自己生成一个：照常能问，只是这一次没法
+		// 去重（浏览器重试时不会带同一个）。
+		requestID = newRequestID()
 	}
 
-	// 归属校验、参数校验、准入全在 agent 那一侧。这里只负责把它的拒绝
+	// ★ 只调一次 Rust。新会话也是：会话由 Rust 在收到这次提交时建，和提交
+	//   记录写在同一个事务里。以前这里先调一次「建会话」再调「提问」，重试
+	//   时会多建一个会话（见 agentclient.go 的 StartTurn）。
+	//
+	// 归属校验、参数校验、去重、准入全在 agent 那一侧。这里只负责把它的拒绝
 	// 翻译成浏览器该看到的状态码（见 writeAgentError 里的映射表）。
 	//
 	// ★ 注意这一步还**没有**给浏览器发任何响应头。所以拒绝能用 HTTP 状态
 	//   码表达；一旦开始写流就只能用事件了。
-	upstream, err := s.agent.StartTurn(u.ID, session, req.Question, req.Provider)
+	upstream, err := s.agent.StartTurn(u.ID, requestID, req.Session, req.Question, req.Provider)
 	if err != nil {
 		writeAgentError(w, err)
 		return
 	}
 	defer upstream.Body.Close()
+
+	if strings.HasPrefix(upstream.Header.Get("Content-Type"), "application/json") {
+		// 同一次提交的重试：Rust 说「就是那一轮」。原样转给浏览器，前端看到
+		// running 就去接着看，看到终态就去拉聊天记录。不重跑。
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.Copy(w, io.LimitReader(upstream.Body, 64<<10)); err != nil {
+			log.Printf("转发重复提交的响应失败: %v", err)
+		}
+		return
+	}
 	pipeSSE(w, flusher, upstream.Body)
+}
+
+// 浏览器没给编号时，Go 替它生成一个。32 位十六进制，满足 Rust 那边的格式。
+func newRequestID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 读失败在正常系统上不会发生；真发生了也只是这一次没法
+		// 去重，用时间凑一个不重复的就行
+		return fmt.Sprintf("go-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 // GET /api/sessions/{id}/events —— 接着看一个正在跑的提问。

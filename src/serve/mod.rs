@@ -44,8 +44,9 @@ use axum::routing::{get, post};
 use serde_json::json;
 use tokio_stream::StreamExt;
 
+use crate::app::registry::Reject;
 use crate::error::{ClipKnowError, Result};
-use crate::store::sqlite::SqliteStore;
+use crate::store::sqlite::{ChatRequestClaim, SqliteStore};
 use crate::wire::TurnSink;
 
 pub mod auth;
@@ -234,13 +235,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 往下都要内部凭证。靠 handler 参数里的 `Principal` 提取器强制，
         // 不是靠中间件——见 auth.rs 里关于「忘了调」的说明。
         .route("/internal/whoami", get(whoami))
-        .route(
-            "/internal/sessions",
-            get(list_sessions).post(create_session),
-        )
+        .route("/internal/sessions", get(list_sessions))
+        // 提问（新会话的话顺便建会话）。为什么合成一个，见 start_turn
+        .route("/internal/turns", post(start_turn))
         // axum 0.8 的路径参数是 {id}，不是老版本的 :id
         .route("/internal/sessions/{id}/messages", get(session_messages))
-        .route("/internal/sessions/{id}/turns", post(create_turn))
         .route("/internal/sessions/{id}/events", get(session_events))
         .route(
             "/internal/sessions/{id}/turns/{turn}/cancel",
@@ -354,43 +353,36 @@ async fn session_messages(
     }
 }
 
-/// `POST /internal/sessions`
+/// `POST /internal/turns`
 ///
-/// 请求体 `{"title": null}`，返回 `201 {"session_id":"..."}`。
+/// 提问。请求体：
 ///
-/// ★ 归属在**创建那一刻**就写进 `sessions.user_id`，不是事后认领。
-///   这是设计文档第 12 节的第 2 条不变量。改造前的做法是 Rust 先建会话、
-///   把 id 放在 hello 那一行报给 Go、Go 再回头认领一次——中间那一小段时间
-///   里会话是无主的，而且认领失败（进程被杀）就永远无主了。
-async fn create_session(
-    State(st): State<Arc<AppState>>,
-    who: Principal,
-    body: Option<axum::Json<CreateSessionBody>>,
-) -> std::result::Result<Response, ApiError> {
-    // body 可有可无：`POST` 一个空请求体就是「建一个没标题的会话」。
-    let title = body.and_then(|axum::Json(b)| b.title);
-    let id = tokio::task::spawn_blocking(move || {
-        crate::app::sessions::create(&mut st.read(), &who.user_id, title.as_deref())
-    })
-    .await
-    .map_err(join_failed)??;
-    Ok((StatusCode::CREATED, axum::Json(json!({"session_id": id}))).into_response())
-}
-
-#[derive(serde::Deserialize)]
-struct CreateSessionBody {
-    title: Option<String>,
-}
-
-/// `POST /internal/sessions/{id}/turns`
+/// ```json
+/// {"request_id":"浏览器点发送时生成的编号", "session_id":"在哪个会话里问（空=新会话）",
+///  "question":"...", "provider":"deepseek"}
+/// ```
 ///
-/// 请求体 `{"question":"...","provider":"deepseek"}`。
-/// 成功返回 `200 text/event-stream`，事件体和改造前 `clipknow turn` 打到
-/// stdout 的 NDJSON **一模一样**——前端一个字都不用改。
+/// 返回三种：
+///
+/// ```text
+/// 新的一轮开始跑     200 text/event-stream，和改之前一模一样
+/// 同一次提交的重试   200 application/json {"duplicate":true,"session":…,"turn":…,"status":…}
+///                    不重跑、不重开事件流；还在跑的话调用方去「接着看」
+/// 拒绝               400 参数错 / 404 不是你的会话 / 409 会话忙或编号冲突 / 503 名额满
+/// ```
+///
+/// ## 为什么建会话和提问合成一个接口
+///
+/// 以前 Go 分两次调：先建会话，再提问。新会话里提问、第二次调用断了，浏览器
+/// 带着同一个编号重试——Go 什么都不记得，又去建一个会话，同一个问题就挂在两个
+/// 会话上了。要让「建会话」认得出是同一次提交，就得在建会话的那一刻把提交
+/// 记录（chat_requests）写下去，而那一行要存问题原文，建会话那次调用手里没有。
+/// 合成一次调用之后，建会话和写记录在同一个事务里（[`SqliteStore::claim_chat_request`]）。
+///
+/// **什么时候建会话的规则没变**：带了会话就在那个会话里问，没带才建。
 ///
 /// ## 流开始之前的拒绝走 HTTP 状态码
 ///
-/// 400 参数错 / 404 不是你的会话 / 409 这个会话在跑 / 503 全局名额满。
 /// 设计文档第 6.2 节：「HTTP 头发出前的拒绝使用 HTTP 状态码；开始流之后
 /// 用事件报告错误」。混着来的话，Go 和前端都得同时处理两套错误路径。
 ///
@@ -398,11 +390,9 @@ struct CreateSessionBody {
 ///
 /// **什么都不做，执行照常跑完并落库。** 那一轮已经花了 SC 配额、模型 token、
 /// 可能还有一次视频分析的钱，为了「你关了页面」把这些扔掉是最亏的。
-/// 事件发不出去时 [`sink::ChannelSink`] 会丢掉它们，循环不受影响。
-async fn create_turn(
+async fn start_turn(
     State(st): State<Arc<AppState>>,
     who: Principal,
-    Path(session_id): Path<String>,
     axum::Json(body): axum::Json<TurnBody>,
 ) -> std::result::Result<Response, ApiError> {
     let question = body.question.trim().to_string();
@@ -413,41 +403,81 @@ async fn create_turn(
             "问题是空的",
         ));
     }
+    let request_id = body.request_id.trim().to_string();
+    if !valid_request_id(&request_id) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "request_id 必须是 1–64 位字母、数字、短横线或下划线",
+        ));
+    }
     // provider 来自浏览器，是外部输入。parse_provider 只认白名单里那两个，
     // 拼错直接报错而不是悄悄用默认那家。
     let provider = crate::app::turn::parse_provider(body.provider.as_deref())?;
+    // 空串当作「没给」，和 provider 一样（见 parse_provider 里的说明）
+    let wanted_session = body
+        .session_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    // ★ 归属校验在申请名额**之前**。
-    //   反过来的话，拿别人的会话 id 乱发请求就能把名额占掉——
-    //   一个不用登录成别人就能做到的拒绝服务。
-    let owns = {
+    // ★ 查（必要时建）这次提交的记录。归属校验在里面，而且排在申请名额**之前**：
+    //   反过来的话，拿别人的会话 id 乱发请求就能把名额占掉——一个不用登录成
+    //   别人就能做到的拒绝服务。
+    let claim = {
         let st = Arc::clone(&st);
-        let (uid, sid) = (who.user_id.clone(), session_id.clone());
-        tokio::task::spawn_blocking(move || st.read().session_owned_by(&uid, &sid))
-            .await
-            .map_err(join_failed)??
+        let (uid, rid, q) = (who.user_id.clone(), request_id.clone(), question.clone());
+        tokio::task::spawn_blocking(move || {
+            st.read()
+                .claim_chat_request(&uid, &rid, wanted_session.as_deref(), &q)
+        })
+        .await
+        .map_err(join_failed)??
     };
-    if !owns {
-        return Err(not_found_session());
-    }
+    let session_id = match claim {
+        ChatRequestClaim::Proceed { session_id } => session_id,
+        ChatRequestClaim::Duplicate {
+            session_id,
+            turn_id,
+        } => return duplicate_response(&st, session_id, turn_id).await,
+        ChatRequestClaim::NotFound => return Err(not_found_session()),
+        ChatRequestClaim::Conflict => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "request_conflict",
+                "这个提交编号已经用在另一个问题上了",
+            ));
+        }
+    };
 
     // 申请名额。拿不到就**立刻拒绝，不排队**——排队的话用户点了发送、
     // 界面一动不动，分不清是卡了还是坏了。
-    let permit = st.registry.admit(&session_id).map_err(|r| {
-        let status = match r {
-            crate::app::registry::Reject::SessionBusy { .. } => StatusCode::CONFLICT,
-            _ => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        ApiError::new(status, r.code(), r.message())
-    })?;
+    //
+    // 被拒的话 chat_requests 里那一行留着、turn_id 是空的：重试时接着用同一个
+    // 会话，不会再建一个。
+    let permit = match st.registry.admit(&session_id, Some(&request_id)) {
+        Ok(p) => p,
+        Err(Reject::Duplicate { turn_id }) => {
+            return duplicate_response(&st, session_id, turn_id).await;
+        }
+        Err(r) => {
+            let status = match r {
+                Reject::SessionBusy { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            return Err(ApiError::new(status, r.code(), r.message()));
+        }
+    };
 
     // 这一轮的事件记录。执行过程往里写，订阅者（发起提问的这个连接、
     // 以及刷新后重新连上来的页面）从里面读。
     let live = permit.live();
     // 编号、取消开关、全局名额。编号在这一刻就定了，比写库早。
-    let control = permit.control();
+    let mut control = permit.control();
+    control.request = Some(crate::app::turn::ChatRequestRef {
+        user_id: who.user_id.clone(),
+        request_id,
+    });
     let db_path = st.db_path.clone();
-    let sid = session_id.clone();
     let sink = Arc::clone(&live);
 
     // ★ 真正干活的在 blocking 线程上。
@@ -460,13 +490,49 @@ async fn create_turn(
     //   Drop，所以"每条退出路径都释放"是类型系统保证的。
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        run_one_turn(&db_path, &sid, &question, provider, &control, &sink);
+        run_one_turn(&db_path, &session_id, &question, provider, &control, &sink);
         // _permit 在这里 Drop：先放会话锁、再把事件记录标成结束（顺序见
         // Permit 的 Drop）。已经连上的订阅者手里有自己的 Arc，会把剩下的读完。
         // 全局名额要等这一轮丢下的工具线程（如果有）也结束才还。
     });
 
     Ok(subscribe_sse(live))
+}
+
+/// 同一次提交的重试：告诉调用方「就是这一轮」，带上它现在的状态。
+///
+/// 返回 JSON 而不是重新接上事件流：调用方（前端）看到 running 就自己去
+/// 「接着看」（`GET /internal/sessions/{id}/events`），看到终态就去拉聊天记录。
+/// 两条路都是现成的，这里不再做一套。
+async fn duplicate_response(
+    st: &Arc<AppState>,
+    session_id: String,
+    turn_id: String,
+) -> std::result::Result<Response, ApiError> {
+    let status = {
+        let st = Arc::clone(st);
+        let (sid, tid) = (session_id.clone(), turn_id.clone());
+        tokio::task::spawn_blocking(move || st.read().turn_status(&sid, &tid))
+            .await
+            .map_err(join_failed)??
+    };
+    // 登记表认出来的那种（拿到名额、还没写库）库里还没有这一行：就是在跑
+    let status = status.map_or("running", |s| s.as_str());
+    Ok(axum::Json(json!({
+        "duplicate": true,
+        "session": session_id,
+        "turn": turn_id,
+        "status": status,
+    }))
+    .into_response())
+}
+
+/// 提交编号的格式。浏览器生成的是 UUID，这里放宽到常见的安全字符，
+/// 但限长：它要进库、进主键。
+fn valid_request_id(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// 在 blocking 线程上跑一轮，并且**无论怎么结束都把库收拾干净**。
@@ -624,12 +690,15 @@ fn subscribe_sse(live: Arc<crate::app::live::LiveTurn>) -> Response {
 
 #[derive(serde::Deserialize)]
 struct TurnBody {
+    /// 浏览器点发送时生成的编号。重试带同一个。
+    request_id: String,
+    /// 在哪个会话里问。不给（或空串）= 新会话里的第一个问题。
+    session_id: Option<String>,
     question: String,
     /// 不给就按环境变量里配了谁的 key 自动挑。
     provider: Option<String>,
 }
 
-/// 会话相关的「没找到」。消息刻意含糊，见上面 handler 的说明。
 /// `POST /internal/sessions/{id}/turns/{turn}/cancel`
 ///
 /// 停止这个会话里编号为 `turn` 的那一轮。编号从 hello 事件的 `turn` 字段来。
@@ -722,6 +791,7 @@ async fn wait_finished(live: &crate::app::live::LiveTurn, limit: std::time::Dura
     }
 }
 
+/// 会话相关的「没找到」。消息刻意含糊：不存在和不是你的给一样的回答。
 fn not_found_session() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", "没有这个会话")
 }
@@ -1161,8 +1231,12 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let sid = crate::app::sessions::create(&mut store, "u_alice", Some("阿的会话")).unwrap();
-        crate::app::sessions::create(&mut store, "u_bob", Some("波的会话")).unwrap();
+        let sid = store
+            .create_session(Some("阿的会话"), Some("u_alice"))
+            .unwrap();
+        store
+            .create_session(Some("波的会话"), Some("u_bob"))
+            .unwrap();
         store
             .save_turn(
                 &sid,
@@ -1297,16 +1371,15 @@ mod tests {
     // ── 提问接口：流开始**之前**的那些拒绝 ────────────────
     //
     // 正常路径（真跑一轮）在 Go 那边的端到端测试里，那边有假模型。
-    // 这里只测拒绝——它们全都在 spawn_blocking 之前返回，不需要模型。
+    // 这里只测拒绝和去重——它们全都在 spawn_blocking 之前返回，不需要模型。
 
     fn post_turn(
         srv: &testserver::TestServer,
         user: &str,
-        session: &str,
         body: &str,
     ) -> reqwest::blocking::Response {
         reqwest::blocking::Client::new()
-            .post(srv.url(&format!("/internal/sessions/{session}/turns")))
+            .post(srv.url("/internal/turns"))
             .bearer_auth(token_for(user))
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -1314,7 +1387,20 @@ mod tests {
             .unwrap()
     }
 
-    /// ★ 拿别人的会话 id 来提问：404，而且**不占用执行名额**。
+    /// 在 `session` 里问 `q`，提交编号 `rid`。`session` 为空 = 新会话。
+    fn ask_body(rid: &str, session: &str, q: &str) -> String {
+        json!({"request_id": rid, "session_id": session, "question": q}).to_string()
+    }
+
+    fn sessions_of(st: &AppState, user: &str) -> i64 {
+        st.read()
+            .count_for_test(&format!(
+                "SELECT count(*) FROM sessions WHERE user_id = '{user}'"
+            ))
+            .unwrap()
+    }
+
+    /// ★ 拿别人的会话 id 来提问：404，而且**不占用执行名额**、不留任何记录。
     ///
     /// 名额的申请必须排在归属校验后面。反过来的话，随便拼一串别人的会话 id
     /// 狂发请求就能把名额占光——一个不用登录成别人就能做到的拒绝服务。
@@ -1322,11 +1408,18 @@ mod tests {
     fn 拿别人的会话提问是_404_且不占名额() {
         let (st, alice_sid) = two_users();
         let reg = Arc::clone(&st.registry);
-        let srv = testserver::spawn(st);
+        let srv = testserver::spawn(Arc::clone(&st));
 
-        let r = post_turn(&srv, "u_bob", &alice_sid, r#"{"question":"偷看"}"#);
+        let r = post_turn(&srv, "u_bob", &ask_body("r1", &alice_sid, "偷看"));
         assert_eq!(r.status(), 404);
         assert_eq!(reg.running_count(), 0, "被拒的请求占住了执行名额");
+        assert_eq!(
+            st.read()
+                .count_for_test("SELECT count(*) FROM chat_requests")
+                .unwrap(),
+            0,
+            "被拒的请求留下了提交记录"
+        );
     }
 
     #[test]
@@ -1334,7 +1427,7 @@ mod tests {
         let (st, _) = two_users();
         let srv = testserver::spawn(st);
         assert_eq!(
-            post_turn(&srv, "u_alice", "根本没有", r#"{"question":"喂"}"#).status(),
+            post_turn(&srv, "u_alice", &ask_body("r1", "根本没有", "喂")).status(),
             404
         );
     }
@@ -1343,13 +1436,30 @@ mod tests {
     fn 空问题是_400() {
         let (st, sid) = two_users();
         let srv = testserver::spawn(st);
-        for body in [r#"{"question":""}"#, r#"{"question":"   "}"#] {
+        for q in ["", "   "] {
             assert_eq!(
-                post_turn(&srv, "u_alice", &sid, body).status(),
+                post_turn(&srv, "u_alice", &ask_body("r1", &sid, q)).status(),
                 400,
-                "{body}"
+                "{q:?}"
             );
         }
+    }
+
+    /// 提交编号要进库、进主键：限长、限字符。
+    #[test]
+    fn 提交编号缺了或格式不对是_400() {
+        let (st, sid) = two_users();
+        let srv = testserver::spawn(st);
+        let long = "a".repeat(65);
+        for rid in ["", "带中文", "a b", "../x", long.as_str()] {
+            assert_eq!(
+                post_turn(&srv, "u_alice", &ask_body(rid, &sid, "喂")).status(),
+                400,
+                "{rid:?}"
+            );
+        }
+        let missing = json!({"session_id": sid, "question": "喂"}).to_string();
+        assert_eq!(post_turn(&srv, "u_alice", &missing).status(), 422);
     }
 
     /// provider 来自浏览器，是外部输入。必须走白名单。
@@ -1357,18 +1467,14 @@ mod tests {
     fn 不认识的_provider_是_400_但空的当作没给() {
         let (st, sid) = two_users();
         let srv = testserver::spawn(st);
-        let bad = post_turn(
-            &srv,
-            "u_alice",
-            &sid,
-            r#"{"question":"喂","provider":"--db"}"#,
-        );
-        assert_eq!(bad.status(), 400);
+        let bad = json!({"request_id":"r1","session_id":sid,"question":"喂","provider":"--db"});
+        assert_eq!(post_turn(&srv, "u_alice", &bad.to_string()).status(), 400);
 
         // ★ 空串当作「没给」，不能变成「不认识的 provider: 」。
         //   传空串是调用方最容易犯的错（Go 那边就犯过一次），而报错
         //   「不认识的 provider: 」跟真实原因一个字都不沾。
-        let empty = post_turn(&srv, "u_alice", &sid, r#"{"question":"喂","provider":""}"#);
+        let empty = json!({"request_id":"r2","session_id":sid,"question":"喂","provider":""});
+        let empty = post_turn(&srv, "u_alice", &empty.to_string());
         assert_ne!(
             empty.status(),
             400,
@@ -1382,53 +1488,118 @@ mod tests {
         let (st, sid) = two_users();
         let srv = testserver::spawn(st);
         let r = reqwest::blocking::Client::new()
-            .post(srv.url(&format!("/internal/sessions/{sid}/turns")))
+            .post(srv.url("/internal/turns"))
             .header("content-type", "application/json")
-            .body(r#"{"question":"喂"}"#)
+            .body(ask_body("r1", &sid, "喂"))
             .send()
             .unwrap();
         assert_eq!(r.status(), 401);
     }
 
+    /// 新会话里的第一个问题：会话由这个接口建，归属在建的那一刻就写进去。
+    ///
+    /// 名额设成 0，让请求停在申请名额那一步（503）——会话和提交记录在那之前
+    /// 已经写好了，这里不用真跑模型。
     #[test]
-    fn 建会话时归属在创建那一刻就写进去() {
-        let (st, _) = two_users();
-        let srv = testserver::spawn(st);
-        let r = reqwest::blocking::Client::new()
-            .post(srv.url("/internal/sessions"))
-            .bearer_auth(token_for("u_bob"))
-            .header("content-type", "application/json")
-            .body("{}")
-            .send()
-            .unwrap();
-        assert_eq!(r.status(), 201);
-        let id = r.json::<serde_json::Value>().unwrap()["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+    fn 新会话里提问_会话归属在创建那一刻写进去() {
+        let (st, _) = two_users_state();
+        let st = Arc::new(st.with_max_turns(0));
+        let srv = testserver::spawn(Arc::clone(&st));
+        let (bob0, alice0) = (sessions_of(&st, "u_bob"), sessions_of(&st, "u_alice"));
 
-        // 波能看到它
-        let mine: serde_json::Value = get_as(&srv, "u_bob", "/internal/sessions").json().unwrap();
-        assert!(
-            mine["sessions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s["id"] == id),
-            "刚建的会话不在自己列表里：{mine}"
+        let r = post_turn(&srv, "u_bob", &ask_body("r1", "", "新会话的问题"));
+        assert_eq!(r.status(), 503, "{}", r.text().unwrap());
+        assert_eq!(
+            sessions_of(&st, "u_bob"),
+            bob0 + 1,
+            "会话没建，或者建在了别人名下"
         );
-        // 阿看不到
-        let other: serde_json::Value = get_as(&srv, "u_alice", "/internal/sessions")
-            .json()
+        assert_eq!(sessions_of(&st, "u_alice"), alice0);
+    }
+
+    // ── 请求幂等 ───────────────────────────────────────────
+
+    /// ★ 新会话里提问被拒（名额满），浏览器带同一个编号重试：还是那一个会话。
+    ///
+    ///   这就是把「建会话」和「提问」合成一个接口要解决的场景。以前 Go 分两次
+    ///   调，重试时会再建一个会话。
+    #[test]
+    fn 新会话里的提问重试_只建一个会话() {
+        let (st, _) = two_users_state();
+        let st = Arc::new(st.with_max_turns(0));
+        let srv = testserver::spawn(Arc::clone(&st));
+        let before = sessions_of(&st, "u_bob");
+        for _ in 0..3 {
+            let r = post_turn(&srv, "u_bob", &ask_body("r1", "", "问"));
+            assert_eq!(r.status(), 503);
+        }
+        assert_eq!(sessions_of(&st, "u_bob"), before + 1, "重试又建了会话");
+    }
+
+    #[test]
+    fn 同一个编号换了问题是_409() {
+        let (st, sid) = two_users_state();
+        let st = Arc::new(st.with_max_turns(0));
+        let srv = testserver::spawn(Arc::clone(&st));
+        assert_eq!(
+            post_turn(&srv, "u_alice", &ask_body("r1", &sid, "问 A")).status(),
+            503
+        );
+        let (code, v) = json_of(post_turn(&srv, "u_alice", &ask_body("r1", &sid, "问 B")));
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["code"], "request_conflict");
+    }
+
+    /// 已经跑完的那一轮：同一个编号再来，告诉它就是那一轮，不重跑。
+    #[test]
+    fn 跑完之后同一个编号再来_返回那一轮不重跑() {
+        let (st, sid) = two_users();
+        let tid = crate::content::model::new_id();
+        {
+            let mut db = st.read();
+            db.claim_chat_request("u_alice", "r1", Some(&sid), "问")
+                .unwrap();
+            db.begin_turn(&tid, &sid, "m", "问", "问", Some(("u_alice", "r1")))
+                .unwrap();
+            db.finish_turn(&tid, &sid, crate::content::model::TurnStatus::Done, &[])
+                .unwrap();
+        }
+        let srv = testserver::spawn(Arc::clone(&st));
+        let r = post_turn(&srv, "u_alice", &ask_body("r1", &sid, "问"));
+        assert!(
+            r.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json"),
+            "重复的提交该回 JSON，不是事件流"
+        );
+        let (code, v) = json_of(r);
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["duplicate"], true);
+        assert_eq!(v["turn"], tid.as_str());
+        assert_eq!(v["session"], sid.as_str());
+        assert_eq!(v["status"], "done");
+        assert_eq!(st.registry.running_count(), 0, "重复的提交又跑了一轮");
+    }
+
+    /// ★ 拿到名额、还没写库的那一小段：库里查不到，靠登记表认出来。
+    #[test]
+    fn 正在跑还没写库时同一个编号再来_返回那一轮() {
+        let (st, sid) = two_users();
+        st.read()
+            .claim_chat_request("u_alice", "r1", Some(&sid), "问")
             .unwrap();
-        assert!(
-            !other["sessions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s["id"] == id),
-            "别人的会话出现在了阿的列表里：{other}"
-        );
+        let p = st.registry.admit(&sid, Some("r1")).unwrap();
+        let srv = testserver::spawn(Arc::clone(&st));
+        let (code, v) = json_of(post_turn(&srv, "u_alice", &ask_body("r1", &sid, "问")));
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["turn"], p.turn_id());
+        assert_eq!(v["status"], "running");
+
+        // 换一个编号就是另一次提交：照旧会话忙
+        let (code, v) = json_of(post_turn(&srv, "u_alice", &ask_body("r2", &sid, "问")));
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["code"], "session_busy");
     }
 
     #[test]
@@ -1445,7 +1616,7 @@ mod tests {
         assert_eq!(v["max_turns"], crate::app::registry::DEFAULT_MAX_TURNS);
         assert_eq!(v["accepting"], true);
 
-        let _p = reg.admit("s-x").unwrap();
+        let _p = reg.admit("s-x", None).unwrap();
         let v: serde_json::Value = reqwest::blocking::get(srv.url("/internal/health"))
             .unwrap()
             .json()
@@ -1485,7 +1656,7 @@ mod tests {
         let reg = Arc::clone(&st.registry);
         let srv = testserver::spawn(st);
 
-        let permit = reg.admit(&sid).unwrap();
+        let permit = reg.admit(&sid, None).unwrap();
         let live = permit.live();
         live.emit_json(&json!({"t": "hello", "session": sid}));
         live.emit_json(&json!({"t": "token", "text": "前半句"}));
@@ -1540,7 +1711,7 @@ mod tests {
         let url = format!("/internal/sessions/{alice_sid}/events");
 
         let idle: serde_json::Value = get_as(&srv, "u_bob", &url).json().unwrap();
-        let _p = reg.admit(&alice_sid).unwrap();
+        let _p = reg.admit(&alice_sid, None).unwrap();
         let busy = get_as(&srv, "u_bob", &url);
         assert_eq!(busy.status(), 404);
         let busy: serde_json::Value = busy.json().unwrap();
@@ -1553,7 +1724,7 @@ mod tests {
         let (st, sid) = two_users();
         // 测试里的库是内存库，只有 AppState 手里那一条连接能看到它
         st.read()
-            .begin_turn(&crate::content::model::new_id(), &sid, "m", "q", "q")
+            .begin_turn(&crate::content::model::new_id(), &sid, "m", "q", "q", None)
             .unwrap();
         let srv = testserver::spawn(st);
         let v: serde_json::Value = get_as(&srv, "u_alice", "/internal/sessions")
@@ -1601,9 +1772,9 @@ mod tests {
     /// 在登记表里占一个名额、在库里写一行 running，假装这一轮在跑。
     /// 不真的跑循环：这里测的是接口，循环的行为在 runner 的测试里。
     fn fake_running(st: &AppState, sid: &str) -> crate::app::registry::Permit {
-        let p = st.registry.admit(sid).unwrap();
+        let p = st.registry.admit(sid, None).unwrap();
         st.read()
-            .begin_turn(p.turn_id(), sid, "m", "问", "问")
+            .begin_turn(p.turn_id(), sid, "m", "问", "问", None)
             .unwrap();
         p
     }
@@ -1632,7 +1803,9 @@ mod tests {
     fn 取消_已经结束的一轮返回真实结局() {
         let (st, sid) = two_users();
         let tid = crate::content::model::new_id();
-        st.read().begin_turn(&tid, &sid, "m", "问", "问").unwrap();
+        st.read()
+            .begin_turn(&tid, &sid, "m", "问", "问", None)
+            .unwrap();
         st.read()
             .finish_turn(&tid, &sid, crate::content::model::TurnStatus::Done, &[])
             .unwrap();
@@ -1681,7 +1854,7 @@ mod tests {
         assert_eq!(code, 200, "{v}");
         assert_eq!(v["status"], "cancelled");
         assert!(
-            st.registry.admit(&sid).is_ok(),
+            st.registry.admit(&sid, None).is_ok(),
             "接口说停好了，同一个会话却还不能再问"
         );
     }
@@ -1705,7 +1878,9 @@ mod tests {
     fn 取消_拿上一轮的编号停不掉新的一轮() {
         let (st, sid) = two_users();
         let old = crate::content::model::new_id();
-        st.read().begin_turn(&old, &sid, "m", "旧", "旧").unwrap();
+        st.read()
+            .begin_turn(&old, &sid, "m", "旧", "旧", None)
+            .unwrap();
         st.read()
             .finish_turn(&old, &sid, crate::content::model::TurnStatus::Done, &[])
             .unwrap();
@@ -1724,7 +1899,7 @@ mod tests {
     #[test]
     fn 健康检查报名额用了几个() {
         let (st, sid) = two_users();
-        let _p = st.registry.admit(&sid).unwrap();
+        let _p = st.registry.admit(&sid, None).unwrap();
         let srv = testserver::spawn(st);
         let v: serde_json::Value = reqwest::blocking::get(srv.url("/internal/health"))
             .unwrap()

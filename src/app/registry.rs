@@ -79,6 +79,12 @@ pub enum Reject {
     Capacity { running: usize, elapsed: Duration },
     /// 正在停机，不再接受新的。
     ShuttingDown,
+    /// 这个会话正在跑的，就是**同一次提交**（同一个 request_id）跑起来的那一轮。
+    /// 不是拒绝：是重试撞上了自己，告诉调用方「就是这一轮」。
+    ///
+    /// 只有这里认得出这种情况：一轮从拿到名额到写进 turns 表之间有一小段空档，
+    /// 那时 chat_requests 里的 turn_id 还是空的，查库认不出来。
+    Duplicate { turn_id: String },
 }
 
 impl Reject {
@@ -94,6 +100,7 @@ impl Reject {
                 elapsed.as_secs_f64()
             ),
             Reject::ShuttingDown => "服务正在停机，暂时不接受新的提问".into(),
+            Reject::Duplicate { .. } => "这次提交已经在跑了".into(),
         }
     }
 
@@ -103,6 +110,7 @@ impl Reject {
             Reject::SessionBusy { .. } => "session_busy",
             Reject::Capacity { .. } => "capacity",
             Reject::ShuttingDown => "shutting_down",
+            Reject::Duplicate { .. } => "duplicate",
         }
     }
 }
@@ -112,6 +120,8 @@ struct Running {
     started: Instant,
     /// 这一轮的编号。取消请求拿它核对目标。
     turn_id: String,
+    /// 这一轮来自哪次提交（浏览器生成的 request_id）。命令行没有。
+    request_id: Option<String>,
     /// 这一轮的取消开关。
     cancel: CancelSignal,
     /// 这一轮发过的全部事件。刷新后的页面从这里补发、接着看。
@@ -174,12 +184,24 @@ impl Registry {
     ///
     /// 抢不到**不排队**。排队的话用户点了发送、界面一动不动，分不清是卡了
     /// 还是坏了；明确拒绝并说明原因，至少知道发生了什么。
-    pub fn admit(self: &Arc<Self>, session_id: &str) -> Result<Permit, Reject> {
+    ///
+    /// `request_id`：这一轮来自哪次提交。会话正被占着、而占着它的就是同一次
+    /// 提交时，返回 [`Reject::Duplicate`] 而不是「会话忙」——那是重试撞上了自己。
+    pub fn admit(
+        self: &Arc<Self>,
+        session_id: &str,
+        request_id: Option<&str>,
+    ) -> Result<Permit, Reject> {
         let mut inner = self.lock();
         if !inner.accepting {
             return Err(Reject::ShuttingDown);
         }
         if let Some(r) = inner.running.get(session_id) {
+            if request_id.is_some() && r.request_id.as_deref() == request_id {
+                return Err(Reject::Duplicate {
+                    turn_id: r.turn_id.clone(),
+                });
+            }
             return Err(Reject::SessionBusy {
                 elapsed: r.started.elapsed(),
             });
@@ -204,6 +226,7 @@ impl Registry {
             Running {
                 started: Instant::now(),
                 turn_id: turn_id.clone(),
+                request_id: request_id.map(str::to_string),
                 cancel: cancel.clone(),
                 live: Arc::clone(&live),
             },
@@ -321,6 +344,8 @@ impl Permit {
             turn_id: self.turn_id.clone(),
             cancel: self.cancel.clone(),
             held: Some(Arc::clone(&self.slot) as Arc<dyn std::any::Any + Send + Sync>),
+            // 登记表不知道是哪个用户；提问接口拿到 Permit 之后自己填
+            request: None,
         }
     }
 
@@ -338,7 +363,7 @@ impl std::fmt::Debug for Permit {
 
 impl PartialEq for Permit {
     /// 只比会话 id。有这个是为了让测试能写
-    /// `assert_eq!(reg.admit(..), Err(..))`——两个 Permit 相不相等本身
+    /// `assert_eq!(reg.admit(.., None), Err(..))`——两个 Permit 相不相等本身
     /// 没有业务含义。
     fn eq(&self, other: &Self) -> bool {
         self.session_id == other.session_id
@@ -383,8 +408,8 @@ mod tests {
     #[test]
     fn 拿到名额之后同一个会话再申请会被拒() {
         let reg = Registry::with_capacity(4);
-        let _p = reg.admit("s1").unwrap();
-        match reg.admit("s1") {
+        let _p = reg.admit("s1", None).unwrap();
+        match reg.admit("s1", None) {
             Err(Reject::SessionBusy { .. }) => {}
             other => panic!("期望 SessionBusy，实际 {other:?}"),
         }
@@ -393,22 +418,22 @@ mod tests {
     #[test]
     fn 名额还回去之后同一个会话能再申请() {
         let reg = Registry::with_capacity(4);
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         drop(p);
-        // ★ 必须绑住这个 Permit。写成 `assert!(reg.admit("s1").is_ok())`
+        // ★ 必须绑住这个 Permit。写成 `assert!(reg.admit("s1", None).is_ok())`
         //   的话，Permit 是个临时值，语句结束就被 Drop 掉了，下一句
         //   running_count 读到 0——第一版就是这么假红的。
         //   （顺带说明 guard 真的在工作。）
-        let _again = reg.admit("s1").unwrap();
+        let _again = reg.admit("s1", None).unwrap();
         assert_eq!(reg.running_count(), 1);
     }
 
     #[test]
     fn 上限是几就只能同时跑几个() {
         let reg = Registry::with_capacity(2);
-        let _a = reg.admit("s1").unwrap();
-        let _b = reg.admit("s2").unwrap();
-        match reg.admit("s3") {
+        let _a = reg.admit("s1", None).unwrap();
+        let _b = reg.admit("s2", None).unwrap();
+        match reg.admit("s3", None) {
             Err(Reject::Capacity { running, .. }) => assert_eq!(running, 2),
             other => panic!("期望 Capacity，实际 {other:?}"),
         }
@@ -419,11 +444,11 @@ mod tests {
     fn 默认允许不同会话同时跑() {
         let reg = Registry::new();
         let permits: Vec<_> = (0..DEFAULT_MAX_TURNS)
-            .map(|i| reg.admit(&format!("s{i}")).expect("还没满却被拒了"))
+            .map(|i| reg.admit(&format!("s{i}"), None).expect("还没满却被拒了"))
             .collect();
         assert_eq!(reg.running_count(), DEFAULT_MAX_TURNS);
         assert!(matches!(
-            reg.admit("one-more"),
+            reg.admit("one-more", None),
             Err(Reject::Capacity { .. })
         ));
         drop(permits);
@@ -435,16 +460,19 @@ mod tests {
     #[test]
     fn 同会话仍然互斥_不同会话不互斥() {
         let reg = Registry::new();
-        let _a = reg.admit("s1").unwrap();
-        let _b = reg.admit("s2").expect("不同会话不该互相挡");
-        assert!(matches!(reg.admit("s1"), Err(Reject::SessionBusy { .. })));
+        let _a = reg.admit("s1", None).unwrap();
+        let _b = reg.admit("s2", None).expect("不同会话不该互相挡");
+        assert!(matches!(
+            reg.admit("s1", None),
+            Err(Reject::SessionBusy { .. })
+        ));
     }
 
     #[test]
     fn 在跑的会话能拿到事件记录_跑完就没了() {
         let reg = Registry::with_capacity(4);
         assert!(reg.live("s1").is_none());
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         let live = reg.live("s1").expect("在跑却拿不到事件记录");
         assert!(Arc::ptr_eq(&live, &p.live()), "拿到的不是同一份记录");
         drop(p);
@@ -455,7 +483,7 @@ mod tests {
     #[test]
     fn 名额归还时事件记录跟着收尾() {
         let reg = Registry::with_capacity(4);
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         let live = p.live();
         assert!(!live.read_from(0).1);
         drop(p);
@@ -471,20 +499,20 @@ mod tests {
         let reg = Registry::with_capacity(1);
         let r2 = Arc::clone(&reg);
         let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _p = r2.admit("s1").unwrap();
+            let _p = r2.admit("s1", None).unwrap();
             panic!("假装跑挂了");
         }));
         assert!(boom.is_err(), "这个闭包本该 panic");
         assert_eq!(reg.running_count(), 0, "panic 之后名额没还回来");
-        assert!(reg.admit("s1").is_ok());
+        assert!(reg.admit("s1", None).is_ok());
     }
 
     #[test]
     fn 停机之后一律拒绝_但在跑的不受影响() {
         let reg = Registry::with_capacity(4);
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         reg.stop_accepting();
-        assert_eq!(reg.admit("s2"), Err(Reject::ShuttingDown));
+        assert_eq!(reg.admit("s2", None), Err(Reject::ShuttingDown));
         // 已经拿到名额的那个还活着
         assert_eq!(reg.running_count(), 1);
         drop(p);
@@ -502,14 +530,14 @@ mod tests {
     #[test]
     fn 等到空闲_超时了会报还剩几个() {
         let reg = Registry::with_capacity(4);
-        let _p = reg.admit("s1").unwrap();
+        let _p = reg.admit("s1", None).unwrap();
         assert_eq!(reg.wait_until_idle(Duration::from_millis(200)), 1);
     }
 
     #[test]
     fn 等到空闲_别的线程结束之后就返回() {
         let reg = Registry::with_capacity(4);
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             drop(p);
@@ -522,8 +550,8 @@ mod tests {
     #[test]
     fn 每一轮申请名额时就分到编号_各不相同() {
         let reg = Registry::with_capacity(4);
-        let a = reg.admit("s1").unwrap();
-        let b = reg.admit("s2").unwrap();
+        let a = reg.admit("s1", None).unwrap();
+        let b = reg.admit("s2", None).unwrap();
         assert!(!a.turn_id().is_empty());
         assert_ne!(a.turn_id(), b.turn_id());
         assert_eq!(a.control().turn_id, a.turn_id());
@@ -533,7 +561,7 @@ mod tests {
     #[test]
     fn 编号对得上才会打开取消开关() {
         let reg = Registry::with_capacity(4);
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         let ctl = p.control();
 
         assert!(reg.request_cancel("s1", "别的编号").is_none());
@@ -550,10 +578,10 @@ mod tests {
     #[test]
     fn 拿上一轮的编号停不掉新的一轮() {
         let reg = Registry::with_capacity(4);
-        let old = reg.admit("s1").unwrap();
+        let old = reg.admit("s1", None).unwrap();
         let old_id = old.turn_id().to_string();
         drop(old);
-        let new = reg.admit("s1").unwrap();
+        let new = reg.admit("s1", None).unwrap();
         assert!(reg.request_cancel("s1", &old_id).is_none());
         assert!(!new.control().cancel.is_cancelled());
     }
@@ -562,7 +590,7 @@ mod tests {
     #[test]
     fn 会话锁马上放开_全局名额等工具线程放手才还() {
         let reg = Registry::with_capacity(2);
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         // 工具线程手里那一份
         let held = p.control().held.expect("服务模式下要给工具线程一份名额");
         drop(p);
@@ -570,17 +598,20 @@ mod tests {
         assert_eq!(reg.running_count(), 0);
         assert_eq!(reg.slots_in_use(), 1, "工具还在跑，名额就还了");
         let again = reg
-            .admit("s1")
+            .admit("s1", None)
             .expect("这一轮结束了，同一个会话该能马上再问");
         assert_eq!(reg.slots_in_use(), 2);
         assert!(
-            matches!(reg.admit("s2"), Err(Reject::Capacity { running: 2, .. })),
+            matches!(
+                reg.admit("s2", None),
+                Err(Reject::Capacity { running: 2, .. })
+            ),
             "被丢下的工具占着的名额也该算数"
         );
 
         drop(held);
         assert_eq!(reg.slots_in_use(), 1);
-        let _s2 = reg.admit("s2").expect("工具线程放手之后名额该回来了");
+        let _s2 = reg.admit("s2", None).expect("工具线程放手之后名额该回来了");
         drop(again);
     }
 
@@ -596,7 +627,7 @@ mod tests {
     #[test]
     fn 记录结束时会话锁一定已经放开() {
         let reg = Registry::with_capacity(4);
-        let p = reg.admit("s1").unwrap();
+        let p = reg.admit("s1", None).unwrap();
         let live = p.live();
 
         let guard = reg.lock();
@@ -613,6 +644,40 @@ mod tests {
         assert!(reg.live("s1").is_none());
     }
 
+    // ── 请求幂等 ───────────────────────────────────────────
+
+    /// ★ 同一次提交的重试撞上了正在跑的自己：告诉它「就是这一轮」，不是「会话忙」。
+    ///
+    ///   这是那一小段空档的唯一防线：拿到名额之后、写进 turns 表之前，库里
+    ///   查不到这一轮，只有登记表知道。
+    #[test]
+    fn 同一次提交重试撞上自己_认得出是同一轮() {
+        let reg = Registry::with_capacity(4);
+        let p = reg.admit("s1", Some("req-1")).unwrap();
+        assert_eq!(
+            reg.admit("s1", Some("req-1")),
+            Err(Reject::Duplicate {
+                turn_id: p.turn_id().to_string()
+            })
+        );
+        assert_eq!(reg.running_count(), 1, "重试不该再占一个名额");
+    }
+
+    #[test]
+    fn 不是同一次提交_照旧是会话忙() {
+        let reg = Registry::with_capacity(4);
+        let _p = reg.admit("s1", Some("req-1")).unwrap();
+        assert!(matches!(
+            reg.admit("s1", Some("req-2")),
+            Err(Reject::SessionBusy { .. })
+        ));
+        // 命令行没有编号，也不能被当成重复
+        assert!(matches!(
+            reg.admit("s1", None),
+            Err(Reject::SessionBusy { .. })
+        ));
+    }
+
     /// 多个线程同时抢同一个会话，只能有一个拿到。
     ///
     /// 「两项检查在同一把锁里」如果写成了「先查再插」两段，这条会红。
@@ -626,7 +691,7 @@ mod tests {
             let w = Arc::clone(&winners);
             hs.push(std::thread::spawn(move || {
                 // 拿到的**不释放**（存进 vec 里返回），这样"同时"才成立
-                match r.admit("same-session") {
+                match r.admit("same-session", None) {
                     Ok(p) => {
                         w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(50));

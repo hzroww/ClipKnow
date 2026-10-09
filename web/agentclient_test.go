@@ -173,7 +173,7 @@ func TestEmptyProviderIsOmittedNotSentAsEmptyString(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"t\":\"done\",\"outcome\":\"done\",\"note\":\"\"}\n\n")
 	})
-	resp, err := cli.StartTurn("u1", "s1", "问题", "")
+	resp, err := cli.StartTurn("u1", "r1", "", "问题", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,13 +181,20 @@ func TestEmptyProviderIsOmittedNotSentAsEmptyString(t *testing.T) {
 	if _, present := body["provider"]; present {
 		t.Errorf("provider 为空时不该出现在请求体里，实际 %#v", body)
 	}
+	// 会话为空 = 新会话，同样不传空串
+	if _, present := body["session_id"]; present {
+		t.Errorf("session_id 为空时不该出现在请求体里，实际 %#v", body)
+	}
+	if body["request_id"] != "r1" {
+		t.Errorf("提交编号没传过去：%#v", body)
+	}
 
 	// 给了就要传
-	if _, err := cli.StartTurn("u1", "s1", "问题", "deepseek"); err != nil {
+	if _, err := cli.StartTurn("u1", "r2", "s1", "问题", "deepseek"); err != nil {
 		t.Fatal(err)
 	}
-	if body["provider"] != "deepseek" {
-		t.Errorf("provider 没传过去：%#v", body)
+	if body["provider"] != "deepseek" || body["session_id"] != "s1" {
+		t.Errorf("provider / session_id 没传过去：%#v", body)
 	}
 }
 

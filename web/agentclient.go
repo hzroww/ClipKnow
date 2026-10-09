@@ -203,46 +203,20 @@ func (c *AgentClient) Messages(userID, sessionID string) ([]Message, error) {
 	return out.Messages, nil
 }
 
-// 新建一个属于这个用户的空会话，返回会话 id。
-//
-// ★ 归属在**创建那一刻**就写进库，不是事后认领。改造前是 Rust 子进程先建、
-//
-//	把 id 放在 hello 那一行报回来、Go 再认领一次——中间那一小段时间里会话
-//	是无主的，认领失败（进程被杀）就永远无主了。
-func (c *AgentClient) CreateSession(userID string) (string, error) {
-	tok, err := c.signer.sign(userID)
-	if err != nil {
-		return "", err
-	}
-	req, err := http.NewRequest(http.MethodPost, c.base+"/internal/sessions",
-		strings.NewReader(`{}`))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.read.Do(req)
-	if err != nil {
-		return "", &agentDownError{err}
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		return "", readAgentError(resp)
-	}
-	var out struct {
-		SessionID string `json:"session_id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	if out.SessionID == "" {
-		return "", fmt.Errorf("agent 建了会话但没回 id")
-	}
-	return out.SessionID, nil
-}
-
 // 提问。返回一个**还没读完**的响应，调用方负责把 body 读完并关掉。
+//
+// 调的是 Rust 的 `POST /internal/turns`。**新会话也走这一个**：sessionID 为空
+// 时由 Rust 建会话。以前 Go 先调一次「建会话」再调一次「提问」，新会话里
+// 提问、第二次调用断了、浏览器带同一个编号重试时，Go 什么都不记得，又建一个
+// 会话——同一个问题挂在两个会话上。合成一次调用后，建会话和写提交记录在
+// Rust 的同一个事务里（见 src/serve/mod.rs 的 start_turn）。
+//
+// requestID 是浏览器点发送时生成的编号，重试带同一个。
+//
+// 成功时（200）有两种响应，调用方按 Content-Type 区分：
+//
+//	text/event-stream   新的一轮开始跑
+//	application/json    同一次提交的重试：{"duplicate":true,"session","turn","status"}
 //
 // ## 超时怎么设
 //
@@ -254,33 +228,34 @@ func (c *AgentClient) CreateSession(userID string) (string, error) {
 //	ResponseHeaderTimeout   30 秒。Rust 在接受请求时就会发出响应头
 //	                        （或者立刻拒绝），拖过 30 秒说明它卡住了。
 //	                        没有这一条的话，agent 半死时这个请求会永远挂着。
-func (c *AgentClient) StartTurn(userID, sessionID, question, provider string) (*http.Response, error) {
+func (c *AgentClient) StartTurn(userID, requestID, sessionID, question, provider string) (*http.Response, error) {
 	tok, err := c.signer.sign(userID)
 	if err != nil {
 		return nil, err
 	}
-	// ★ provider 为空时**整个字段不传**，不传一个空字符串。
+	// ★ provider、session_id 为空时**整个字段不传**，不传空字符串。
 	//
-	//   传空串的话，Rust 那边收到的是 Some("")，而它的白名单里没有空串，
-	//   于是一个「没指定模型」的正常请求变成 400「不认识的 provider: 」。
-	//   （和 docker-compose 那个 ${VAR:-} 传空串的坑是同一类：
-	//     "没给" 和 "给了个空的" 必须是两回事。）
-	payload := map[string]string{"question": question}
+	//   传空串的话，Rust 那边收到的是 Some("")。provider 的白名单里没有空串，
+	//   一个「没指定模型」的正常请求会变成 400「不认识的 provider: 」——这个
+	//   bug 真发生过。（Rust 那边现在也把空串当没给，两边都防。）
+	payload := map[string]string{"request_id": requestID, "question": question}
 	if strings.TrimSpace(provider) != "" {
 		payload["provider"] = provider
+	}
+	if strings.TrimSpace(sessionID) != "" {
+		payload["session_id"] = sessionID
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	url := c.base + "/internal/sessions/" + url.PathEscape(sessionID) + "/turns"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, c.base+"/internal/turns", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Accept", "text/event-stream, application/json")
 
 	resp, err := c.stream.Do(req)
 	if err != nil {
@@ -289,7 +264,7 @@ func (c *AgentClient) StartTurn(userID, sessionID, question, provider string) (*
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		// 流还没开始，拒绝走 HTTP 状态码——400 参数错 / 404 不是你的会话 /
-		// 409 这个会话在跑 / 503 名额满。
+		// 409 这个会话在跑或者编号冲突 / 503 名额满。
 		return nil, readAgentError(resp)
 	}
 	return resp, nil

@@ -14,7 +14,7 @@
 //!      两边各写一套准入规则，就会出现「网页拦得住、命令行拦不住」。
 //!
 //!   3. **对外的数据形状不等于数据库的行。** `sessions` 表有 user_id、
-//!      deleted_at、creation_request_id，这些不该出现在给浏览器的 JSON 里。
+//!      deleted_at，这些不该出现在给浏览器的 JSON 里。
 //!      这一层负责把行翻译成 DTO，让表结构改动不会直接漏到接口上。
 
 pub mod live;

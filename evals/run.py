@@ -72,11 +72,19 @@ def run_turn(db, question, session=None, flags=None, provider=None, user=None):
     cmd += [question]
 
     t0 = time.time()
+    # ★ 超时也要返回一个**字段齐全**的结果。原来超时那条路只带了五个字段，
+    #   后面的断言一查「迭代次数」就 KeyError，整个评测脚本退出——2026-10-10
+    #   跑全量时 B1 超过 7 分钟，就这样把后面几十题连同下一轮对比一起带走了。
+    timed_out = False
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=TURN_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return {"outcome": "timeout", "wall_secs": TURN_TIMEOUT, "answer": "",
-                "tools": Counter(), "events": [], "stderr": "超时"}
+        stdout, stderr, code = p.stdout, p.stderr, p.returncode
+    except subprocess.TimeoutExpired as e:
+        # 被杀之前已经打出来的那部分也留着：只知道「超时」查不了，要看它卡在哪一步。
+        # 注意 POSIX 上这里拿到的是 bytes，即使 text=True
+        def text(b):
+            return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+        stdout, stderr, code, timed_out = text(e.stdout), text(e.stderr), None, True
 
     r = {
         "outcome": None, "answer": "", "session": session,
@@ -87,11 +95,11 @@ def run_turn(db, question, session=None, flags=None, provider=None, user=None):
         "wall_secs": round(time.time() - t0, 1),
         "first_tool_secs": None,
         "tools": Counter(), "events": [], "note": "",
-        "stderr": p.stderr.strip()[-800:],
-        "exit_code": p.returncode,
+        "stderr": stderr.strip()[-800:],
+        "exit_code": code,
     }
 
-    for line in p.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -103,7 +111,10 @@ def run_turn(db, question, session=None, flags=None, provider=None, user=None):
             continue
         t = d.get("t")
         r["events"].append(d)
-        if t == "hello":
+        if t == "iteration":
+            # 正常结束时 usage 里有准数会覆盖它；超时时只剩这个
+            r["iterations"] = max(r["iterations"], d.get("n") or 0)
+        elif t == "hello":
             r["session"] = d.get("session")
         elif t == "tool_call":
             r["tools"][d.get("name", "?")] += 1
@@ -130,7 +141,12 @@ def run_turn(db, question, session=None, flags=None, provider=None, user=None):
             r["outcome"] = r["outcome"] or "error"
             r["note"] = d.get("message", "")
 
-    if r["outcome"] is None:
+    if timed_out:
+        r["outcome"] = "timeout"
+        last = r["events"][-1].get("t") if r["events"] else "（一个事件都没出）"
+        r["note"] = (f"超过 {TURN_TIMEOUT} 秒没跑完，被杀掉了。已经跑到第 {r['iterations']} 轮，"
+                     f"调过 {sum(r['tools'].values())} 次工具，最后一个事件是 {last}")
+    elif r["outcome"] is None:
         # 流没有正常收尾。Go 那边有同样的判断——这里也要有，因为 eval 直接
         # 起子进程，不经过 Go。
         r["outcome"] = "no_terminal_event"
@@ -669,6 +685,9 @@ def main():
     ap.add_argument("--bin", default=None,
                     help="用哪个 clipknow 程序跑（默认 target/release/clipknow）。"
                          "拿旧版本跑对比时指到旧版本编出来的程序")
+    ap.add_argument("--work", default=None,
+                    help="运行库放哪（默认 results/warm.db）。两轮同时跑时各给一个，"
+                         "不然每次重置会把对方正在用的库冲掉")
     args = ap.parse_args()
 
     global BIN
@@ -685,7 +704,8 @@ def main():
     if args.db:
         db = pathlib.Path(args.db)
     else:
-        db = OUT_DIR / ("fresh.db" if args.fresh else "warm.db")
+        db = (pathlib.Path(args.work) if args.work
+              else OUT_DIR / ("fresh.db" if args.fresh else "warm.db"))
         for suffix in ("", "-wal", "-shm"):
             p = pathlib.Path(str(db) + suffix)
             if p.exists():

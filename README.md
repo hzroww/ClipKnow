@@ -184,9 +184,18 @@ DASHSCOPE_VISION_MODEL=...   # 可选，默认 qwen3-vl-plus
 再加一个**不是 key** 的环境变量：Go 和 Rust 之间的内部凭证密钥。两个进程读的是
 同一个名字，值必须一样，少于 32 字符两边都拒绝启动。
 
+**只生成一次，存进 shell 的启动文件**，之后新开的每个终端拿到的都是同一个值：
+
 ```bash
-export CLIPKNOW_INTERNAL_SECRET=$(openssl rand -base64 32)
+echo "export CLIPKNOW_INTERNAL_SECRET=$(openssl rand -base64 32)" >> ~/.zshrc   # bash 用 ~/.bashrc
+source ~/.zshrc
 ```
+
+两种做法会出事，都实测过：
+
+- **每个终端各跑一次 `openssl rand`**：那是两个不同的值。网页启动时直接退出，报
+  「agent 不认我签的凭证……多半是 CLIPKNOW_INTERNAL_SECRET 两边配得不一样」。
+- **只写进 `.env`**：Rust 会读 `.env`，Go 不读——网页那边等于没配，同样起不来。
 
 没有「没配就不校验」的降级路径——那种默认是最典型的上线事故：开发时一路顺畅，
 上线忘了配，于是一个谁都能调的服务挂在那里，而且不报任何错。
@@ -209,9 +218,9 @@ brew install rustup && rustup toolchain install stable
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 cargo build --release
 
-# ② key 放进 .env（已在 .gitignore 里）或 ~/.zshrc，
-#    再生成一个内部凭证密钥（两个终端里都要有）
-export CLIPKNOW_INTERNAL_SECRET=$(openssl rand -base64 32)
+# ② key 放进 .env（已在 .gitignore 里）或 ~/.zshrc；
+#    内部凭证密钥照上面「只生成一次」那两行做（做过就跳过），
+#    之后新开的终端里都是同一个值
 
 # ③ 建库。这是**唯一**执行建表语句的地方，服务启动只检查版本不升级——
 #    两个服务会同时启动，各自跑 DDL 就是两个写者抢锁
@@ -267,6 +276,9 @@ export CLIPKNOW_INTERNAL_SECRET=$(openssl rand -base64 32)
 docker compose up -d --build
 docker compose logs -f            # 看启动日志
 ```
+
+compose **每执行一条命令**都会检查这几个必填变量，换个新终端跑 `docker compose logs`
+或 `down` 会直接报「先 export ……」。长期用的话，和上面一样存进 `~/.zshrc`。
 
 打开 <http://localhost:3000>,注册账号即可。
 

@@ -120,8 +120,9 @@ enum Command {
         session: Option<String>,
         /// 这一轮属于哪个用户（users.id）。新建会话时写进 sessions.user_id。
         ///
-        /// 网页那条路必须给——不给的话建出来的会话 user_id 为空，
-        /// 列表里谁都看不到它。命令行（find/ask）不需要。
+        /// 不给就是无主会话：网页上谁都看不到它，长期记忆也不读不写。
+        /// 评测的记忆用例靠它——会话有主人，记忆才会启动，而且这条路
+        /// 会等抽取跑完再退出（见 app::turn::Extraction::Inline）。
         #[arg(long)]
         user: Option<String>,
         /// 这一轮的问题
@@ -806,6 +807,9 @@ fn cmd_turn_json(
             provider,
             config: &cfg,
             control: &turn::TurnControl::standalone(),
+            // ★ 命令行问完就退出，后台线程会跟着没了，所以抽取在这里跑完再走。
+            //   只有带 --user 建的会话才有主人、才会抽（evals 的记忆用例）。
+            extraction: turn::Extraction::Inline,
         },
         &sink,
     )

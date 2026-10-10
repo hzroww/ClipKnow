@@ -49,6 +49,18 @@ pub struct TurnRequest<'a> {
     pub provider: Option<Provider>,
     pub config: &'a LoopConfig,
     pub control: &'a TurnControl,
+    /// 这一轮正常答完之后，长期记忆的抽取怎么跑。见 [`Extraction`]。
+    pub extraction: Extraction,
+}
+
+/// 一轮答完之后的记忆抽取怎么跑（`app::memory`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extraction {
+    /// 另开一条线程，`execute` 立刻返回。服务模式用：用户已经拿到答案了，不用等。
+    Background,
+    /// 在当前线程上跑完再返回。命令行用：进程一退出后台线程就跟着没了，
+    /// 评测的记忆用例就是靠这一条才测得到。
+    Inline,
 }
 
 /// 跑一轮要带上的控制信息。服务模式下由登记表在申请名额时给出
@@ -200,16 +212,18 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
     sink.emit_json(&usage_json(&res, cost));
     sink.emit_json(&done_json(&res.outcome, &outcome_note(&res, req.config)));
 
-    // 抽取放在 done 之后、另开线程：用户已经拿到答案了，不用等它。
+    // 抽取放在 done 之后：网页那边用户已经拿到答案了，不用等它。
     // 只在正常答完时抽，和 Laplace 一样——失败、停止的轮次不抽。
     if memory_owner.is_some() && matches!(res.outcome, TurnOutcome::Done) {
-        crate::app::memory::spawn_extraction(
-            req.db_path,
-            req.provider,
-            req.session_id,
-            turn_id,
-            req.question,
-        );
+        let (db, sid, q) = (req.db_path, req.session_id, req.question);
+        match req.extraction {
+            Extraction::Background => {
+                crate::app::memory::spawn_extraction(db, req.provider, sid, turn_id, q)
+            }
+            Extraction::Inline => {
+                crate::app::memory::run_extraction(db, req.provider, sid, turn_id, q)
+            }
+        }
     }
     Ok(())
 }

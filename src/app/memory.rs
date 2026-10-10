@@ -158,20 +158,35 @@ pub fn spawn_extraction(
     );
     let spawned = std::thread::Builder::new()
         .name("memory-extract".into())
-        .spawn(move || {
-            let run = || -> Result<ExtractReport> {
-                let mut store = SqliteStore::open(&db)?;
-                let llm = build_client(provider)?;
-                extract_for_turn(&mut store, &*llm, &sid, &tid, &q)
-            };
-            match run() {
-                Ok(r) if r.skipped.is_some() => {}
-                Ok(r) => eprintln!("记忆（会话 {sid}）：{}", r.summary()),
-                Err(e) => eprintln!("⚠️  记忆抽取失败（会话 {sid}，这一轮没记上）：{e}"),
-            }
-        });
+        .spawn(move || run_extraction(&db, provider, &sid, &tid, &q));
     if let Err(e) = spawned {
         eprintln!("⚠️  起不了记忆抽取线程（会话 {session_id}，这一轮没记上）：{e}");
+    }
+}
+
+/// 就在当前线程上抽取一次，跑完才返回。结果只进日志（stderr）。
+///
+/// 命令行 `clipknow turn` 用它：进程一退出，后台线程就跟着没了，所以得等。
+/// 评测靠这条路测记忆（`evals/run.py` 的记忆用例）。
+///
+/// 自己开库连接、自己建模型客户端：和这一轮的执行不共享任何东西，
+/// 后台线程里跑的也是这同一个函数。
+pub fn run_extraction(
+    db_path: &str,
+    provider: Option<Provider>,
+    session_id: &str,
+    turn_id: &str,
+    question: &str,
+) {
+    let run = || -> Result<ExtractReport> {
+        let mut store = SqliteStore::open(db_path)?;
+        let llm = build_client(provider)?;
+        extract_for_turn(&mut store, &*llm, session_id, turn_id, question)
+    };
+    match run() {
+        Ok(r) if r.skipped.is_some() => {}
+        Ok(r) => eprintln!("记忆（会话 {session_id}）：{}", r.summary()),
+        Err(e) => eprintln!("⚠️  记忆抽取失败（会话 {session_id}，这一轮没记上）：{e}"),
     }
 }
 

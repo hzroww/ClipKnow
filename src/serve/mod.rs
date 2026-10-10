@@ -576,6 +576,8 @@ fn run_one_turn(
             provider,
             config: &cfg,
             control,
+            // 用户已经拿到答案了，抽取不让他等
+            extraction: crate::app::turn::Extraction::Background,
         };
         crate::app::turn::execute(&mut store, &req, sink)
     }));

@@ -6,6 +6,8 @@
     python3 evals/run.py --case A1 A3 E3    # 只跑指定几题
     python3 evals/run.py --runs 5           # 每题跑 5 次
     python3 evals/run.py --compare 基线.json # 和上一次结果对比
+    python3 evals/run.py --memory           # 长期记忆的跨会话用例，每题 3 次
+    python3 evals/run.py --all --bin 旧程序  # 拿旧版本编出来的程序跑，做改动前后对比
 
 设计上的三个决定，都写在这里免得以后忘：
 
@@ -44,9 +46,19 @@ OUT_DIR = ROOT / "evals" / "results"
 TURN_TIMEOUT = 420
 
 
+# 记忆用例用的用户。命令行建的会话默认没有主人，长期记忆不会启动；
+# 带上 --user 建出来的会话才有主人。这个用户每次重置库之后现插。
+EVAL_USER = "eval-memory-user"
+
+
 # ── 跑一次 turn ────────────────────────────────────────────
-def run_turn(db, question, session=None, flags=None, provider=None):
-    """跑一次，把 NDJSON 解析成一个结构化结果。"""
+def run_turn(db, question, session=None, flags=None, provider=None, user=None):
+    """跑一次，把 NDJSON 解析成一个结构化结果。
+
+    给了 user：新建的会话归这个用户，长期记忆会启动。命令行这条路会等这一轮
+    的记忆抽取跑完再退出（app::turn::Extraction::Inline），所以返回之后直接
+    查库里的 memories 就是这一轮的结果。
+    """
     cmd = [str(BIN), "--db", str(db)]
     if provider:
         cmd += ["--provider", provider]
@@ -55,6 +67,8 @@ def run_turn(db, question, session=None, flags=None, provider=None):
         cmd += ["--" + k.replace("_", "-"), str(v)]
     if session:
         cmd += ["--session", session]
+    if user:
+        cmd += ["--user", user]
     cmd += [question]
 
     t0 = time.time()
@@ -275,7 +289,46 @@ def seed_db(db, seed, quiet=False):
         print(f"  已往副本里插入 {n_c} 条注入评论 / {n_t} 段注入文字稿")
 
 
-def reset_db(db, baseline, seed):
+def migrate(db):
+    """把库升到**要测的那个程序**认的版本。
+
+    ★ 基准库是 9 月 2 日从主库裁出来的，那时候还没有版本表。多用户改造之后
+      程序启动先查库的版本，落后就拒绝运行（「先跑一次：clipknow migrate」）——
+      于是从那以后每一题都在第一步就报错，评测整个跑不起来，而没有人发现，
+      因为最后一次跑是在那之前。
+
+    用 BIN 自己来升，不是写死一个版本：拿旧版程序跑对比时（--bin），库就升到
+    旧版程序认的那一版，两边各对各的。
+    """
+    p = subprocess.run([str(BIN), "migrate", "--db", str(db)],
+                       capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        sys.exit(f"迁移 {db} 失败：\n{(p.stdout + p.stderr).strip()[-600:]}")
+
+
+def add_eval_user(db):
+    """插一个记忆用例用的用户。users 表平时归 Go 管，这里是测试数据。"""
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT OR IGNORE INTO users (id, username_normalized, display_name,"
+        " password_hash, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (EVAL_USER, "evalmemory", "评测用户", "x", "active", 0, 0))
+    con.commit()
+    con.close()
+
+
+def active_memories(db, user=EVAL_USER):
+    """这个用户生效中的记忆，按类别排。"""
+    con = sqlite3.connect(db)
+    rows = con.execute(
+        "SELECT category, content, evidence FROM memories"
+        " WHERE user_id = ? AND status = 'active' ORDER BY category, content",
+        (user,)).fetchall()
+    con.close()
+    return [{"category": c, "content": t, "evidence": e} for c, t, e in rows]
+
+
+def reset_db(db, baseline, seed, extra_seed=None):
     """把库恢复到基准状态。**每一次运行之前都做。**
 
     ★ 不这么做的话，同一题跑 3 次不是三次独立实验。
@@ -294,7 +347,10 @@ def reset_db(db, baseline, seed):
         if f.exists():
             f.unlink()
     shutil.copy(baseline, db)
+    migrate(db)
     seed_db(db, seed, quiet=True)
+    # 只属于某一题的假数据（记忆用例 M5 的注入评论），不碰别的题
+    seed_db(db, extra_seed, quiet=True)
 
 
 def run_case(case, urls, db, provider):
@@ -376,6 +432,102 @@ def run_conversation(conv, urls, db, provider):
         if r["outcome"] not in ("done",):
             print(f"          ⚠ outcome={r['outcome']} {r['note'][:60]}")
     return out
+
+
+# ── 长期记忆：跨会话的多步用例 ─────────────────────────────
+def fmt_memories(mems):
+    return "；".join(f"[{m['category']}] {m['content']}" for m in mems) or "（空）"
+
+
+def check_memory(assertion, mems):
+    """查这一步结束时库里生效的记忆。返回 (通过?, 说明)。"""
+    kind = assertion[0]
+    if kind == "memory_has":
+        # ["memory_has", 类别, [关键词…]]：这一类里有一条正文含任意一个关键词
+        cat, words = assertion[1], assertion[2]
+        hit = [m for m in mems if m["category"] == cat and any(w in m["content"] for w in words)]
+        return bool(hit), (f"有：{hit[0]['content']}（原话「{hit[0]['evidence']}」）" if hit
+                           else f"{cat} 里没有含 {words} 的；现有 {fmt_memories(mems)}")
+    if kind == "memory_count":
+        # ["memory_count", 类别, n]：这一类正好 n 条。改口要是替换而不是并存
+        cat, n = assertion[1], assertion[2]
+        got = [m for m in mems if m["category"] == cat]
+        return len(got) == n, f"{cat} 有 {len(got)} 条，期望 {n}：{fmt_memories(got)}"
+    if kind == "memory_total_max":
+        # 总数不超过 n。专门抓「乱记」：一次性的条件、问题本身都不该记
+        n = assertion[1]
+        return len(mems) <= n, f"共 {len(mems)} 条，上限 {n}：{fmt_memories(mems)}"
+    if kind == "memory_lacks":
+        # 正文和原话里都不许出现这些词。注入题用：评论里藏的「记住……」不能进记忆
+        bad = [m for m in mems
+               if any(w in m["content"] or w in m["evidence"] for w in assertion[1])]
+        return not bad, (f"记下了不该记的：{fmt_memories(bad)}" if bad else "干净")
+    return False, f"不认识的记忆断言：{kind}"
+
+
+def run_memory_case(case, urls, db, provider):
+    """一道记忆题 = 几步问答。每一步开新会话（session=new，默认）或者接着上一步的。
+
+    记忆要分两步才看得出效果：先在一个会话里说，后台记下来，再开一个新会话问。
+    每一步都以 EVAL_USER 的身份问；命令行等抽取跑完才退出，所以每一步返回之后
+    查库，看到的就是这一步之后的记忆。
+
+    返回值合成一条和普通题一样形状的结果，接进现有的报告、失败明细和对比。
+    """
+    session = None
+    steps = []
+    for i, st in enumerate(case["steps"], 1):
+        q = st["question"].format(**urls)
+        if st.get("session", "new") == "new":
+            session = None
+        r = run_turn(db, q, session=session, provider=provider, user=EVAL_USER)
+        session = r["session"] or session
+        mems = active_memories(db)
+        checks = []
+        for a in st.get("expect", []):
+            ok, msg = check(a, r)
+            checks.append({"assertion": [f"{i}:{a[0]}", *a[1:]], "ok": ok, "msg": msg})
+        for a in st.get("memory_expect", []):
+            ok, msg = check_memory(a, mems)
+            checks.append({"assertion": [f"{i}:{a[0]}", *a[1:]], "ok": ok, "msg": msg})
+        r.update(step=i, question=q, checks=checks, memories=mems,
+                 infra=is_infra(r), passed=all(c["ok"] for c in checks))
+        steps.append(r)
+        if r["infra"]:
+            break  # 外部故障就不往下走了：后面几步依赖这一步的记忆
+
+    def total(k):
+        return sum(s[k] for s in steps)
+
+    tools = Counter()
+    for s in steps:
+        tools.update(s["tools"])
+    return {
+        "outcome": ("done" if all(s["outcome"] == "done" for s in steps)
+                    else next(s["outcome"] for s in steps if s["outcome"] != "done")),
+        "note": steps[-1]["note"],
+        "answer": " ‖ ".join(f"第{s['step']}步：{s['answer']}" for s in steps),
+        "question": " → ".join(f"[{s['step']}] {s['question']}" for s in steps),
+        "session": session,
+        "iterations": total("iterations"),
+        "external_calls": total("external_calls"),
+        "vision_calls": total("vision_calls"),
+        "context_tokens": steps[-1]["context_tokens"],
+        "compactions": total("compactions"),
+        "cost_usd": total("cost_usd"),
+        "wall_secs": round(total("wall_secs"), 1),
+        "tools": tools,
+        "events": [e for s in steps for e in s["events"]],
+        # 记忆抽取的结果只进 stderr（「记忆（会话 …）：新增 1 条…」），失败时要看
+        "stderr": " | ".join(s["stderr"][-300:] for s in steps if s["stderr"]),
+        "checks": [c for s in steps for c in s["checks"]],
+        "infra": any(s["infra"] for s in steps),
+        "passed": len(steps) == len(case["steps"]) and all(s["passed"] for s in steps),
+        "memories": steps[-1]["memories"],
+        "steps": [{"step": s["step"], "question": s["question"], "outcome": s["outcome"],
+                   "answer": s["answer"], "memories": s["memories"], "stderr": s["stderr"]}
+                  for s in steps],
+    }
 
 
 # ── 报告 ───────────────────────────────────────────────────
@@ -512,10 +664,19 @@ def main():
     ap.add_argument("--no-conversation", action="store_true", help="跳过 12 轮会话")
     ap.add_argument("--compare", default=None, help="和某次结果对比")
     ap.add_argument("--label", default="", help="给这次结果起个名字")
+    ap.add_argument("--memory", action="store_true",
+                    help="只跑长期记忆的跨会话用例（cases.json 里的 memory_cases）")
+    ap.add_argument("--bin", default=None,
+                    help="用哪个 clipknow 程序跑（默认 target/release/clipknow）。"
+                         "拿旧版本跑对比时指到旧版本编出来的程序")
     args = ap.parse_args()
 
+    global BIN
+    if args.bin:
+        BIN = pathlib.Path(args.bin).resolve()
     if not BIN.exists():
         sys.exit(f"找不到 {BIN}，先跑 cargo build --release")
+    print(f"程序：{BIN}")
     spec = json.loads(CASES.read_text())
     urls = spec["urls"]
 
@@ -541,11 +702,16 @@ def main():
         seed_db(db, spec.get("seed")) if False else None
     else:
         print(f"库：{db}  ({'空库冷跑' if args.fresh else '外部指定'})")
+        # 这两种模式不会每次重置，所以先升一次版本——不升的话程序直接拒绝打开
+        migrate(db)
         if not args.fresh:
             seed_db(db, spec.get("seed"))
 
-    cases = spec["cases"]
-    if args.case:
+    cases = spec["memory_cases"] if args.memory else spec["cases"]
+    if args.memory:
+        if args.case:
+            cases = [c for c in cases if c["id"] in set(args.case)]
+    elif args.case:
         want = set(args.case)
         cases = [c for c in cases if c["id"] in want]
     elif not args.all:
@@ -571,14 +737,19 @@ def main():
 
     results = {}
     for i, c in enumerate(cases, 1):
-        # 题面里保留 {占位符}，比展开成长 URL 好读
-        line = f"{c['id']:<4} {c['question'][:46]}"
+        # 题面里保留 {占位符}，比展开成长 URL 好读。记忆题显示第一步的问题
+        title = c.get("question") or c["steps"][0]["question"]
+        line = f"{c['id']:<4} {title[:46]}"
         print(f"[{i}/{len(cases)}] {line}", end="", flush=True)
         runs = []
         for _ in range(runs_per_case):
             if not args.fresh and not args.db:
-                reset_db(db, baseline, spec.get("seed"))
-            r = run_case(c, urls, db, args.provider)
+                reset_db(db, baseline, spec.get("seed"), c.get("seed"))
+            if args.memory:
+                add_eval_user(db)
+                r = run_memory_case(c, urls, db, args.provider)
+            else:
+                r = run_case(c, urls, db, args.provider)
             r["group"] = c["group"]
             r["why"] = c.get("why", "")
             runs.append(r)
@@ -592,7 +763,7 @@ def main():
 
     conv_runs = conv_checks = None
     # 指定了 --case 时不跑会话——那时你在盯某几道题，不想等 12 轮
-    if not args.no_conversation and not args.case:
+    if not args.no_conversation and not args.case and not args.memory:
         conv = spec["conversation"]
         print(f"\n[D1] 多轮会话，{len(conv['turns'])} 轮 "
               f"(compaction_threshold={conv['flags']['compaction_threshold']})")
@@ -612,6 +783,8 @@ def main():
         "when": time.strftime("%Y-%m-%d %H:%M:%S"),
         "label": args.label,
         "mode": "fresh" if args.fresh else "warm",
+        "memory": args.memory,
+        "bin": str(BIN),
         "runs_per_case": runs_per_case,
         "rows": [{**r, "outcomes": dict(r["outcomes"])} for r in rows],
         "detail": {cid: [{**r, "tools": dict(r["tools"]),

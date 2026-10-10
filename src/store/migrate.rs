@@ -79,6 +79,13 @@ const MIGRATIONS: &[Migration] = &[
             "../../migrations/agent/009_chat_requests.sql"
         ))],
     },
+    Migration {
+        version: 5,
+        name: "memories",
+        steps: &[Step::Sql(include_str!(
+            "../../migrations/agent/010_memories.sql"
+        ))],
+    },
 ];
 
 /// 代码期望的库版本。
@@ -363,6 +370,52 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// ★ 用户删掉一条记忆时，它的旧版本跟着删——靠的是 superseded_by 上的
+    ///   ON DELETE CASCADE，不是代码记得去删。而且要能**连着删好几代**：
+    ///   「只要中文」→「中文英文都行」→「只要英文」，删最新的那条，前两条都得走。
+    #[test]
+    fn 删掉一条记忆_它的旧版本一代一代全跟着删() {
+        let mut c = fresh();
+        run(&mut c).unwrap();
+        user(&c, "u1");
+        let ins = "INSERT INTO memories(id,user_id,category,content,evidence,status,superseded_by,created_at,updated_at)
+                   VALUES (?1,'u1','preference',?1,'原话',?2,?3,0,0)";
+        c.execute(ins, rusqlite::params!["v3", "active", None::<String>])
+            .unwrap();
+        c.execute(ins, rusqlite::params!["v2", "superseded", "v3"])
+            .unwrap();
+        c.execute(ins, rusqlite::params!["v1", "superseded", "v2"])
+            .unwrap();
+        // 别人的、不相干的一条，不能被连带
+        c.execute(ins, rusqlite::params!["other", "active", None::<String>])
+            .unwrap();
+
+        c.execute("DELETE FROM memories WHERE id = 'v3'", [])
+            .unwrap();
+        let left: Vec<String> = c
+            .prepare("SELECT id FROM memories ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, vec!["other".to_string()], "旧版本没删干净");
+    }
+
+    #[test]
+    fn 记忆只能是三类之一() {
+        let mut c = fresh();
+        run(&mut c).unwrap();
+        user(&c, "u1");
+        let ins = "INSERT INTO memories(id,user_id,category,content,evidence,created_at,updated_at)
+                   VALUES (?1,'u1',?2,'c','e',0,0)";
+        c.execute(ins, ["m1", "exclusion"]).unwrap();
+        assert!(
+            c.execute(ins, ["m2", "password"]).is_err(),
+            "不认识的类别必须被库拒绝"
+        );
     }
 
     /// 从来没用过的那一列删干净了，免得以后有人以为它也在管去重。

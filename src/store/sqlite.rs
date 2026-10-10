@@ -16,6 +16,10 @@ use crate::error::Result;
 use crate::ingest::url::Platform;
 use crate::store::{Store, StoredVideo};
 
+// 长期记忆的存取。放在子模块里，能直接用这里的连接和 write_tx
+mod memories;
+pub use memories::ApplyReport;
+
 pub struct SqliteStore {
     conn: Connection,
 }

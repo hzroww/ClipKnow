@@ -447,6 +447,8 @@ pub fn run_turn(
             cancel: &CancelSignal::new(),
         },
         history,
+        // 命令行建的会话没有主人，没有长期记忆
+        None,
         question,
         cfg,
         &NoopObserver,
@@ -454,9 +456,14 @@ pub fn run_turn(
 }
 
 /// 跑一次提问，把每一步推给 `obs`。
+///
+/// `memory` 是这个会话冻结的那段长期记忆（`agent::memory::render_block` 拼的），
+/// 没有就是 None。它排在**所有消息的最前面**、只发给模型，不进这一轮的条目
+/// （所以不落库、不显示在聊天记录里、也不会被压缩摘要进去）。
 pub fn run_turn_observed(
     deps: TurnDeps<'_>,
     history: &History,
+    memory: Option<&str>,
     question: &str,
     cfg: &LoopConfig,
     obs: &dyn TurnObserver,
@@ -509,6 +516,14 @@ pub fn run_turn_observed(
         None => history.to_items(),
     };
     let mut messages: Vec<Msg> = crate::agent::context::to_messages(&flat);
+    // ★ 长期记忆放在最前面，连压缩摘要都排在它后面。
+    //
+    //   位置决定前缀缓存能吃到多少：这段在同一个会话里是冻结的，放最前面，
+    //   后面的历史每轮都能接着命中缓存。用 user 而不是 system：系统提示词是
+    //   最高权限，记忆是权限最低的背景材料（段里自己写着），不能混进去。
+    if let Some(m) = memory.filter(|m| !m.is_empty()) {
+        messages.insert(0, Msg::user(m));
+    }
 
     let mut idx = 1i64;
     items.push(Item::user_message(idx, question));
@@ -2585,6 +2600,7 @@ mod tests {
         run_turn_observed(
             TurnDeps { llm, tools, cancel },
             &no_hist(),
+            None,
             "问题",
             &cfg(),
             &NoopObserver,
@@ -2772,6 +2788,7 @@ mod tests {
                 cancel: &cancel,
             },
             &no_hist(),
+            None,
             "问题",
             &cfg(),
             &rec,
@@ -2781,5 +2798,74 @@ mod tests {
             vec![(false, false), (true, true)],
             "正常的那次不标，被丢下的那次标着被停止"
         );
+    }
+
+    // ── 长期记忆 ──────────────────────────────────────────
+
+    fn with_memory(memory: Option<&str>, history: &History) -> (MockLlm, TurnResult) {
+        let cancel = CancelSignal::new();
+        let llm = MockLlm::new(vec![wants("", &[("search_videos", "科普")]), says("答完")]);
+        let mut tools = ScriptedTools::new(&cancel, &[ToolScript::Ok]);
+        let res = run_turn_observed(
+            TurnDeps {
+                llm: &llm,
+                tools: &mut tools,
+                cancel: &cancel,
+            },
+            history,
+            memory,
+            "这一轮的问题",
+            &cfg(),
+            &NoopObserver,
+        );
+        (llm, res)
+    }
+
+    /// ★ 记忆段在**每一次**请求里都是第一条，排在历史前面——前缀缓存靠这个；
+    ///   而且不进这一轮的条目：不落库，不显示在聊天记录里，不会被摘要进去。
+    #[test]
+    fn 记忆段排在每次请求的最前面_不进这一轮的条目() {
+        let history = History {
+            turns: vec![TurnItems {
+                seq: 1,
+                items: vec![
+                    Item::user_message(1, "上次问的"),
+                    Item::assistant_message(2, 1, "上次答的"),
+                ],
+            }],
+            ..Default::default()
+        };
+        let block = "<memory-context>\n偏好：\n- 只要中文博主\n</memory-context>";
+        let (llm, res) = with_memory(Some(block), &history);
+        let seen = llm.seen.borrow();
+        assert_eq!(seen.len(), 2, "一次调工具、一次答完");
+        for req in seen.iter() {
+            match &req.messages[0] {
+                Msg::User(t) => assert_eq!(t, block),
+                other => panic!("第一条不是记忆段：{other:?}"),
+            }
+            match &req.messages[1] {
+                Msg::User(t) => assert!(t.contains("上次问的"), "{t}"),
+                other => panic!("记忆段后面该是历史：{other:?}"),
+            }
+        }
+        assert!(
+            !res.items
+                .iter()
+                .any(|i| i.payload.to_string().contains("只要中文博主")),
+            "记忆段进了这一轮的条目，会被落库"
+        );
+    }
+
+    #[test]
+    fn 没有记忆或者记忆是空串_请求里什么都不多() {
+        for m in [None, Some("")] {
+            let (llm, _) = with_memory(m, &no_hist());
+            let first = &llm.seen.borrow()[0].messages[0];
+            match first {
+                Msg::User(t) => assert!(t.contains("这一轮的问题"), "{t}"),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }

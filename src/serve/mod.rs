@@ -40,7 +40,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde_json::json;
 use tokio_stream::StreamExt;
 
@@ -245,6 +245,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/internal/sessions/{id}/turns/{turn}/cancel",
             post(cancel_turn),
         )
+        // 长期记忆：网页上的记忆面板列出、删除。只有这个用户自己的
+        .route("/internal/memories", get(list_memories))
+        .route("/internal/memories/{id}", delete(delete_memory))
         .fallback(fallback)
         .with_state(state)
 }
@@ -791,6 +794,54 @@ async fn wait_finished(live: &crate::app::live::LiveTurn, limit: std::time::Dura
     }
 }
 
+/// `GET /internal/memories`
+///
+/// 返回 `{"memories":[{id,category,content,evidence,created_at,updated_at}],
+///        "limits":{"profile":3,"preference":10,"exclusion":50}}` —— 只有这个
+/// 用户生效中的记忆。过滤在 SQL 的 WHERE 里（`SqliteStore::active_memories`）。
+///
+/// 上限一起给出去，面板上显示「偏好 8/10」用。上限只在 Rust 这边写一份
+/// （`agent::memory::Category::cap`），前端不再抄一遍。
+async fn list_memories(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+) -> std::result::Result<Response, ApiError> {
+    let ms = tokio::task::spawn_blocking(move || st.read().active_memories(&who.user_id))
+        .await
+        .map_err(join_failed)??;
+    let limits: serde_json::Map<String, serde_json::Value> = crate::agent::memory::Category::ALL
+        .into_iter()
+        .map(|c| (c.as_str().to_string(), json!(c.cap())))
+        .collect();
+    Ok(axum::Json(json!({"memories": ms, "limits": limits})).into_response())
+}
+
+/// `DELETE /internal/memories/{id}`
+///
+/// 删掉自己的一条记忆，成功回 204。不存在、不是你的、已经删过，**一律 404**，
+/// 不区分——理由同 `session_messages`。
+///
+/// 删掉之后，这个用户所有会话冻结的记忆段都会清掉、下一轮重新拼：删了就要
+/// 马上不再影响回答（见 `SqliteStore::delete_memory`）。
+async fn delete_memory(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    let deleted = tokio::task::spawn_blocking(move || st.read().delete_memory(&who.user_id, &id))
+        .await
+        .map_err(join_failed)??;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "没有这条记忆",
+        ))
+    }
+}
+
 /// 会话相关的「没找到」。消息刻意含糊：不存在和不是你的给一样的回答。
 fn not_found_session() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", "没有这个会话")
@@ -1291,6 +1342,92 @@ mod tests {
 
         let v: serde_json::Value = get_as(&srv, "u_bob", "/internal/sessions").json().unwrap();
         assert_eq!(v["sessions"][0]["title"], "波的会话");
+    }
+
+    // ── 长期记忆面板 ──────────────────────────────────────
+
+    /// 两个用户各有记忆。返回 (state, 阿的那条记忆的 id)。
+    fn two_users_with_memories() -> (Arc<AppState>, String) {
+        use crate::agent::memory::{Category, MemoryOp};
+        let (st, _) = two_users_state();
+        let add = |c: Category, s: &str| MemoryOp::Add {
+            category: c,
+            content: s.into(),
+            evidence: s.into(),
+        };
+        st.read()
+            .apply_memory_ops(
+                "u_alice",
+                None,
+                &[
+                    add(Category::Preference, "阿只要中文博主"),
+                    add(Category::Profile, "阿做美妆"),
+                ],
+            )
+            .unwrap();
+        st.read()
+            .apply_memory_ops("u_bob", None, &[add(Category::Preference, "波的偏好")])
+            .unwrap();
+        let alice = st.read().active_memories("u_alice").unwrap()[1].id.clone();
+        (Arc::new(st), alice)
+    }
+
+    fn delete_as(
+        srv: &testserver::TestServer,
+        user: &str,
+        path: &str,
+    ) -> reqwest::blocking::Response {
+        reqwest::blocking::Client::new()
+            .delete(srv.url(path))
+            .bearer_auth(token_for(user))
+            .send()
+            .unwrap()
+    }
+
+    #[test]
+    fn 记忆列表只出自己的_带着各类上限() {
+        let (st, _) = two_users_with_memories();
+        let srv = testserver::spawn(st);
+
+        let v: serde_json::Value = get_as(&srv, "u_alice", "/internal/memories")
+            .json()
+            .unwrap();
+        let ms = v["memories"].as_array().unwrap();
+        assert_eq!(ms.len(), 2, "{v}");
+        // 身份排在偏好前面
+        assert_eq!(ms[0]["category"], "profile");
+        assert_eq!(ms[0]["content"], "阿做美妆");
+        assert!(
+            ms[0]["evidence"].is_string() && ms[0]["id"].is_string(),
+            "{v}"
+        );
+        assert!(!v.to_string().contains("波的偏好"), "混进了别人的记忆：{v}");
+        assert_eq!(v["limits"]["exclusion"], 50, "{v}");
+
+        let r = reqwest::blocking::get(srv.url("/internal/memories")).unwrap();
+        assert_eq!(r.status(), 401, "不带凭证不能看");
+    }
+
+    #[test]
+    fn 删自己的记忆是_204_再删一次和删别人的都是_404() {
+        let (st, alice_mem) = two_users_with_memories();
+        let srv = testserver::spawn(Arc::clone(&st));
+        let path = format!("/internal/memories/{alice_mem}");
+
+        // 波拿阿的记忆 id 来删：404，而且阿的那条还在
+        let r = delete_as(&srv, "u_bob", &path);
+        assert_eq!(r.status(), 404);
+        assert_eq!(r.json::<serde_json::Value>().unwrap()["code"], "not_found");
+        assert_eq!(st.read().active_memories("u_alice").unwrap().len(), 2);
+
+        assert_eq!(delete_as(&srv, "u_alice", &path).status(), 204);
+        assert_eq!(st.read().active_memories("u_alice").unwrap().len(), 1);
+        assert_eq!(delete_as(&srv, "u_alice", &path).status(), 404, "删第二次");
+        assert_eq!(
+            st.read().active_memories("u_bob").unwrap().len(),
+            1,
+            "别人的不该被动"
+        );
     }
 
     #[test]

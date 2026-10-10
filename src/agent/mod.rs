@@ -10,6 +10,7 @@ pub mod compaction;
 pub mod context;
 pub mod exec;
 pub mod llm;
+pub mod memory;
 pub mod runner;
 pub mod tools;
 pub mod vision;

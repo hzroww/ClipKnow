@@ -18,6 +18,7 @@
 //!      这一层负责把行翻译成 DTO，让表结构改动不会直接漏到接口上。
 
 pub mod live;
+pub mod memory;
 pub mod registry;
 pub mod sessions;
 pub mod turn;

@@ -127,6 +127,23 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
         Err(e) => bail!(e),
     };
 
+    // ★ 长期记忆。会话有主人（网页那条路）才有，命令行建的会话没有。
+    //   读失败只当没有记忆，不拦这一轮（见 app::memory）。
+    let memory_owner = if crate::app::memory::enabled() {
+        store.session_owner(req.session_id).unwrap_or_else(|e| {
+            eprintln!(
+                "⚠️  会话 {} 查主人失败，这一轮不带记忆：{e}",
+                req.session_id
+            );
+            None
+        })
+    } else {
+        None
+    };
+    let memory = memory_owner
+        .as_ref()
+        .and_then(|_| crate::app::memory::context_for_turn(store, req.session_id));
+
     // ★ 提问一被接受就先写库：一行 running 的 turn + 用户的问题 + 标题。
     //
     //   以前是整轮答完才写。实测：跑到一半刷新页面，连自己问的问题都看不到，
@@ -154,6 +171,7 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
             cancel: &req.control.cancel,
         },
         &history,
+        memory.as_deref(),
         req.question,
         req.config,
         sink,
@@ -181,6 +199,18 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
         .cost_usd(res.input_tokens, res.cached_input_tokens, res.output_tokens);
     sink.emit_json(&usage_json(&res, cost));
     sink.emit_json(&done_json(&res.outcome, &outcome_note(&res, req.config)));
+
+    // 抽取放在 done 之后、另开线程：用户已经拿到答案了，不用等它。
+    // 只在正常答完时抽，和 Laplace 一样——失败、停止的轮次不抽。
+    if memory_owner.is_some() && matches!(res.outcome, TurnOutcome::Done) {
+        crate::app::memory::spawn_extraction(
+            req.db_path,
+            req.provider,
+            req.session_id,
+            turn_id,
+            req.question,
+        );
+    }
     Ok(())
 }
 

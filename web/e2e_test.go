@@ -113,6 +113,24 @@ func startServer(t *testing.T, modelURL string) *httptest.Server {
 // 那边状态（比如 /internal/health 里名额用了几个）的测试用。
 func startServerWithAgent(t *testing.T, modelURL string) (*httptest.Server, *AgentClient) {
 	t.Helper()
+	return startServerOpts(t, modelURL, false)
+}
+
+// 打开长期记忆的版本。只有专门测记忆的用例用，见 startServerOpts。
+func startServerWithMemory(t *testing.T, modelURL string) *httptest.Server {
+	t.Helper()
+	srv, _ := startServerOpts(t, modelURL, true)
+	return srv
+}
+
+// memory 决定长期记忆开不开。
+//
+// ★ 默认关：每一轮正常答完，Rust 会在后台再调一次模型抽取记忆。那一次调用
+//
+//	的时机不确定（答完之后的某个时刻），会打乱其它用例「模型被调了几次」的
+//	断言，而它们测的根本不是记忆。
+func startServerOpts(t *testing.T, modelURL string, memory bool) (*httptest.Server, *AgentClient) {
+	t.Helper()
 	bin := clipknowBin(t)
 	dir := t.TempDir()
 	db := filepath.Join(dir, "clipknow.db")
@@ -124,6 +142,11 @@ func startServerWithAgent(t *testing.T, modelURL string) (*httptest.Server, *Age
 	t.Setenv("DEEPSEEK_API_KEY", "fake-key-for-test")
 	t.Setenv("SCRAPECREATORS_API_KEY", "fake-key-for-test")
 	t.Setenv("DASHSCOPE_API_KEY", "")
+	if memory {
+		t.Setenv("CLIPKNOW_MEMORY", "on")
+	} else {
+		t.Setenv("CLIPKNOW_MEMORY", "off")
+	}
 
 	// ★ 先把库建出来。迁移不再由服务启动时顺手做（Go 和 Rust 会同时启动，
 	//   两边都跑 DDL 就是两个写者抢锁），所以这里显式跑一次——和真实部署

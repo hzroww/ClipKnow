@@ -209,9 +209,9 @@ func TestEmptyProviderIsOmittedNotSentAsEmptyString(t *testing.T) {
 //
 //	387 个测试全绿，最后是靠 grep 发现的。）
 func TestGoHasNoChatTableSQL(t *testing.T) {
-	// 聊天表由 Rust 拥有。users / auth_sessions 是 Go 自己的，不在此列。
+	// 聊天表和记忆表由 Rust 拥有。users / auth_sessions 是 Go 自己的，不在此列。
 	forbidden := regexp.MustCompile(
-		`(?i)(from|join|into|update)\s+(sessions|turns|items)\b`)
+		`(?i)(from|join|into|update)\s+(sessions|turns|items|memories)\b`)
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -239,8 +239,8 @@ func TestGoHasNoChatTableSQL(t *testing.T) {
 				continue
 			}
 			if forbidden.MatchString(line) {
-				t.Errorf("%s:%d 又出现了聊天表的 SQL：%s\n"+
-					"这三张表由 Rust 拥有，Go 应该走 agentclient.go 问它",
+				t.Errorf("%s:%d 又出现了聊天表或记忆表的 SQL：%s\n"+
+					"这几张表由 Rust 拥有，Go 应该走 agentclient.go 问它",
 					name, i+1, trimmed)
 			}
 		}

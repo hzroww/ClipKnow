@@ -112,6 +112,9 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/sessions/{id}/events", s.needAuth(s.handleEvents))
 	mux.HandleFunc("POST /api/sessions/{id}/turns/{turn}/cancel", s.needAuth(s.handleCancel))
 	mux.HandleFunc("/api/chat", s.needAuth(s.handleChat))
+	// 长期记忆面板。记忆存在 Rust 那边，这里只认人、转发
+	mux.HandleFunc("GET /api/memories", s.needAuth(s.handleMemories))
+	mux.HandleFunc("DELETE /api/memories/{id}", s.needAuth(s.handleDeleteMemory))
 	// 登录页本身不设防——它就是那个输用户名密码的地方
 	mux.HandleFunc("/", s.handleIndex)
 	return mux

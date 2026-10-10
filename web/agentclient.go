@@ -339,6 +339,64 @@ func (c *AgentClient) CancelTurn(userID, sessionID, turnID string) (int, *Cancel
 	return resp.StatusCode, &out, nil
 }
 
+// 一条长期记忆。对应 Rust 那边 agent::memory::Memory。
+type Memory struct {
+	ID string `json:"id"`
+	// profile / preference / exclusion
+	Category string `json:"category"`
+	// 一句话事实，会进模型的上下文
+	Content string `json:"content"`
+	// 用户的原话，只给面板看
+	Evidence  string `json:"evidence"`
+	CreatedAt int64  `json:"created_at"`
+	// 最后一次被提到的时间。一类满了，挤掉的是这个最早的
+	UpdatedAt int64 `json:"updated_at"`
+}
+
+// 记忆面板要的全部：生效中的记忆，和每一类最多几条。
+//
+// 上限从 Rust 那边带过来，面板显示「偏好 8/10」。Go 和前端都不抄一份数字。
+type Memories struct {
+	Memories []Memory       `json:"memories"`
+	Limits   map[string]int `json:"limits"`
+}
+
+// 这个用户生效中的长期记忆。
+func (c *AgentClient) Memories(userID string) (*Memories, error) {
+	var out Memories
+	if err := c.get(userID, "/internal/memories", &out); err != nil {
+		return nil, err
+	}
+	// 空切片而不是 nil，理由同 Sessions
+	if out.Memories == nil {
+		out.Memories = []Memory{}
+	}
+	return &out, nil
+}
+
+// 删掉自己的一条记忆。不存在 / 不是你的 / 已经删过，都返回一个 404 的 agentError。
+func (c *AgentClient) DeleteMemory(userID, memoryID string) error {
+	tok, err := c.signer.sign(userID)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodDelete,
+		c.base+"/internal/memories/"+url.PathEscape(memoryID), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.read.Do(req)
+	if err != nil {
+		return &agentDownError{err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return readAgentError(resp)
+	}
+	return nil
+}
+
 // ── 启动自检 ────────────────────────────────────────────────
 
 // 起服务前确认 Rust 那边真的能用。

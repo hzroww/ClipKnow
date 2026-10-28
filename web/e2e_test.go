@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -89,7 +90,14 @@ func fakeModel(t *testing.T, hits *int) *httptest.Server {
 // 不该让整个 go test 变红，那只会让人学会忽略红色。
 func clipknowBin(t *testing.T) string {
 	t.Helper()
-	p, err := filepath.Abs("../target/release/clipknow")
+	path := os.Getenv("CLIPKNOW_TEST_BIN")
+	if path == "" {
+		path = "../target/release/clipknow"
+		if runtime.GOOS == "windows" {
+			path += ".exe"
+		}
+	}
+	p, err := filepath.Abs(path)
 	if err != nil {
 		t.Fatal(err)
 	}

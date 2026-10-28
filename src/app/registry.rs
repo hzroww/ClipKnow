@@ -346,6 +346,7 @@ impl Permit {
             held: Some(Arc::clone(&self.slot) as Arc<dyn std::any::Any + Send + Sync>),
             // 登记表不知道是哪个用户；提问接口拿到 Permit 之后自己填
             request: None,
+            prepared: false,
         }
     }
 

@@ -8,6 +8,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ClipKnowError {
+    #[error("5 次免费问答已用完，你仍可查看历史对话。")]
+    FreeQuotaExhausted,
     #[error("无法识别的链接: {0}\n目前只支持 YouTube / TikTok / Instagram")]
     UnsupportedUrl(String),
 

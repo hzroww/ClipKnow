@@ -125,6 +125,9 @@ func TestSecondQuestionOnBusySessionIsRejected(t *testing.T) {
 		}
 	}
 
+	if q := quotaForTest(t, cli, srv); q["used"] != float64(1) {
+		t.Fatal("会话忙的拒绝不能扣次数", q)
+	}
 	openGate()
 	drain(first)
 }

@@ -49,6 +49,7 @@ use crate::error::{ClipKnowError, Result};
 use crate::store::sqlite::{ChatRequestClaim, SqliteStore};
 use crate::wire::TurnSink;
 
+mod admin;
 pub mod auth;
 use auth::Principal;
 
@@ -212,6 +213,11 @@ fn join_failed(e: tokio::task::JoinError) -> ApiError {
 impl From<ClipKnowError> for ApiError {
     fn from(e: ClipKnowError) -> Self {
         match e {
+            ClipKnowError::FreeQuotaExhausted => ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "free_quota_exhausted",
+                e.to_string(),
+            ),
             // 调用方传的参数不对，不是服务端的问题
             ClipKnowError::BadRequest(m) => {
                 ApiError::new(StatusCode::BAD_REQUEST, "bad_request", m)
@@ -232,9 +238,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 不设防：Docker 的 healthcheck 调它，那时候没有密钥可用。
         // 它也确实什么都不泄漏——只说库的迁移版本。
         .route("/internal/health", get(health))
+        .route("/internal/quota", get(quota))
         // 往下都要内部凭证。靠 handler 参数里的 `Principal` 提取器强制，
         // 不是靠中间件——见 auth.rs 里关于「忘了调」的说明。
         .route("/internal/whoami", get(whoami))
+        .route(
+            "/internal/admin/users/{user}/sessions",
+            get(admin::sessions),
+        )
+        .route(
+            "/internal/admin/sessions/{session}/turns",
+            get(admin::turns),
+        )
+        .route("/internal/admin/turns/{turn}", get(admin::turn))
+        .route(
+            "/internal/admin/turns/{turn}/items/{item}/raw",
+            get(admin::raw),
+        )
         .route("/internal/sessions", get(list_sessions))
         // 提问（新会话的话顺便建会话）。为什么合成一个，见 start_turn
         .route("/internal/turns", post(start_turn))
@@ -491,15 +511,55 @@ async fn start_turn(
     //
     //   名额（permit）move 进闭包：闭包结束时 Drop，名额归还。panic 也走
     //   Drop，所以"每条退出路径都释放"是类型系统保证的。
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        // Keep admission and execution in one owned task. A disconnected HTTP
+        // client must not leave a charged question without an execution worker.
+        let prepare = (|| -> crate::error::Result<()> {
+            let llm = crate::agent::llm::build_client(provider)?;
+            crate::ingest::scrapecreators::ScrapeCreators::from_env()?;
+            let mut store = SqliteStore::open(&db_path)?;
+            let request = control.request.as_ref().expect("HTTP request identity");
+            store.begin_turn(
+                &control.turn_id,
+                &session_id,
+                llm.model_name(),
+                &question,
+                &question.chars().take(40).collect::<String>(),
+                Some((&request.user_id, &request.request_id)),
+            )?;
+            Ok(())
+        })();
+        match prepare {
+            Ok(()) => {
+                control.prepared = true;
+                let _ = ready_tx.send(Ok(()));
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(ApiError::from(e)));
+                return;
+            }
+        }
         run_one_turn(&db_path, &session_id, &question, provider, &control, &sink);
         // _permit 在这里 Drop：先放会话锁、再把事件记录标成结束（顺序见
         // Permit 的 Drop）。已经连上的订阅者手里有自己的 Arc，会把剩下的读完。
         // 全局名额要等这一轮丢下的工具线程（如果有）也结束才还。
     });
-
+    ready_rx
+        .await
+        .map_err(|_| ApiError::internal("问答准备任务异常退出"))??;
     Ok(subscribe_sse(live))
+}
+
+async fn quota(
+    State(st): State<Arc<AppState>>,
+    who: Principal,
+) -> std::result::Result<axum::Json<serde_json::Value>, ApiError> {
+    let value = tokio::task::spawn_blocking(move || st.read().user_quota(&who.user_id))
+        .await
+        .map_err(join_failed)??;
+    Ok(axum::Json(value))
 }
 
 /// 同一次提交的重试：告诉调用方「就是这一轮」，带上它现在的状态。

@@ -17,7 +17,9 @@ use crate::ingest::url::Platform;
 use crate::store::{Store, StoredVideo};
 
 // 长期记忆的存取。放在子模块里，能直接用这里的连接和 write_tx
+mod admin;
 mod memories;
+mod quota;
 pub use memories::ApplyReport;
 
 pub struct SqliteStore {
@@ -602,6 +604,9 @@ impl SqliteStore {
                 }
             }
             None => {
+                // Reject exhausted users before creating empty conversations.
+                // Accepted retries above still work after the fifth question.
+                quota::ensure_available(&tx, user_id)?;
                 let sid = match session_id {
                     Some(s) => s.to_string(),
                     None => insert_session(&tx, None, Some(user_id))?,
@@ -901,6 +906,8 @@ impl SqliteStore {
                     "提交记录对不上：{request_id} 不存在、不在这个会话、或者已经跑过一轮"
                 )));
             }
+            // Same transaction as the turn and request binding: failures roll back all three.
+            quota::charge(&tx, user_id, ts)?;
         }
         touch_session(&tx, session_id, ts)?;
         tx.commit()?;

@@ -468,9 +468,18 @@ func writeAgentError(w http.ResponseWriter, err error) {
 	}
 
 	switch ae.Status {
+	case http.StatusTooManyRequests:
+		if ae.Code == "free_quota_exhausted" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(ae)
+			return
+		}
+		http.Error(w, ae.Message, http.StatusServiceUnavailable)
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
 		http.Error(w, ae.Message, ae.Status)
-	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+	case http.StatusServiceUnavailable:
 		http.Error(w, ae.Message, http.StatusServiceUnavailable)
 	case http.StatusUnauthorized:
 		// 见上面映射表里这一行的说明。原因只进服务端日志。

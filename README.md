@@ -15,7 +15,7 @@
 | 闸门 | 四层十二道,含不变量 `max_video_analyses < max_tool_calls` |
 | 上下文压缩 | 12 轮触发 5 次,窗口 8,983 → 2,879 token,压缩后仍答对 9 轮 |
 | 长期记忆 | 答完后台单独抽取、原话核对、按会话冻结;主模型没有写记忆的工具 |
-| 自动测试 | Rust **569 个** + Go **45 个**,全部不联网不花钱(夹具是真实响应) |
+| 自动测试 | Rust **575 个** + Go **51 个**,全部不联网不花钱(夹具是真实响应) |
 | 代码 | Rust 约 6,200 行 + 测试 9,700 行；Go 约 1,500 行 + 测试 1,100 行；前端 1 个文件 |
 | CI | 每次 push 跑 5 个任务：Rust / Go / 端到端 / 老库升级 / Docker 从零起 |
 
@@ -267,6 +267,52 @@ cd web && go run . -db ../clipknow.db
 `turn` 和网页那条路调的是**同一个函数**（`app::turn::execute`），区别只在事件
 往哪送：一个写 stdout，一个塞进队列转成 SSE。评测脚本（`evals/run.py`）用的就是
 `turn`。
+
+### 只读调试后台
+
+登录管理员账号后，聊天页右上角会出现「调试后台」，也可以访问 `/admin`。
+按「用户 → 会话 → 问答」浏览全部已保存记录；展开问答可查看按迭代分组的模型正文、
+供应商返回的思考字段、工具参数和工具结果。原始响应仅在点击时加载。
+
+先正常注册自己的账号，再在部署机器上执行一次（`your_username` 换成自己的用户名）：
+
+```powershell
+cd web
+go run . -db ../clipknow.db -admin-user your_username
+```
+
+已编译部署使用 `clipknow-web -db /data/clipknow.db -admin-user your_username`；
+Compose 部署可运行 `docker compose exec web /usr/local/bin/clipknow-web -db /data/clipknow.db -admin-user your_username`。
+这条命令只将已有账号标记为管理员后退出，不创建账号、不修改密码，也不需要 agent 在线。
+已有登录会在下次请求读取最新权限；刷新聊天页即可看到入口。普通注册不会自动获得管理员权限。
+
+后台只查询现有数据库，不增加监控表、不实时采集，不会调用模型或重新执行工具。
+执行中的问答可能只有问题和状态；结束后点击「刷新记录」查看新保存的条目。
+未记录的完整模型请求、逐轮预算、token、耗时和具体失败原因不会推测补齐。
+无用户归属的 CLI 会话不出现在用户列表下。免费次数限制属于独立功能，本后台不改变问答额度。
+
+管理 API 为只读 GET：`/api/admin/users`、`/api/admin/users/{user}/sessions`、
+`/api/admin/sessions/{session}/turns`、`/api/admin/turns/{turn}`、
+`/api/admin/turns/{turn}/items/{item}/raw`。列表默认每页 30 条，通过 `limit`（1–100）和 `offset`
+分页。Go 检查当前登录账号的管理员标记，Rust 还会检查内部签名凭证中的 `admin:read` 权限范围。
+
+### 免费问答额度
+
+普通账号累计可开始 5 次免费问答，不按天重置，跨会话累计。一次提问内部多轮模型和
+工具调用仍只算一次。管理员不限次数；将已有账号设为管理员的方法见上节。
+
+扣次数与创建问答记录、绑定 request_id 在同一个 SQLite 事务中完成；并发请求不会
+超额，同一次 request_id 重试不会重复扣。被接受后的失败、中断、取消仍计次；空问题、
+未登录、会话忙、执行名额满和接受前的配置错误不扣。额度用完仍可查看历史记录。
+已有账号从升级后开始计次，历史问答不追扣；无用户归属的本机 CLI 不适用此限制。
+
+前端输入框下显示剩余次数。`GET /api/quota` 查询当前登录用户，由 Go 转发至
+`GET /internal/quota`；额度耗尽的提交返回 HTTP 429 和 `free_quota_exhausted`，不会自动重试。
+Rust 管理 `user_quotas`，仅只读查询账号表的当前 `is_admin` 来判断豁免，浏览器不能指定身份或豁免标记。
+
+升级时先停止两个服务、备份数据库，用新编译的 Rust 二进制执行
+`clipknow migrate --db clipknow.db`（新增迁移版本 6），然后启动新版 Rust 和 Go 服务。
+服务启动不会自动迁移；不要只更新前端或只替换一个服务。
 
 ### Docker
 

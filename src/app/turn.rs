@@ -76,6 +76,8 @@ pub struct TurnControl {
     /// 这一轮来自哪次提交（浏览器的一次「点发送」）。写库时把这一轮的编号
     /// 填回 `chat_requests`，同一个编号再来就认得出。命令行没有这个，是 None。
     pub request: Option<ChatRequestRef>,
+    /// HTTP admission has already atomically saved the question and charged quota.
+    pub prepared: bool,
 }
 
 /// 一次提交的身份：哪个用户、哪个编号。见 `migrations/agent/009_chat_requests.sql`。
@@ -93,6 +95,7 @@ impl TurnControl {
             cancel: CancelSignal::new(),
             held: None,
             request: None,
+            prepared: false,
         }
     }
 }
@@ -161,17 +164,19 @@ pub fn execute(store: &mut SqliteStore, req: &TurnRequest<'_>, sink: &dyn TurnSi
     //   以前是整轮答完才写。实测：跑到一半刷新页面，连自己问的问题都看不到，
     //   会话连标题都没有——看起来像「问题全丢了」，其实只是还没写。
     let turn_id = req.control.turn_id.as_str();
-    if let Err(e) = store.begin_turn(
-        turn_id,
-        req.session_id,
-        llm.model_name(),
-        req.question,
-        &truncate_chars(req.question, 40),
-        req.control
-            .request
-            .as_ref()
-            .map(|r| (r.user_id.as_str(), r.request_id.as_str())),
-    ) {
+    if !req.control.prepared
+        && let Err(e) = store.begin_turn(
+            turn_id,
+            req.session_id,
+            llm.model_name(),
+            req.question,
+            &truncate_chars(req.question, 40),
+            req.control
+                .request
+                .as_ref()
+                .map(|r| (r.user_id.as_str(), r.request_id.as_str())),
+        )
+    {
         bail!(e)
     }
 

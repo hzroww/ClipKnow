@@ -352,6 +352,7 @@
         <button id="stop" title="停下这个会话正在回答的问题">停止</button>
       </div>
     </div>
+    <div class="hint" id="quota" role="status">正在读取免费问答次数…</div>
     <div class="hint" id="hint">Enter 发送 · Shift+Enter 换行</div>
   </footer>
 </main>
@@ -368,6 +369,26 @@ const ANSWER_SIGNATURE = '你好呀 我叫王浩宇 是个扫0 很开心为你�
 
 const $ = s => document.querySelector(s);
 const log = $('#log'), qBox = $('#q'), sendBtn = $('#send'), stopBtn = $('#stop'), hint = $('#hint');
+let quota = null, quotaRequest = 0;
+async function refreshQuota() {
+  const version = ++quotaRequest;
+  try {
+    const response = await fetch('/api/quota', {cache:'no-store'});
+    if (!response.ok) throw new Error('额度查询失败');
+    const data = await response.json();
+    if (version !== quotaRequest) return;
+    quota = data;
+    $('#quota').textContent = data.unlimited ? '管理员 · 不限次数' :
+      data.remaining === 0 ? '5 次免费问答已用完，你仍可查看历史对话。' :
+      `剩余 ${data.remaining} / ${data.limit} 次免费问答 · 每次开始问答消耗 1 次，失败或停止仍计次`;
+  } catch {
+    if (version !== quotaRequest) return;
+    quota = null;
+    $('#quota').textContent = '暂时无法读取额度，发送时由服务端检查';
+  }
+  updateSend();
+}
+window.addEventListener('focus', () => { if (me) refreshQuota(); });
 
 let sessionId = null;   // 当前**显示着**的会话。null = 新会话（下一次提问会新建一个）
 
@@ -896,7 +917,7 @@ function finishRun(run) {
 function updateSend() {
   const here = visibleRun();
   // 输入框**始终可用**——等的时候可以先把下一个问题打好。
-  sendBtn.disabled = !!here;
+  sendBtn.disabled = !!here || !!(quota && !quota.unlimited && quota.remaining === 0);
   sendBtn.style.display = here ? 'none' : '';
   stopBtn.classList.toggle('on', !!here);
   stopBtn.disabled = !!here?.stopping;
@@ -1035,10 +1056,14 @@ async function submit(run, q, provider) {
     }
     if (!res.ok) {
       const t = await res.text();
-      addStep(run.steps, '✗', t, null, 'err');
+      let message = t;
+      try { const error = JSON.parse(t); message = error.message || t; } catch {}
+      addStep(run.steps, '✗', message, null, 'err');
+      refreshQuota();
       if (res.status === 401) showGate('登录过期了，重新输一次');
       return;
     }
+    refreshQuota();
     // 服务端认出这是同一次提交的重试：没重跑，告诉我们是哪一轮
     if ((res.headers.get('Content-Type') || '').startsWith('application/json')) {
       await attachExisting(run, await res.json());
@@ -1227,6 +1252,11 @@ function renderMe() {
     ? ` · 还能问 ${me.quota} 次` : '';
   $('#whoami').innerHTML = '';
   const links = el('span', '');
+  if (me.admin) {
+    const adminLink = el('a', 'linkish', '调试后台');
+    adminLink.href = '/admin';
+    links.append(adminLink);
+  }
   const memBtn = el('button', 'linkish', '记忆');
   memBtn.onclick = openMemories;
   const outBtn = el('button', 'linkish', '退出');
@@ -1381,10 +1411,13 @@ async function logout() {
 async function refreshMe() {
   const r = await fetch('/api/me');
   if (r.ok) { me = await r.json(); renderMe(); }
+  refreshQuota();
 }
 
 // 登录之后进入主界面：网址里记着会话就回到那个会话（刷新的情况），没有就显示欢迎页。
 function enterApp() {
+  quota = null;
+  refreshQuota();
   const id = hashSession();
   if (id) openSession(id);
   else { showWelcome(); loadSessions(); }

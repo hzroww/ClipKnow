@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>调试后台 · ClipKnow</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f5f1; --paper:#fffefa; --text:#292d29; --muted:#73786f; --line:#dedfd6; --accent:#355d49; --tint:#eaf0e7; --bad:#a44438; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.65 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    button,a { -webkit-tap-highlight-color:transparent; }
+    button { font:inherit; cursor:pointer; color:inherit; }
+    button:disabled { cursor:default; opacity:.45; }
+    button:focus-visible,a:focus-visible,summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+    header { padding:20px 28px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:18px; }
+    header h1 { font-size:21px; letter-spacing:-.6px; margin:0; font-weight:650; }
+    header p { margin:3px 0 0; color:var(--muted); font-size:12px; }
+    .brand { font-size:11px; letter-spacing:2px; color:var(--accent); }
+    .actions { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+    a { color:var(--accent); text-decoration:none; }
+    .quiet { background:transparent; border:1px solid var(--line); border-radius:5px; padding:5px 11px; }
+    #identity { color:var(--muted); font-size:12px; }
+    #notice { padding:8px 28px; background:var(--tint); border-bottom:1px solid var(--line); color:var(--accent); font-size:12px; }
+    #notice[hidden] { display:none; }
+    .layout { display:grid; grid-template-columns:220px 260px minmax(0,1fr); min-height:calc(100vh - 120px); }
+    .rail { min-width:0; border-right:1px solid var(--line); padding:20px 12px; }
+    .rail h2 { margin:0 10px 14px; font-size:13px; font-weight:650; }
+    .list { display:flex; flex-direction:column; gap:5px; }
+    .entry { width:100%; text-align:left; background:transparent; border:1px solid transparent; border-radius:6px; padding:10px; overflow:hidden; }
+    .entry:hover { background:var(--paper); border-color:var(--line); }
+    .entry.selected { background:var(--tint); border-color:#c6d4c3; }
+    .entry strong { display:block; font-size:13px; font-weight:600; overflow-wrap:anywhere; }
+    .entry small { display:block; color:var(--muted); font-size:11px; margin-top:3px; overflow-wrap:anywhere; }
+    .entry .mono { font-family:ui-monospace,Consolas,monospace; font-size:10px; }
+    .pager { display:flex; gap:9px; align-items:center; margin:16px 9px 0; }
+    .pager small { color:var(--muted); flex:1; text-align:center; font-size:11px; }
+    .pager button { border:1px solid var(--line); border-radius:4px; background:var(--paper); padding:3px 8px; }
+    main { padding:24px 30px 50px; min-width:0; }
+    #breadcrumb { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    #session-title { font-size:22px; margin:8px 0 2px; font-weight:600; overflow-wrap:anywhere; }
+    #session-meta { color:var(--muted); font:11px/1.7 ui-monospace,Consolas,monospace; overflow-wrap:anywhere; }
+    #turns { margin-top:22px; }
+    .empty { color:var(--muted); padding:18px 10px; font-size:13px; }
+    .error { color:var(--bad); padding:12px 10px; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .turn { background:var(--paper); border:1px solid var(--line); border-radius:8px; margin-bottom:14px; }
+    .turn-head { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 17px; border-bottom:1px solid var(--line); font-size:12px; }
+    .turn-meta { color:var(--muted); font-size:11px; }
+    .badge { border:1px solid var(--line); border-radius:4px; padding:1px 7px; font-size:11px; white-space:nowrap; }
+    .badge.done { color:var(--accent); background:var(--tint); }
+    .badge.failed,.badge.interrupted { color:var(--bad); }
+    .preview { padding:14px 17px 4px; }
+    .caption { color:var(--muted); font-size:10px; font-weight:600; letter-spacing:1px; margin-bottom:4px; }
+    .prose { white-space:pre-wrap; overflow-wrap:anywhere; margin:0 0 14px; }
+    details.debug > summary { padding:10px 17px; color:var(--accent); cursor:pointer; font-size:12px; }
+    .debug-body { padding:0 17px 18px; min-width:0; }
+    .note { color:var(--muted); font-size:12px; padding:10px 0; }
+    .iteration { border-top:1px solid var(--line); margin-top:15px; padding-top:10px; }
+    .iteration h3 { font-size:13px; font-weight:650; margin:0 0 10px; }
+    .step { padding:8px 0 12px 12px; border-left:2px solid var(--line); margin:8px 0; }
+    .step h4 { margin:0 0 5px; font-size:12px; font-weight:600; }
+    .step .caption { margin-top:10px; letter-spacing:0; }
+    pre { margin:6px 0 10px; padding:10px 12px; border:1px solid var(--line); border-radius:4px; background:var(--bg); font:12px/1.7 ui-monospace,Consolas,"Microsoft YaHei",monospace; white-space:pre-wrap; overflow-wrap:anywhere; max-height:460px; overflow:auto; tab-size:2; }
+    .fold { margin:8px 0; }
+    .fold > summary { cursor:pointer; color:var(--accent); font-size:12px; }
+    .payload-tools { display:flex; justify-content:flex-end; margin:4px 0; }
+    .copy { background:transparent; border:0; color:var(--muted); font-size:11px; padding:2px 5px; }
+    .small-id { color:var(--muted); font:10px/1.7 ui-monospace,Consolas,monospace; overflow-wrap:anywhere; }
+    @media(max-width:1050px) { .layout { grid-template-columns:180px 210px minmax(0,1fr); } main { padding:20px 18px; } header { padding:16px 20px; } }
+    @media(max-width:760px) { header { align-items:flex-start; padding:16px; } .actions { gap:9px; justify-content:flex-end; } #identity { display:none; } .layout { grid-template-columns:1fr 1fr; } .rail { padding:15px 8px; border-bottom:1px solid var(--line); } .rail .list { max-height:260px; overflow:auto; } main { grid-column:1/-1; padding:20px 14px; } .entry .mono { font-size:9px; } #notice { padding:8px 16px; } .turn-head { align-items:flex-start; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><div class="brand">CLIPKNOW / ADMIN</div><h1>问答调试</h1><p>查看已保存的对话与执行条目</p></div>
+    <div class="actions"><span id="identity"></span><button class="quiet" id="refresh">刷新记录</button><a href="/">返回聊天</a></div>
+  </header>
+  <div id="notice" role="status" hidden></div>
+  <div class="layout">
+    <aside class="rail" aria-label="用户列表"><h2>所有用户</h2><div class="list" id="users"></div><div id="users-pager"></div></aside>
+    <aside class="rail" aria-label="会话列表"><h2 id="sessions-label">会话</h2><div class="list" id="sessions"><div class="empty">选择用户，查看其会话。</div></div><div id="sessions-pager"></div></aside>
+    <main>
+      <div id="breadcrumb">用户 / 会话 / 问答</div>
+      <h2 id="session-title">选择一段会话</h2><div id="session-meta"></div>
+      <div id="turns"><div class="empty">从左侧选择用户和会话，展开某次问答查看调试信息。</div></div><div id="turns-pager"></div>
+    </main>
+  </div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const PAGE = 30;
+const state = {user:null,session:null,usersPage:0,sessionsPage:0,turnsPage:0,usersReq:0,sessionsReq:0,turnsReq:0};
+const statuses = {done:'已完成',failed:'失败',cancelled:'已取消',interrupted:'已中断',running:'执行中'};
+function node(tag, cls, text) { const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=String(text); return e; }
+function date(ts) { return ts==null?'未记录':new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}); }
+function name(u) { return u.display_name||u.username||u.id; }
+function pretty(v) { if(typeof v==='string') { try{return JSON.stringify(JSON.parse(v),null,2);}catch{return v;} } return JSON.stringify(v,null,2)??''; }
+function notice(text) { $('notice').textContent=text; $('notice').hidden=!text; }
+async function api(path) {
+  const r=await fetch(path,{cache:'no-store'});
+  if(!r.ok) {
+    const raw=await r.text(); let message=raw;
+    try{message=JSON.parse(raw).message||raw;}catch{}
+    if(r.status===401) {message='登录已过期，请返回聊天页面重新登录。';notice(message);}
+    if(r.status===403) {message='当前账号没有管理员权限。';notice(message);}
+    throw new Error(message||`请求失败（${r.status}）`);
+  }
+  return r.json();
+}
+function failure(container,error,retry) {
+  const box=node('div','error',error.message||String(error));
+  if(retry){const b=node('button','quiet','重试'); b.onclick=retry;box.append(document.createElement('br'),b);}
+  container.replaceChildren(box);
+}
+function pager(target,page,more,load) {
+  const row=node('div','pager'),prev=node('button','','上一页'),next=node('button','','下一页');
+  prev.disabled=page===0;next.disabled=!more;prev.onclick=()=>load(page-1);next.onclick=()=>load(page+1);
+  row.append(prev,node('small','',`第 ${page+1} 页`),next);target.replaceChildren(row);
+}
+function payload(container,label,value) {
+  if(label)container.append(node('div','caption',label));
+  const text=pretty(value),pre=node('pre','',text),tools=node('div','payload-tools'),copy=node('button','copy','复制');
+  copy.onclick=async()=>{try{await navigator.clipboard.writeText(text);copy.textContent='已复制';}catch{copy.textContent='复制失败，请手动选择';}};
+  tools.append(copy);container.append(tools,pre);
+}
+function fold(container,label,value) {
+  const d=node('details','fold');d.append(node('summary','',label));
+  const body=node('div');let loaded=false;
+  d.ontoggle=()=>{if(d.open&&!loaded){loaded=true;payload(body,'',value);}};
+  d.append(body);container.append(d);
+}
+function clearTurns() {
+  state.session=null;state.turnsReq++;state.turnsPage=0;
+  $('session-title').textContent='选择一段会话';$('session-meta').textContent='';$('turns-pager').replaceChildren();
+  $('breadcrumb').textContent=state.user?`${name(state.user)} / 会话`:'用户 / 会话 / 问答';
+  $('turns').replaceChildren(node('div','empty','选择会话，查看其中的每次问答。'));
+}
+async function loadUsers(page=0) {
+  const version=++state.usersReq;state.usersPage=page;
+  $('users').replaceChildren(node('div','empty','正在读取用户…'));$('users-pager').replaceChildren();
+  try {
+    const data=await api(`/api/admin/users?limit=${PAGE}&offset=${page*PAGE}`);if(version!==state.usersReq)return;
+    const entries=data.users.map(u=>{
+      const b=node('button','entry'+(state.user?.id===u.id?' selected':''));
+      b.append(node('strong','',name(u)),node('small','mono',u.id),node('small','',`注册于 ${date(u.created_at)}`));
+      b.onclick=()=>{state.user=u;loadUsers(state.usersPage);loadSessions(0);};return b;
+    });
+    $('users').replaceChildren(...(entries.length?entries:[node('div','empty','还没有注册用户。')]));
+    pager($('users-pager'),page,data.has_more,loadUsers);
+  }catch(e){if(version===state.usersReq)failure($('users'),e,()=>loadUsers(page));}
+}
+async function loadSessions(page=0) {
+  if(!state.user)return;
+  const user=state.user,version=++state.sessionsReq;state.sessionsPage=page;clearTurns();
+  $('sessions-label').textContent=`${name(user)}的会话`;
+  $('sessions').replaceChildren(node('div','empty','正在读取会话…'));$('sessions-pager').replaceChildren();
+  try {
+    const data=await api(`/api/admin/users/${encodeURIComponent(user.id)}/sessions?limit=${PAGE}&offset=${page*PAGE}`);
+    if(version!==state.sessionsReq||state.user?.id!==user.id)return;
+    const entries=data.sessions.map(s=>{
+      const b=node('button','entry');b.dataset.session=s.id;
+      b.append(node('strong','',s.title||'未命名会话'),node('small','',`创建 ${date(s.created_at)}`),
+        node('small','',`更新 ${date(s.updated_at??s.created_at)}`),node('small','mono',s.id));
+      if(s.deleted_at!=null)b.append(node('small','','已软删除，数据库仍保留'));
+      b.onclick=()=>{
+        state.session=s;
+        for(const el of $('sessions').children)el.classList.toggle('selected',el===b);
+        loadTurns(0);
+      };return b;
+    });
+    $('sessions').replaceChildren(...(entries.length?entries:[node('div','empty','这个用户还没有会话。')]));
+    pager($('sessions-pager'),page,data.has_more,loadSessions);
+  }catch(e){if(version===state.sessionsReq)failure($('sessions'),e,()=>loadSessions(page));}
+}
+async function loadTurns(page=0) {
+  if(!state.session)return;
+  const session=state.session,version=++state.turnsReq;state.turnsPage=page;
+  $('breadcrumb').textContent=`${name(state.user)} / 会话 / 问答`;
+  $('session-title').textContent=session.title||'未命名会话';$('session-meta').textContent=`${session.id} · 创建于 ${date(session.created_at)}`;
+  $('turns').replaceChildren(node('div','empty','正在读取问答…'));$('turns-pager').replaceChildren();
+  try {
+    const data=await api(`/api/admin/sessions/${encodeURIComponent(session.id)}/turns?limit=${PAGE}&offset=${page*PAGE}`);
+    if(version!==state.turnsReq)return;
+    const cards=data.turns.map(turnCard);
+    $('turns').replaceChildren(...(cards.length?cards:[node('div','empty','这个会话还没有问答记录。')]));
+    pager($('turns-pager'),page,data.has_more,loadTurns);
+  }catch(e){if(version===state.turnsReq)failure($('turns'),e,()=>loadTurns(page));}
+}
+function turnCard(t) {
+  const card=node('article','turn'),head=node('div','turn-head'),meta=node('div');
+  meta.append(node('strong','',`第 ${t.seq} 次提问`),node('div','turn-meta',`${t.model} · ${date(t.created_at)}`));
+  head.append(meta,node('span','badge '+(statuses[t.status]?t.status:''),statuses[t.status]||t.status));
+  const preview=node('div','preview');preview.append(node('div','caption','用户问题 · 预览'),node('p','prose',t.question_preview||'尚未保存问题正文'));
+  if(t.answer_preview)preview.append(node('div','caption','最后一条模型正文 · 预览'),node('p','prose',t.answer_preview));
+  const d=node('details','debug'),body=node('div','debug-body');d.append(node('summary','','展开调试信息'),body);
+  let loaded=false,loading=false;
+  async function load() {
+    if(loading)return;loading=true;body.replaceChildren(node('div','note','正在读取已保存条目…'));
+    try {
+      const data=await api(`/api/admin/turns/${encodeURIComponent(t.id)}`);
+      renderDebug(body,data);loaded=true;
+    }catch(e){failure(body,e,load);}finally{loading=false;}
+  }
+  d.ontoggle=()=>{if(d.open&&!loaded)load();};card.append(head,preview,d);return card;
+}
+function renderDebug(body,data) {
+  body.replaceChildren(node('div','small-id',`问答 ID：${data.turn.id}`));
+  if(data.turn.status==='running')body.append(node('div','note','执行中：这里只展示已经写入数据库的内容。问答结束后点击顶部刷新记录。'));
+  else if(data.turn.status==='interrupted')body.append(node('div','note','执行已中断，未落库的中间过程无法在此恢复。'));
+  else if(data.turn.status==='failed')body.append(node('div','note','数据库只保存了失败状态；具体原因请结合下方已有工具结果查看，未记录的原因无法还原。'));
+  const groups=new Map();
+  for(const item of data.items){const key=item.iteration??'input';if(!groups.has(key))groups.set(key,[]);groups.get(key).push(item);}
+  if(!data.items.length)body.append(node('div','note','数据库中没有保存这次问答的消息条目。'));
+  for(const [iteration,items] of groups) {
+    const section=node('section','iteration');section.append(node('h3','',iteration==='input'?'用户输入与其他记录':`第 ${iteration} 轮`));
+    const used=new Set();
+    for(const item of items) {
+      if(used.has(item.id))continue;
+      const p=item.payload||{},step=node('div','step');
+      if(item.type==='user_message') {
+        step.append(node('h4','','用户问题'),node('p','prose',p.text??pretty(item.payload)));
+      }else if(item.type==='assistant_message') {
+        step.append(node('h4','','模型返回'));
+        if(p.text)step.append(node('div','caption','正文'),node('p','prose',p.text));
+        if(p.reasoning)fold(step,'模型返回的思考字段',p.reasoning);
+        if(!p.text&&!p.reasoning)step.append(node('div','note','没有正文或思考字段，工具调用见下方记录。'));
+        fold(step,'查看保存的消息 JSON',item.payload);
+      }else if(item.type==='function_call') {
+        step.append(node('h4','',`工具调用 · ${p.name||'未记录名称'}`),node('div','small-id',`调用 ID：${item.call_id??'未记录'}`));
+        payload(step,'参数',p.args??item.payload);
+        const result=items.find(x=>x.type==='function_call_output'&&x.call_id===item.call_id&&!used.has(x.id));
+        if(result){used.add(result.id);renderResult(step,result,data.turn.id);}
+        else step.append(node('div','note','数据库中没有对应的工具结果。'));
+      }else if(item.type==='function_call_output') {
+        step.append(node('h4','','工具结果'),node('div','small-id',`调用 ID：${item.call_id??'未记录'}`));renderResult(step,item,data.turn.id);
+      }else {step.append(node('h4','',item.type));payload(step,'保存的内容',item.payload);}
+      section.append(step);
+    }
+    body.append(section);
+  }
+  if(data.turn.summary!=null)fold(body,`保存的压缩摘要 · 覆盖至第 ${data.turn.summarized_upto??'?'} 次提问`,data.turn.summary);
+  body.append(node('div','note','这里只展示数据库原有记录，未记录完整模型请求、逐轮预算、token 用量和准确耗时。'));
+}
+function renderResult(step,item,turnID) {
+  const p=item.payload||{};
+  step.append(node('div','caption',p.is_error===true?'工具返回 · 错误或未执行':p.is_error===false?'工具返回 · 未标记为错误':'工具返回 · 错误标记未记录'));
+  payload(step,'交给模型的内容',p.content??item.payload);
+  const metadata=[];
+  if(p.endpoint!=null)metadata.push(`接口：${p.endpoint}`);
+  metadata.push(`已记录 credits：${p.credits_charged??'未记录'}`);
+  step.append(node('div','note',metadata.join(' · ')));
+  fold(step,'查看保存的工具结果 JSON',item.payload);
+  if(!item.has_raw){step.append(node('div','note','未保存原始响应。'));return;}
+  const d=node('details','fold'),body=node('div');d.append(node('summary','','查看工具原始响应'),body);step.append(d);
+  let loaded=false,loading=false;
+  async function load(){
+    if(loading)return;loading=true;body.replaceChildren(node('div','note','正在读取原始响应…'));
+    try{const data=await api(`/api/admin/turns/${encodeURIComponent(turnID)}/items/${encodeURIComponent(item.id)}/raw`);body.replaceChildren();payload(body,'',data.raw);loaded=true;}
+    catch(e){failure(body,e,load);}finally{loading=false;}
+  }
+  d.ontoggle=()=>{if(d.open&&!loaded)load();};
+}
+$('refresh').onclick=async()=>{
+  const button=$('refresh');button.disabled=true;
+  try{
+    await loadUsers(state.usersPage);
+    if(state.session)await loadTurns(state.turnsPage);
+    else if(state.user)await loadSessions(state.sessionsPage);
+  }finally{button.disabled=false;}
+};
+(async()=>{
+  try{const me=await api('/api/me');if(!me.admin)throw new Error('当前账号没有管理员权限。');$('identity').textContent=`管理员 · ${name(me)}`;await loadUsers();}
+  catch(e){notice(e.message);failure($('users'),e);$('refresh').disabled=true;}
+})();
+</script>
+</body>
+</html>

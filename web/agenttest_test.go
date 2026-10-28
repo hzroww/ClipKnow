@@ -44,6 +44,8 @@ const agentStartTimeout = 20 * time.Second
 func startAgent(t *testing.T, bin, db string) *AgentClient {
 	t.Helper()
 	t.Setenv(internalSecretEnv, testInternalSecret)
+	// 本机假服务不经过宿主代理；否则代理返回的 502 会污染离线测试。
+	t.Setenv("NO_PROXY", "127.0.0.1,localhost,::1")
 
 	cmd := exec.Command(bin, "serve", "--db", db, "--addr", "127.0.0.1:0")
 	// ★ 钉住工作目录，不继承测试进程的。
@@ -60,7 +62,10 @@ func startAgent(t *testing.T, bin, db string) *AgentClient {
 		t.Fatalf("起不了 clipknow serve: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			// Windows 不支持向子进程发送 SIGTERM。
+			_ = cmd.Process.Kill()
+		}
 		_ = cmd.Wait()
 	})
 

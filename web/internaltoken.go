@@ -85,6 +85,15 @@ func (s *tokenSigner) sign(userID string) (string, error) {
 // 拆出这个参数只为一件事：让跨语言的黄金样例测试能产出**确定的**字符串。
 // 时间一变签名就变，那条测试就没法写成定值比对了。
 func (s *tokenSigner) signAt(userID string, now time.Time) (string, error) {
+	return s.signScopedAt(userID, "", now)
+}
+
+// 只由 needAdmin 验证身份后的管理查询调用；sub 始终是管理员本人。
+func (s *tokenSigner) signAdmin(userID string) (string, error) {
+	return s.signScopedAt(userID, "admin:read", time.Now())
+}
+
+func (s *tokenSigner) signScopedAt(userID, scope string, now time.Time) (string, error) {
 	if strings.TrimSpace(userID) == "" {
 		// 空的 user_id 会让 Rust 那边的归属查询匹配到 0 行，表现成「一条
 		// 会话都没有」——一个很难查的静默失败。在源头拦住。
@@ -103,6 +112,9 @@ func (s *tokenSigner) signAt(userID string, now time.Time) (string, error) {
 		"aud": internalAudience,
 		"iat": now.Unix(),
 		"exp": now.Add(internalTokenTTL).Unix(),
+	}
+	if scope != "" {
+		claims["scope"] = scope
 	}
 	// SigningMethodHS256 必须和 Rust 那边 Validation::new(Algorithm::HS256)
 	// 写死的算法一致。改这里就要同时改那边，两条测试会喊。

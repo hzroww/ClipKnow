@@ -43,7 +43,11 @@ func main() {
 		"常驻 agent 服务的地址（clipknow serve 监听的那个）")
 	importAcc := flag.Bool("import-accounts", false,
 		"一次性：把 access.json 里的邀请码变成真账号，打印初始密码后退出")
+	adminUser := flag.String("admin-user", "", "一次性：将指定的已有用户名设为管理员后退出")
 	flag.Parse()
+	if *importAcc && *adminUser != "" {
+		log.Fatal("-import-accounts 和 -admin-user 不能同时使用")
+	}
 
 	dbAbs, err := filepath.Abs(*db)
 	if err != nil {
@@ -63,6 +67,13 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 	defer acc.Close()
+	if *adminUser != "" {
+		if err := acc.SetAdmin(*adminUser); err != nil {
+			log.Fatalf("设置管理员失败: %v", err)
+		}
+		log.Printf("已将 %s 设为管理员", *adminUser)
+		return
+	}
 
 	// ★ 密钥没配就直接起不来，不存在「没配就不校验」的降级路径。
 	signer, err := newTokenSigner()
@@ -106,6 +117,13 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/auth/login", s.handleLoginNew)
 	mux.HandleFunc("/api/auth/logout", s.handleLogoutNew)
 	mux.HandleFunc("/api/me", s.handleMe)
+	mux.HandleFunc("GET /api/quota", s.needAuth(s.handleQuota))
+	mux.HandleFunc("GET /admin", s.needAdmin(s.handleAdminPage))
+	mux.HandleFunc("GET /api/admin/users", s.needAdmin(s.handleAdminUsers))
+	mux.HandleFunc("GET /api/admin/users/{user}/sessions", s.needAdmin(s.handleAdminSessions))
+	mux.HandleFunc("GET /api/admin/sessions/{session}/turns", s.needAdmin(s.handleAdminTurns))
+	mux.HandleFunc("GET /api/admin/turns/{turn}", s.needAdmin(s.handleAdminTurn))
+	mux.HandleFunc("GET /api/admin/turns/{turn}/items/{item}/raw", s.needAdmin(s.handleAdminRaw))
 	mux.HandleFunc("/api/sessions", s.needAuth(s.handleSessions))
 	mux.HandleFunc("/api/sessions/", s.needAuth(s.handleHistory))
 	// 比上面那条前缀更具体，所以 /api/sessions/<id>/events 会落到这里

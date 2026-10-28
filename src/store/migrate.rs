@@ -86,6 +86,13 @@ const MIGRATIONS: &[Migration] = &[
             "../../migrations/agent/010_memories.sql"
         ))],
     },
+    Migration {
+        version: 6,
+        name: "user_quotas",
+        steps: &[Step::Sql(include_str!(
+            "../../migrations/agent/011_user_quotas.sql"
+        ))],
+    },
 ];
 
 /// 代码期望的库版本。

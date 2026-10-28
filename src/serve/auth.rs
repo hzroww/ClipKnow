@@ -11,7 +11,7 @@
 //!
 //! ## 三条不能破的规矩
 //!
-//! 1. **user_id 只能来自凭证的 `sub`，不能来自请求体或 URL。**
+//! 1. **普通接口的 user_id 只能来自凭证的 `sub`，不能来自请求体或 URL。**
 //!    这是设计文档第 12 节的第一条不变量。放松一次，「拿别人的 user_id
 //!    去查别人的会话」就成立了。
 //!
@@ -73,6 +73,9 @@ const MIN_SECRET_LEN: usize = 32;
 struct Claims {
     /// subject —— users.id。**唯一的身份来源。**
     sub: String,
+    /// 仅在 Go 校验过管理员后签发。普通用户凭证不带权限范围。
+    #[serde(default)]
+    scope: String,
     // iss / aud / exp 由 jsonwebtoken 的 Validation 校验，
     // 不需要在这里声明成字段。
 }
@@ -85,6 +88,9 @@ struct Claims {
 pub struct Principal {
     pub user_id: String,
 }
+
+/// 管理查询必须显式使用此提取器，普通用户的已签名凭证也不能访问。
+pub struct AdminPrincipal;
 
 /// 校验器。启动时建一次，之后所有请求共用。
 pub struct Verifier {
@@ -102,6 +108,20 @@ impl std::fmt::Debug for Verifier {
 }
 
 impl Verifier {
+    pub fn verify_admin(&self, token: &str) -> std::result::Result<(), ApiError> {
+        self.verify(token)?;
+        let data = jsonwebtoken::decode::<Claims>(token, &self.key, &self.validation)
+            .map_err(|e| unauthorized(format!("管理员凭证无效: {e}")))?;
+        if data.claims.scope != "admin:read" {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "需要管理员权限",
+            ));
+        }
+        Ok(())
+    }
+
     /// 从环境变量读密钥。没配或太短都直接报错。
     pub fn from_env() -> Result<Self> {
         let secret = crate::env_var(SECRET_ENV).ok_or(ClipKnowError::MissingEnv(SECRET_ENV))?;
@@ -168,6 +188,30 @@ fn unauthorized(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", message)
 }
 
+fn bearer(parts: &Parts) -> std::result::Result<&str, ApiError> {
+    let raw = parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .ok_or_else(|| unauthorized("缺少 Authorization 头"))?
+        .to_str()
+        .map_err(|_| unauthorized("Authorization 头不是合法的 ASCII"))?;
+    raw.strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .map(str::trim)
+        .ok_or_else(|| unauthorized("Authorization 头不是 Bearer 形式"))
+}
+
+impl FromRequestParts<Arc<AppState>> for AdminPrincipal {
+    type Rejection = ApiError;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        state.verifier.verify_admin(bearer(parts)?)?;
+        Ok(Self)
+    }
+}
+
 /// 让 `Principal` 能直接写进 handler 的参数表。
 ///
 /// 写成 axum 的提取器（而不是一个「每个 handler 记得调一次」的函数）是
@@ -181,20 +225,7 @@ impl FromRequestParts<Arc<AppState>> for Principal {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> std::result::Result<Self, Self::Rejection> {
-        let raw = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .ok_or_else(|| unauthorized("缺少 Authorization 头"))?
-            .to_str()
-            .map_err(|_| unauthorized("Authorization 头不是合法的 ASCII"))?;
-
-        // 只认 "Bearer <token>"。大小写不敏感是 RFC 6750 要求的。
-        let token = raw
-            .strip_prefix("Bearer ")
-            .or_else(|| raw.strip_prefix("bearer "))
-            .ok_or_else(|| unauthorized("Authorization 头不是 Bearer 形式"))?;
-
-        state.verifier.verify(token.trim())
+        state.verifier.verify(bearer(parts)?)
     }
 }
 
@@ -238,6 +269,26 @@ mod tests {
         let v = Verifier::new(SECRET);
         let p = v.verify(&sign(SECRET, good_claims())).unwrap();
         assert_eq!(p.user_id, "u_abc");
+    }
+
+    #[test]
+    fn admin_scope_is_required_signed_and_subject_to_expiry() {
+        let v = Verifier::new(SECRET);
+        assert_eq!(
+            v.verify_admin(&sign(SECRET, good_claims()))
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let mut claims = good_claims();
+        claims["scope"] = json!("admin:read");
+        assert!(v.verify_admin(&sign(SECRET, claims.clone())).is_ok());
+        assert!(
+            v.verify_admin(&sign(b"other-secret", claims.clone()))
+                .is_err()
+        );
+        claims["exp"] = json!(now() - 60);
+        assert!(v.verify_admin(&sign(SECRET, claims)).is_err());
     }
 
     #[test]
